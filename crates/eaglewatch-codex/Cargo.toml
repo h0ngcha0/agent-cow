@@ -1,0 +1,15 @@
+[package]
+name = "eaglewatch-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+directories.workspace = true
+eaglewatch-core = { path = "../eaglewatch-core" }
+rusqlite.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
