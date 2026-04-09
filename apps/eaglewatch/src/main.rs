@@ -1,4 +1,5 @@
 mod api;
+mod open;
 mod tui;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};

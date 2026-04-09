@@ -1,6 +1,7 @@
-use std::{fs, net::SocketAddr, path::Path, process::Command, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{Context, Result, anyhow};
+use crate::open;
+use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
@@ -8,7 +9,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use eaglewatch_core::{MonitorService, NavigationKind, ProviderKind, SessionQuery, SessionSummary};
+use eaglewatch_core::{MonitorService, NavigationKind, SessionQuery};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -38,7 +39,7 @@ struct OpenResponse {
 pub async fn run(service: MonitorService, bind: SocketAddr) -> Result<()> {
     let state = ApiState {
         service: Arc::new(service),
-        local_machine_id: local_machine_id(),
+        local_machine_id: open::local_machine_id(),
     };
 
     let app = Router::new()
@@ -89,32 +90,13 @@ async fn open_session_target(
     Query(params): Query<OpenParams>,
 ) -> Result<Json<OpenResponse>, ApiError> {
     let session = state.service.get_session(&id).await?;
-    let navigation_kind = parse_navigation_kind(&params.kind)?;
-    let target = session
-        .summary
-        .navigation
-        .iter()
-        .find(|target| target.kind == navigation_kind)
-        .ok_or_else(|| {
-            anyhow!(
-                "navigation target `{}` is not available for this session",
-                params.kind
-            )
-        })?;
-
-    match target.kind {
-        NavigationKind::WorkingDirectory | NavigationKind::RolloutPath => {
-            open_target(&target.target)?;
-        }
-        NavigationKind::ThreadId => {
-            return Err(anyhow!("opening a Codex thread directly is not supported yet").into());
-        }
-    }
+    let action =
+        open::open_session_navigation(&session.summary, parse_navigation_kind(&params.kind)?)?;
 
     Ok(Json(OpenResponse {
         ok: true,
-        label: target.label.clone(),
-        target: target.target.clone(),
+        label: action.label,
+        target: action.target,
     }))
 }
 
@@ -128,15 +110,12 @@ async fn open_session_app(
         return Err(anyhow!("opening provider apps is only supported for local sessions").into());
     }
 
-    let (label, target) = provider_app_target(&session.summary)
-        .ok_or_else(|| anyhow!("this provider does not expose a local app target yet"))?;
-
-    open_uri(&target)?;
+    let action = open::open_session_app(&session.summary, &state.local_machine_id)?;
 
     Ok(Json(OpenResponse {
         ok: true,
-        label,
-        target,
+        label: action.label,
+        target: action.target,
     }))
 }
 
@@ -150,85 +129,6 @@ fn parse_navigation_kind(value: &str) -> Result<NavigationKind> {
         "rollout_path" => Ok(NavigationKind::RolloutPath),
         "working_directory" => Ok(NavigationKind::WorkingDirectory),
         _ => Err(anyhow!("unsupported navigation kind `{value}`")),
-    }
-}
-
-fn local_machine_id() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "local".to_string())
-}
-
-fn provider_app_target(summary: &SessionSummary) -> Option<(String, String)> {
-    match summary.provider {
-        ProviderKind::Codex => {
-            let thread_id = summary
-                .navigation
-                .iter()
-                .find(|target| target.kind == NavigationKind::ThreadId)
-                .map(|target| target.target.as_str())
-                .filter(|target| !target.is_empty())
-                .unwrap_or(summary.id.as_str());
-
-            Some(("Codex".to_string(), format!("codex://threads/{thread_id}")))
-        }
-        ProviderKind::Claude => Some(("Claude".to_string(), "claude://".to_string())),
-    }
-}
-
-fn open_target(target: &str) -> Result<()> {
-    let path = Path::new(target);
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("target does not exist or cannot be read: `{target}`"))?;
-
-    open_with_system(target, metadata.is_file())
-}
-
-fn open_uri(target: &str) -> Result<()> {
-    open_with_system(target, false)
-}
-
-fn open_with_system(target: &str, reveal_file: bool) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        if reveal_file {
-            command.args(["-R", target]);
-        } else {
-            command.arg(target);
-        }
-        command
-    };
-
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(target);
-        command
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", target]);
-        command
-    };
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        return Err(anyhow!(
-            "open action is not supported on this operating system"
-        ));
-    }
-
-    let status = command
-        .status()
-        .with_context(|| format!("failed to launch system open command for `{target}`"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("system open command failed for `{target}`"))
     }
 }
 

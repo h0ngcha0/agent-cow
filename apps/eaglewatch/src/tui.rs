@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::open;
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -10,7 +11,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use eaglewatch_core::{
-    MonitorService, SessionDetail, SessionQuery, SessionStatusKind, SessionSummary,
+    MonitorService, NavigationKind, SessionDetail, SessionQuery, SessionStatusKind, SessionSummary,
 };
 use ratatui::{
     Frame, Terminal,
@@ -60,6 +61,8 @@ async fn run_loop(
                     KeyCode::Down | KeyCode::Char('j') => app.select_next(),
                     KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
                     KeyCode::Char('r') => app.reload(&service).await?,
+                    KeyCode::Enter | KeyCode::Char('o') => app.open_selected_app(),
+                    KeyCode::Char('f') => app.open_selected_working_directory(),
                     _ => {}
                 }
 
@@ -82,11 +85,18 @@ struct TuiApp {
     sessions: Vec<SessionSummary>,
     detail: Option<SessionDetail>,
     list_state: ListState,
+    local_machine_id: String,
     limit: usize,
     refresh_every: Duration,
     last_refresh: Instant,
     error: Option<String>,
+    notice: Option<UiNotice>,
     selection_changed: bool,
+}
+
+struct UiNotice {
+    message: String,
+    is_error: bool,
 }
 
 impl TuiApp {
@@ -98,10 +108,12 @@ impl TuiApp {
             sessions: Vec::new(),
             detail: None,
             list_state,
+            local_machine_id: open::local_machine_id(),
             limit,
             refresh_every,
             last_refresh: Instant::now(),
             error: None,
+            notice: None,
             selection_changed: false,
         }
     }
@@ -165,6 +177,17 @@ impl TuiApp {
             .map(|session| session.id.as_str())
     }
 
+    fn selected_summary(&self) -> Option<&SessionSummary> {
+        self.detail
+            .as_ref()
+            .map(|detail| &detail.summary)
+            .or_else(|| {
+                self.list_state
+                    .selected()
+                    .and_then(|index| self.sessions.get(index))
+            })
+    }
+
     fn select_next(&mut self) {
         if self.sessions.is_empty() {
             return;
@@ -191,6 +214,52 @@ impl TuiApp {
 
         self.list_state.select(Some(previous));
         self.selection_changed = true;
+    }
+
+    fn open_selected_app(&mut self) {
+        let Some(summary) = self.selected_summary().cloned() else {
+            self.notice = Some(UiNotice {
+                message: "No session selected.".to_string(),
+                is_error: true,
+            });
+            return;
+        };
+
+        self.notice = Some(
+            match open::open_session_app(&summary, &self.local_machine_id) {
+                Ok(action) => UiNotice {
+                    message: format!("Opened {}.", action.label),
+                    is_error: false,
+                },
+                Err(error) => UiNotice {
+                    message: error.to_string(),
+                    is_error: true,
+                },
+            },
+        );
+    }
+
+    fn open_selected_working_directory(&mut self) {
+        let Some(summary) = self.selected_summary().cloned() else {
+            self.notice = Some(UiNotice {
+                message: "No session selected.".to_string(),
+                is_error: true,
+            });
+            return;
+        };
+
+        self.notice = Some(
+            match open::open_session_navigation(&summary, NavigationKind::WorkingDirectory) {
+                Ok(action) => UiNotice {
+                    message: format!("Opened {}.", action.label),
+                    is_error: false,
+                },
+                Err(error) => UiNotice {
+                    message: error.to_string(),
+                    is_error: true,
+                },
+            },
+        );
     }
 }
 
@@ -264,8 +333,23 @@ fn draw(frame: &mut Frame, app: &mut TuiApp) {
         .wrap(Wrap { trim: false });
     frame.render_widget(detail, body[1]);
 
-    let footer =
-        Paragraph::new("q quit • j/k move • r refresh").style(Style::default().fg(Color::Gray));
+    let mut footer_spans = vec![Span::styled(
+        "q quit • j/k move • enter/o open in app • f folder • r refresh",
+        Style::default().fg(Color::Gray),
+    )];
+    if let Some(notice) = &app.notice {
+        footer_spans.push(Span::raw("  •  "));
+        footer_spans.push(Span::styled(
+            notice.message.clone(),
+            Style::default().fg(if notice.is_error {
+                Color::Red
+            } else {
+                Color::Green
+            }),
+        ));
+    }
+
+    let footer = Paragraph::new(Line::from(footer_spans));
     frame.render_widget(footer, layout[2]);
 }
 
