@@ -1,19 +1,20 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{fs, net::SocketAddr, path::Path, process::Command, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use eaglewatch_core::{MonitorService, SessionQuery};
-use serde::Deserialize;
+use eaglewatch_core::{MonitorService, NavigationKind, ProviderKind, SessionQuery, SessionSummary};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 struct ApiState {
     service: Arc<MonitorService>,
+    local_machine_id: String,
 }
 
 #[derive(Deserialize)]
@@ -22,9 +23,22 @@ struct ListParams {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct OpenParams {
+    kind: String,
+}
+
+#[derive(Serialize)]
+struct OpenResponse {
+    ok: bool,
+    label: String,
+    target: String,
+}
+
 pub async fn run(service: MonitorService, bind: SocketAddr) -> Result<()> {
     let state = ApiState {
         service: Arc::new(service),
+        local_machine_id: local_machine_id(),
     };
 
     let app = Router::new()
@@ -32,6 +46,8 @@ pub async fn run(service: MonitorService, bind: SocketAddr) -> Result<()> {
         .route("/health", get(health))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}", get(get_session))
+        .route("/api/sessions/{id}/open", post(open_session_target))
+        .route("/api/sessions/{id}/open-app", post(open_session_app))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -67,8 +83,153 @@ async fn get_session(
     Ok(Json(session))
 }
 
+async fn open_session_target(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+    Query(params): Query<OpenParams>,
+) -> Result<Json<OpenResponse>, ApiError> {
+    let session = state.service.get_session(&id).await?;
+    let navigation_kind = parse_navigation_kind(&params.kind)?;
+    let target = session
+        .summary
+        .navigation
+        .iter()
+        .find(|target| target.kind == navigation_kind)
+        .ok_or_else(|| {
+            anyhow!(
+                "navigation target `{}` is not available for this session",
+                params.kind
+            )
+        })?;
+
+    match target.kind {
+        NavigationKind::WorkingDirectory | NavigationKind::RolloutPath => {
+            open_target(&target.target)?;
+        }
+        NavigationKind::ThreadId => {
+            return Err(anyhow!("opening a Codex thread directly is not supported yet").into());
+        }
+    }
+
+    Ok(Json(OpenResponse {
+        ok: true,
+        label: target.label.clone(),
+        target: target.target.clone(),
+    }))
+}
+
+async fn open_session_app(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<OpenResponse>, ApiError> {
+    let session = state.service.get_session(&id).await?;
+
+    if session.summary.machine_id != state.local_machine_id {
+        return Err(anyhow!("opening provider apps is only supported for local sessions").into());
+    }
+
+    let (label, target) = provider_app_target(&session.summary)
+        .ok_or_else(|| anyhow!("this provider does not expose a local app target yet"))?;
+
+    open_uri(&target)?;
+
+    Ok(Json(OpenResponse {
+        ok: true,
+        label,
+        target,
+    }))
+}
+
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+fn parse_navigation_kind(value: &str) -> Result<NavigationKind> {
+    match value {
+        "thread_id" => Ok(NavigationKind::ThreadId),
+        "rollout_path" => Ok(NavigationKind::RolloutPath),
+        "working_directory" => Ok(NavigationKind::WorkingDirectory),
+        _ => Err(anyhow!("unsupported navigation kind `{value}`")),
+    }
+}
+
+fn local_machine_id() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "local".to_string())
+}
+
+fn provider_app_target(summary: &SessionSummary) -> Option<(String, String)> {
+    match summary.provider {
+        ProviderKind::Codex => {
+            let thread_id = summary
+                .navigation
+                .iter()
+                .find(|target| target.kind == NavigationKind::ThreadId)
+                .map(|target| target.target.as_str())
+                .filter(|target| !target.is_empty())
+                .unwrap_or(summary.id.as_str());
+
+            Some(("Codex".to_string(), format!("codex://threads/{thread_id}")))
+        }
+        ProviderKind::Claude => Some(("Claude".to_string(), "claude://".to_string())),
+    }
+}
+
+fn open_target(target: &str) -> Result<()> {
+    let path = Path::new(target);
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("target does not exist or cannot be read: `{target}`"))?;
+
+    open_with_system(target, metadata.is_file())
+}
+
+fn open_uri(target: &str) -> Result<()> {
+    open_with_system(target, false)
+}
+
+fn open_with_system(target: &str, reveal_file: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        if reveal_file {
+            command.args(["-R", target]);
+        } else {
+            command.arg(target);
+        }
+        command
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(target);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", target]);
+        command
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        return Err(anyhow!(
+            "open action is not supported on this operating system"
+        ));
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch system open command for `{target}`"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("system open command failed for `{target}`"))
+    }
 }
 
 struct ApiError(anyhow::Error);
@@ -188,6 +349,10 @@ const INDEX_HTML: &str = r#"<!doctype html>
       .title {
         font-weight: 600;
         line-height: 1.4;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 3;
+        overflow: hidden;
       }
 
       .meta,
@@ -251,6 +416,46 @@ const INDEX_HTML: &str = r#"<!doctype html>
         margin-top: 18px;
       }
 
+      .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+      }
+
+      .action-button {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: rgba(79, 209, 197, 0.08);
+        color: var(--text);
+        border-radius: 999px;
+        padding: 9px 14px;
+        cursor: pointer;
+        font: inherit;
+        transition: background 140ms ease, transform 140ms ease;
+      }
+
+      .action-button:hover {
+        background: rgba(79, 209, 197, 0.16);
+        transform: translateY(-1px);
+      }
+
+      .action-button:disabled {
+        opacity: 0.55;
+        cursor: default;
+        transform: none;
+      }
+
+      .notice {
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .error {
+        color: var(--danger);
+      }
+
       .section h2 {
         font-size: 13px;
         margin: 0 0 10px;
@@ -290,7 +495,6 @@ const INDEX_HTML: &str = r#"<!doctype html>
       <section class="panel sessions">
         <div class="hero">
           <h1>EagleWatch</h1>
-          <p>Local-first observability for Codex sessions. This first build shares one Rust core across CLI, TUI, and web.</p>
         </div>
         <header>
           <strong>Sessions</strong>
@@ -312,6 +516,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
     <script>
       let selectedId = null;
+      let sessionsCache = [];
 
       function relativeTime(dateString) {
         const deltaSeconds = Math.floor((Date.now() - new Date(dateString).getTime()) / 1000);
@@ -325,7 +530,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
         return (kind || "idle").replace(/[^a-z_]/g, "");
       }
 
+      function truncateText(text, maxChars) {
+        const chars = Array.from(text || "");
+        if (chars.length <= maxChars) return text;
+        if (maxChars <= 3) return ".".repeat(maxChars);
+        return `${chars.slice(0, maxChars - 3).join("")}...`;
+      }
+
       function renderSessions(sessions) {
+        sessionsCache = sessions;
         const root = document.getElementById("session-list");
         document.getElementById("session-count").textContent = `${sessions.length} visible`;
         root.innerHTML = "";
@@ -334,7 +547,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           const row = document.createElement("div");
           row.className = `session-row ${session.id === selectedId ? "active" : ""}`;
           row.innerHTML = `
-            <div class="title">${session.title}</div>
+            <div class="title">${truncateText(session.title, 170)}</div>
             <div class="meta">
               <span class="status ${statusClass(session.status.kind)}">${session.status.kind}</span>
               <span>${session.tokens.total_tokens.toLocaleString()} tokens</span>
@@ -363,6 +576,23 @@ const INDEX_HTML: &str = r#"<!doctype html>
         status.className = `status ${statusClass(detail.summary.status.kind)}`;
         status.textContent = detail.summary.status.kind;
 
+        const supportedNavigation = detail.summary.navigation.filter((target) =>
+          target.kind === "working_directory"
+        );
+
+        const actions = supportedNavigation.map((target) => `
+          <button class="action-button" type="button" onclick="openNavigation('${detail.summary.id}', '${target.kind}', this)">
+            ${target.label}
+          </button>
+        `).join("");
+
+        const appLabel = providerAppLabel(detail.summary);
+        const appAction = appLabel ? `
+          <button class="action-button" type="button" onclick="openApp('${detail.summary.id}', this)">
+            Open in ${appLabel}
+          </button>
+        ` : "";
+
         const events = detail.recent_events.slice().reverse().map((event) => `
           <li><strong>${new Date(event.timestamp).toLocaleTimeString()}</strong> ${event.summary}</li>
         `).join("");
@@ -373,6 +603,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
         document.getElementById("detail-body").innerHTML = `
           <div class="detail-grid">
+            <div><strong>Provider</strong><br>${detail.summary.provider}</div>
             <div><strong>Status</strong><br>${detail.summary.status.kind} (${detail.summary.status.confidence})</div>
             <div><strong>Tokens</strong><br>${detail.summary.tokens.total_tokens.toLocaleString()}</div>
             <div><strong>Created</strong><br>${new Date(detail.summary.created_at).toLocaleString()}</div>
@@ -387,6 +618,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <h2>Status Reason</h2>
             <div>${detail.summary.status.reason}</div>
           </div>
+
+          ${(appAction || actions) ? `
+            <div class="section">
+              <h2>Open</h2>
+              <div class="actions">${appAction}${actions}</div>
+              <div id="open-notice" class="notice"></div>
+            </div>
+          ` : ""}
 
           ${detail.last_assistant_message ? `
             <div class="section">
@@ -415,15 +654,98 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
 
       async function loadSessions() {
-        const response = await fetch("/api/sessions?limit=60");
-        const data = await response.json();
-        renderSessions(data.sessions);
+        try {
+          const response = await fetch("/api/sessions?limit=60");
+          if (!response.ok) {
+            throw new Error(`session list failed (${response.status})`);
+          }
+          const data = await response.json();
+          renderSessions(data.sessions);
+        } catch (error) {
+          document.getElementById("session-count").textContent = "failed";
+          document.getElementById("session-list").innerHTML = `<div class="session-row"><div class="title error">${error.message}</div></div>`;
+        }
       }
 
       async function loadDetail(id) {
-        const response = await fetch(`/api/sessions/${id}`);
-        const data = await response.json();
-        renderDetail(data);
+        try {
+          const response = await fetch(`/api/sessions/${id}`);
+          if (!response.ok) {
+            throw new Error(`session detail failed (${response.status})`);
+          }
+          const data = await response.json();
+          renderDetail(data);
+        } catch (error) {
+          document.getElementById("detail-body").innerHTML = `<p class="meta error">${error.message}</p>`;
+        }
+      }
+
+      function providerAppLabel(summary) {
+        if (summary.provider === "codex") return "Codex";
+        if (summary.provider === "claude") return "Claude";
+        return null;
+      }
+
+      async function openNavigation(sessionId, kind, button) {
+        const notice = document.getElementById("open-notice");
+        if (notice) {
+          notice.textContent = "";
+          notice.className = "notice";
+        }
+
+        button.disabled = true;
+        try {
+          const response = await fetch(`/api/sessions/${sessionId}/open?kind=${encodeURIComponent(kind)}`, {
+            method: "POST"
+          });
+
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || `open failed (${response.status})`);
+          }
+
+          if (notice) {
+            notice.textContent = `Opened ${data.label}.`;
+          }
+        } catch (error) {
+          if (notice) {
+            notice.textContent = error.message;
+            notice.className = "notice error";
+          }
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      async function openApp(sessionId, button) {
+        const notice = document.getElementById("open-notice");
+        if (notice) {
+          notice.textContent = "";
+          notice.className = "notice";
+        }
+
+        button.disabled = true;
+        try {
+          const response = await fetch(`/api/sessions/${sessionId}/open-app`, {
+            method: "POST"
+          });
+
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || `open app failed (${response.status})`);
+          }
+
+          if (notice) {
+            notice.textContent = `Opened ${data.label}.`;
+          }
+        } catch (error) {
+          if (notice) {
+            notice.textContent = error.message;
+            notice.className = "notice error";
+          }
+        } finally {
+          button.disabled = false;
+        }
       }
 
       loadSessions();

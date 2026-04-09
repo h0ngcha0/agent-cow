@@ -220,7 +220,7 @@ fn build_summary(
         machine_id: machine_id.to_string(),
         machine_label: machine_label.to_string(),
         provider: ProviderKind::Codex,
-        title: normalize_inline_text(&row.title),
+        title: normalize_title(&row.title),
         cwd: row.cwd.clone(),
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -622,11 +622,99 @@ fn compact_text(text: &str) -> String {
     truncate_chars(&text, 140)
 }
 
+fn normalize_title(text: &str) -> String {
+    let normalized = normalize_inline_text(text);
+    compact_automation_title(&normalized).unwrap_or(normalized)
+}
+
+fn compact_automation_title(text: &str) -> Option<String> {
+    let body = text.strip_prefix("Automation:")?.trim();
+
+    if let Some(id) = automation_id(body) {
+        let label = pascal_case_label(id);
+        if !label.is_empty() {
+            return Some(format!("Automation: {label}"));
+        }
+    }
+
+    let name = body
+        .split_once("Automation ID:")
+        .map(|(name, _)| name.trim())
+        .unwrap_or(body);
+    let label = pascal_case_label(name);
+
+    if label.is_empty() {
+        Some("Automation".to_string())
+    } else {
+        Some(format!("Automation: {label}"))
+    }
+}
+
 fn normalize_inline_text(text: &str) -> String {
-    text.split_whitespace()
+    collapse_markdown_links(text)
+        .split_whitespace()
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn collapse_markdown_links(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find('[') {
+        output.push_str(&rest[..start]);
+
+        let Some(label_end) = rest[start + 1..].find(']') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let label_end = start + 1 + label_end;
+        let label = &rest[start + 1..label_end];
+
+        let Some(after_label) = rest[label_end + 1..].strip_prefix('(') else {
+            output.push_str(&rest[start..=label_end]);
+            rest = &rest[label_end + 1..];
+            continue;
+        };
+
+        let Some(url_end) = after_label.find(')') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+
+        output.push_str(label);
+        rest = &after_label[url_end + 1..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn automation_id(text: &str) -> Option<&str> {
+    text.split_once("Automation ID:")
+        .map(|(_, tail)| tail.trim())
+        .and_then(|tail| tail.split_whitespace().next())
+}
+
+fn pascal_case_label(text: &str) -> String {
+    let mut normalized = String::new();
+
+    for part in text.split(|ch: char| !ch.is_alphanumeric()) {
+        if part.is_empty() {
+            continue;
+        }
+
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            normalized.extend(first.to_uppercase());
+        }
+        for ch in chars {
+            normalized.extend(ch.to_lowercase());
+        }
+    }
+
+    normalized
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -708,7 +796,7 @@ fn tail_lines(path: &Path, line_limit: usize) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_waiting_input;
+    use super::{looks_like_waiting_input, normalize_title};
     use chrono::Utc;
 
     #[test]
@@ -726,5 +814,27 @@ mod tests {
         let assistant = (now, "Which repo should I inspect first?".to_string());
 
         assert!(looks_like_waiting_input(Some(&assistant), None));
+    }
+
+    #[test]
+    fn normalize_title_compacts_automation_id() {
+        let title = "Automation: Sync Linear Automation ID: sync-linear Automation memory: $CODEX_HOME/automations/sync-linear/memory.md Last run: never";
+
+        assert_eq!(normalize_title(title), "Automation: SyncLinear");
+    }
+
+    #[test]
+    fn normalize_title_keeps_non_automation_titles() {
+        let title = "Investigate Docker image startup failure for backend service";
+
+        assert_eq!(normalize_title(title), title);
+    }
+
+    #[test]
+    fn normalize_title_collapses_markdown_skill_links() {
+        let title =
+            "[$superpowers](/Users/h0ngcha0/.codex/skills/superpowers/SKILL.md) Build the monitor";
+
+        assert_eq!(normalize_title(title), "$superpowers Build the monitor");
     }
 }
