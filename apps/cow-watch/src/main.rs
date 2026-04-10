@@ -135,15 +135,25 @@ fn init_tracing() {
 
 fn print_sessions(sessions: &[SessionSummary]) {
     println!(
-        "{:<14} {:>10} {:<8} {:<18} title",
-        "status", "tokens", "archived", "updated"
+        "{:<14} {:>8} {:>7} {:>10} {:<8} {:<18} title",
+        "status", "cost", "ctx", "tokens", "archived", "updated"
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(116));
 
     for session in sessions {
         println!(
-            "{:<14} {:>10} {:<8} {:<18} {}",
+            "{:<14} {:>8} {:>7} {:>10} {:<8} {:<18} {}",
             session.status.kind,
+            session
+                .cost
+                .as_ref()
+                .map(|cost| format_usd_short(cost.total_usd))
+                .unwrap_or_else(|| "--".to_string()),
+            session
+                .context_window
+                .as_ref()
+                .map(|context| format!("{}%", context.used_percent))
+                .unwrap_or_else(|| "--".to_string()),
             session.tokens.total_tokens,
             if session.archived { "yes" } else { "no" },
             relative_time(session.updated_at),
@@ -163,6 +173,25 @@ fn print_session_detail(detail: &SessionDetail) {
         summary.status.kind, summary.status.confidence, summary.status.reason
     );
     println!("Tokens: {}", summary.tokens.total_tokens);
+    if let Some(cost) = &summary.cost {
+        println!(
+            "Cost: ${:.4} (input ${:.4}, cached ${:.4}, output ${:.4}, {})",
+            cost.total_usd,
+            cost.input_usd,
+            cost.cached_input_usd,
+            cost.output_usd,
+            cost.pricing_source
+        );
+    }
+    if let Some(context) = &summary.context_window {
+        println!(
+            "Context: {} / {} used ({} remaining, {}%)",
+            context.used_tokens,
+            context.limit_tokens,
+            context.remaining_tokens,
+            context.used_percent
+        );
+    }
     println!("Created: {}", summary.created_at);
     println!("Updated: {}", summary.updated_at);
     println!("CWD: {}", summary.cwd);
@@ -239,4 +268,18 @@ fn truncate(input: &str, max_len: usize) -> String {
 
     let truncated: String = input.chars().take(max_len - 3).collect();
     format!("{truncated}...")
+}
+
+fn format_usd_short(value: f64) -> String {
+    if value >= 100.0 {
+        format!("${value:.0}")
+    } else if value >= 10.0 {
+        format!("${value:.1}")
+    } else if value >= 1.0 {
+        format!("${value:.2}")
+    } else if value >= 0.01 {
+        format!("${value:.3}")
+    } else {
+        format!("${value:.4}")
+    }
 }

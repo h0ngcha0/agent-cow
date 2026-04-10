@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionDetail, SessionList, SessionSummary};
+use crate::{SessionDetail, SessionList};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionQuery {
@@ -15,7 +14,7 @@ pub struct SessionQuery {
 
 #[async_trait]
 pub trait SessionSource: Send + Sync {
-    async fn list_sessions(&self, query: SessionQuery) -> Result<Vec<SessionSummary>>;
+    async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList>;
     async fn get_session(&self, id: &str) -> Result<SessionDetail>;
 }
 
@@ -30,11 +29,7 @@ impl MonitorService {
     }
 
     pub async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
-        let sessions = self.source.list_sessions(query).await?;
-        Ok(SessionList {
-            generated_at: Utc::now(),
-            sessions,
-        })
+        self.source.list_sessions(query).await
     }
 
     pub async fn latest_session(&self) -> Result<SessionDetail> {
@@ -47,6 +42,7 @@ impl MonitorService {
             .await?;
 
         let latest = list
+            .sessions
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("no sessions were found"))?;

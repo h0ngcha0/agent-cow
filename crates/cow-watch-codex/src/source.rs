@@ -4,26 +4,33 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use cow_watch_core::{
-    ActivityEvent, ActivityKind, NavigationKind, NavigationTarget, ProviderKind, SessionDetail,
-    SessionQuery, SessionSource, SessionStatus, SessionStatusKind, SessionSummary,
-    StatusConfidence, TokenUsage, ToolCallStat,
+    ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
+    PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionCost, SessionDetail,
+    SessionList, SessionQuery, SessionSource, SessionStatus, SessionStatusKind, SessionSummary,
+    StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
 };
 use directories::BaseDirs;
+use reqwest::Client;
 use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const SUMMARY_TAIL_LINES: usize = 96;
+const SUMMARY_TAIL_LINES: usize = 384;
 const DETAIL_TAIL_LINES: usize = 320;
 const RECENT_EVENT_LIMIT: usize = 48;
 const RUNNING_TTL_SECONDS: i64 = 90;
 const STALE_AFTER_MINUTES: i64 = 20;
+const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
+const LITELLM_PRICING_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+const LITELLM_PRICING_CACHE_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub struct CodexSource {
@@ -31,6 +38,8 @@ pub struct CodexSource {
     codex_home: PathBuf,
     machine_id: String,
     machine_label: String,
+    pricing_client: Client,
+    pricing_cache: Arc<Mutex<Option<LitellmPricingCache>>>,
     static_cache: Arc<Mutex<HashMap<PathBuf, TranscriptStatic>>>,
 }
 
@@ -66,11 +75,46 @@ struct RolloutHint {
     active_turns: usize,
     pending_call_ids: HashSet<String>,
     pending_call_names: HashMap<String, String>,
+    run_started_at: Option<DateTime<Utc>>,
+    run_active: bool,
     last_token_usage: Option<TokenUsage>,
+    context_window: Option<ContextWindowUsage>,
+    quota: Option<ProviderQuota>,
     last_user_message: Option<(DateTime<Utc>, String)>,
     last_assistant_message: Option<(DateTime<Utc>, String)>,
     recent_events: Vec<ActivityEvent>,
     tool_stats: HashMap<String, ToolCallStat>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexPricing {
+    input_per_million: f64,
+    cached_input_per_million: f64,
+    output_per_million: f64,
+    source: PricingSource,
+}
+
+type LitellmPricingMap = HashMap<String, LitellmPricingEntry>;
+
+#[derive(Clone, Debug)]
+struct LitellmPricingCache {
+    fetched_at_epoch_ms: i64,
+    entries: Arc<LitellmPricingMap>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LitellmPricingCacheFile {
+    fetched_at_epoch_ms: i64,
+    entries: LitellmPricingMap,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LitellmPricingEntry {
+    input_cost_per_token: Option<f64>,
+    cache_read_input_token_cost: Option<f64>,
+    output_cost_per_token: Option<f64>,
+    max_input_tokens: Option<u64>,
+    max_tokens: Option<u64>,
 }
 
 impl CodexSource {
@@ -86,6 +130,11 @@ impl CodexSource {
             codex_home,
             machine_id: machine_label.clone(),
             machine_label,
+            pricing_client: Client::builder()
+                .user_agent("cow-watch/0.1")
+                .build()
+                .expect("reqwest client should build"),
+            pricing_cache: Arc::new(Mutex::new(None)),
             static_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -332,13 +381,98 @@ impl CodexSource {
 
         inputs
     }
+
+    async fn litellm_pricing(&self) -> Option<Arc<LitellmPricingMap>> {
+        if let Some(entries) = self.cached_pricing_entries(true) {
+            return Some(entries);
+        }
+
+        let disk_cache = self.load_pricing_cache_from_disk();
+        if let Some(cache) = &disk_cache {
+            self.replace_pricing_cache(cache.clone());
+            if is_pricing_cache_fresh(cache.fetched_at_epoch_ms) {
+                return Some(cache.entries.clone());
+            }
+        }
+
+        if let Some(cache) = self.fetch_pricing_cache().await {
+            self.replace_pricing_cache(cache.clone());
+            self.store_pricing_cache_to_disk(&cache);
+            return Some(cache.entries);
+        }
+
+        disk_cache.map(|cache| cache.entries)
+    }
+
+    fn cached_pricing_entries(&self, require_fresh: bool) -> Option<Arc<LitellmPricingMap>> {
+        let guard = self.pricing_cache.lock().ok()?;
+        let cache = guard.as_ref()?;
+        if require_fresh && !is_pricing_cache_fresh(cache.fetched_at_epoch_ms) {
+            return None;
+        }
+        Some(cache.entries.clone())
+    }
+
+    fn replace_pricing_cache(&self, cache: LitellmPricingCache) {
+        if let Ok(mut guard) = self.pricing_cache.lock() {
+            *guard = Some(cache);
+        }
+    }
+
+    async fn fetch_pricing_cache(&self) -> Option<LitellmPricingCache> {
+        let response = self
+            .pricing_client
+            .get(LITELLM_PRICING_URL)
+            .send()
+            .await
+            .ok()?;
+        let response = response.error_for_status().ok()?;
+        let payload = response.json::<Value>().await.ok()?;
+        let entries = parse_litellm_pricing_map(&payload)?;
+
+        Some(LitellmPricingCache {
+            fetched_at_epoch_ms: now_epoch_millis(),
+            entries: Arc::new(entries),
+        })
+    }
+
+    fn load_pricing_cache_from_disk(&self) -> Option<LitellmPricingCache> {
+        let path = pricing_cache_path()?;
+        let raw = fs::read_to_string(path).ok()?;
+        let parsed = serde_json::from_str::<LitellmPricingCacheFile>(&raw).ok()?;
+        Some(LitellmPricingCache {
+            fetched_at_epoch_ms: parsed.fetched_at_epoch_ms,
+            entries: Arc::new(parsed.entries),
+        })
+    }
+
+    fn store_pricing_cache_to_disk(&self, cache: &LitellmPricingCache) {
+        let Some(path) = pricing_cache_path() else {
+            return;
+        };
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let payload = LitellmPricingCacheFile {
+            fetched_at_epoch_ms: cache.fetched_at_epoch_ms,
+            entries: (*cache.entries).clone(),
+        };
+
+        if let Ok(raw) = serde_json::to_string(&payload) {
+            let _ = fs::write(path, raw);
+        }
+    }
 }
 
 #[async_trait]
 impl SessionSource for CodexSource {
-    async fn list_sessions(&self, query: SessionQuery) -> Result<Vec<SessionSummary>> {
+    async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
         let now = Utc::now();
         let mut sessions = Vec::new();
+        let mut latest_quota: Option<(DateTime<Utc>, ProviderQuota)> = None;
+        let litellm_pricing = self.litellm_pricing().await;
 
         for row in self.load_threads()? {
             if !query.include_archived && row.archived {
@@ -351,13 +485,25 @@ impl SessionSource for CodexSource {
                 analyze_rollout(&PathBuf::from(&row.rollout_path), ReadMode::Summary).ok()
             };
 
-            sessions.push(build_summary(
+            let summary = build_summary(
                 &self.machine_id,
                 &self.machine_label,
                 &row,
                 hint.as_ref(),
+                litellm_pricing.as_deref(),
                 now,
-            ));
+            );
+
+            if let Some(quota) = hint.as_ref().and_then(|hint| hint.quota.clone()) {
+                let should_replace = latest_quota
+                    .as_ref()
+                    .is_none_or(|(updated_at, _)| row.updated_at >= *updated_at);
+                if should_replace {
+                    latest_quota = Some((row.updated_at, quota));
+                }
+            }
+
+            sessions.push(summary);
 
             if let Some(limit) = query.limit
                 && sessions.len() >= limit
@@ -366,18 +512,24 @@ impl SessionSource for CodexSource {
             }
         }
 
-        Ok(sessions)
+        Ok(SessionList {
+            generated_at: now,
+            overview: build_overview(&sessions, latest_quota.map(|(_, quota)| quota)),
+            sessions,
+        })
     }
 
     async fn get_session(&self, id: &str) -> Result<SessionDetail> {
         let now = Utc::now();
         let row = self.thread_by_id(id)?;
         let hint = analyze_rollout(&PathBuf::from(&row.rollout_path), ReadMode::Detail)?;
+        let litellm_pricing = self.litellm_pricing().await;
         let summary = build_summary(
             &self.machine_id,
             &self.machine_label,
             &row,
             Some(&hint),
+            litellm_pricing.as_deref(),
             now,
         );
 
@@ -412,6 +564,7 @@ fn build_summary(
     machine_label: &str,
     row: &ThreadRow,
     hint: Option<&RolloutHint>,
+    litellm_pricing: Option<&LitellmPricingMap>,
     now: DateTime<Utc>,
 ) -> SessionSummary {
     let mut tokens = hint
@@ -419,6 +572,11 @@ fn build_summary(
         .unwrap_or_default();
     tokens.total_tokens = tokens.total_tokens.max(row.tokens_used);
 
+    let pricing = row
+        .model
+        .as_deref()
+        .and_then(|model| resolve_codex_pricing(model, litellm_pricing));
+    let cost = pricing.and_then(|pricing| estimate_session_cost(&tokens, pricing));
     let status = derive_status(row, hint, now);
     let rollout_path = (!row.rollout_path.is_empty()).then_some(row.rollout_path.clone());
     let navigation = build_navigation(row, rollout_path.clone());
@@ -432,12 +590,16 @@ fn build_summary(
         cwd: row.cwd.clone(),
         created_at: row.created_at,
         updated_at: row.updated_at,
+        run_started_at: hint.and_then(|hint| hint.run_started_at.clone()),
+        run_active: hint.is_some_and(|hint| hint.run_active),
         archived: row.archived,
         model: row.model.clone(),
         agent_role: row.agent_role.clone(),
         git_branch: row.git_branch.clone(),
         git_origin_url: row.git_origin_url.clone(),
         tokens,
+        cost,
+        context_window: hint.and_then(|hint| hint.context_window.clone()),
         status,
         rollout_path,
         navigation,
@@ -468,6 +630,119 @@ fn build_navigation(row: &ThreadRow, rollout_path: Option<String>) -> Vec<Naviga
     }
 
     navigation
+}
+
+fn build_overview(sessions: &[SessionSummary], quota: Option<ProviderQuota>) -> UsageOverview {
+    let total_tokens = sessions
+        .iter()
+        .map(|session| session.tokens.total_tokens)
+        .sum();
+    let total_cost_usd = sessions
+        .iter()
+        .filter_map(|session| session.cost.as_ref().map(|cost| cost.total_usd))
+        .sum();
+    let sessions_with_cost = sessions
+        .iter()
+        .filter(|session| session.cost.is_some())
+        .count();
+    let sessions_with_context = sessions
+        .iter()
+        .filter(|session| session.context_window.is_some())
+        .count();
+
+    UsageOverview {
+        total_tokens,
+        total_cost_usd,
+        sessions_with_cost,
+        sessions_with_context,
+        quotas: quota.into_iter().collect(),
+    }
+}
+
+fn resolve_codex_pricing(
+    model: &str,
+    litellm_pricing: Option<&LitellmPricingMap>,
+) -> Option<CodexPricing> {
+    if let Some(entry) = litellm_pricing.and_then(|entries| find_litellm_entry(model, entries))
+        && let Some(pricing) = litellm_to_codex_pricing(entry)
+    {
+        return Some(pricing);
+    }
+
+    match model.to_ascii_lowercase().as_str() {
+        "gpt-5.4" => Some(CodexPricing {
+            input_per_million: 2.5,
+            cached_input_per_million: 0.25,
+            output_per_million: 15.0,
+            source: PricingSource::BuiltIn,
+        }),
+        "gpt-5.4-mini" => Some(CodexPricing {
+            input_per_million: 0.75,
+            cached_input_per_million: 0.075,
+            output_per_million: 4.5,
+            source: PricingSource::BuiltIn,
+        }),
+        "gpt-5.3-codex" => Some(CodexPricing {
+            input_per_million: 1.75,
+            cached_input_per_million: 0.175,
+            output_per_million: 14.0,
+            source: PricingSource::BuiltIn,
+        }),
+        "codex-mini-latest" => Some(CodexPricing {
+            input_per_million: 1.5,
+            cached_input_per_million: 0.375,
+            output_per_million: 6.0,
+            source: PricingSource::BuiltIn,
+        }),
+        _ => None,
+    }
+}
+
+fn find_litellm_entry<'a>(
+    model: &str,
+    entries: &'a LitellmPricingMap,
+) -> Option<&'a LitellmPricingEntry> {
+    entries
+        .get(model)
+        .or_else(|| entries.get(&format!("openai/{model}")))
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|(key, _)| key.contains(model))
+                .map(|(_, value)| value)
+        })
+}
+
+fn litellm_to_codex_pricing(entry: &LitellmPricingEntry) -> Option<CodexPricing> {
+    Some(CodexPricing {
+        input_per_million: entry.input_cost_per_token? * 1_000_000.0,
+        cached_input_per_million: entry.cache_read_input_token_cost.unwrap_or(0.0) * 1_000_000.0,
+        output_per_million: entry.output_cost_per_token? * 1_000_000.0,
+        source: PricingSource::LiteLlm,
+    })
+}
+
+fn estimate_session_cost(tokens: &TokenUsage, pricing: CodexPricing) -> Option<SessionCost> {
+    let input_tokens = tokens.input_tokens?;
+    let cached_input_tokens = tokens.cached_input_tokens.unwrap_or(0);
+    let output_tokens = tokens.output_tokens?;
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+
+    let input_usd = token_cost(uncached_input_tokens, pricing.input_per_million);
+    let cached_input_usd = token_cost(cached_input_tokens, pricing.cached_input_per_million);
+    let output_usd = token_cost(output_tokens, pricing.output_per_million);
+
+    Some(SessionCost {
+        input_usd,
+        cached_input_usd,
+        output_usd,
+        total_usd: input_usd + cached_input_usd + output_usd,
+        pricing_source: pricing.source,
+    })
+}
+
+fn token_cost(tokens: u64, rate_per_million: f64) -> f64 {
+    (tokens as f64 / 1_000_000.0) * rate_per_million
 }
 
 fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>) -> SessionStatus {
@@ -602,6 +877,11 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
     let lines = read_rollout_lines(path, mode)?;
     let mut hint = RolloutHint::default();
     let mut recent_events = VecDeque::with_capacity(RECENT_EVENT_LIMIT);
+    let mut open_turns = HashMap::<String, DateTime<Utc>>::new();
+    let mut unnamed_open_turns = Vec::<DateTime<Utc>>::new();
+    let mut latest_tool_call_at = None;
+    let mut latest_turn_id = None::<String>;
+    let mut latest_turn_first_seen_at = None;
 
     for line in lines {
         let value: Value = match serde_json::from_str(&line) {
@@ -619,6 +899,16 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
             .unwrap_or_default();
         let payload = value.get("payload").unwrap_or(&Value::Null);
 
+        if let (Some(timestamp), Some(turn_id)) = (timestamp, extract_turn_id(payload)) {
+            match latest_turn_id.as_deref() {
+                Some(current_turn_id) if current_turn_id == turn_id => {}
+                _ => {
+                    latest_turn_id = Some(turn_id.to_string());
+                    latest_turn_first_seen_at = Some(timestamp);
+                }
+            }
+        }
+
         match root_kind {
             "event_msg" => {
                 let event_kind = payload
@@ -629,6 +919,16 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                     "task_started" => {
                         hint.active_turns += 1;
                         if let Some(timestamp) = timestamp {
+                            remember_latest_timestamp(&mut hint.run_started_at, timestamp);
+                            if let Some(turn_id) = payload
+                                .get("turn_id")
+                                .and_then(Value::as_str)
+                                .filter(|turn_id| !turn_id.is_empty())
+                            {
+                                open_turns.insert(turn_id.to_string(), timestamp);
+                            } else {
+                                unnamed_open_turns.push(timestamp);
+                            }
                             push_recent_event(
                                 &mut recent_events,
                                 ActivityEvent {
@@ -641,6 +941,15 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                     }
                     "task_complete" => {
                         hint.active_turns = hint.active_turns.saturating_sub(1);
+                        if let Some(turn_id) = payload
+                            .get("turn_id")
+                            .and_then(Value::as_str)
+                            .filter(|turn_id| !turn_id.is_empty())
+                        {
+                            open_turns.remove(turn_id);
+                        } else {
+                            unnamed_open_turns.pop();
+                        }
                         if let Some(timestamp) = timestamp {
                             push_recent_event(
                                 &mut recent_events,
@@ -653,12 +962,21 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         }
                     }
                     "token_count" => {
-                        if let Some(token_usage) = payload
-                            .get("info")
-                            .and_then(|info| info.get("total_token_usage"))
-                            .and_then(parse_token_usage)
+                        if let Some(info) = payload.get("info") {
+                            if let Some(token_usage) =
+                                info.get("total_token_usage").and_then(parse_token_usage)
+                            {
+                                hint.last_token_usage = Some(token_usage);
+                            }
+
+                            if let Some(context_window) = parse_context_window_usage(info) {
+                                hint.context_window = Some(context_window);
+                            }
+                        }
+
+                        if let Some(quota) = payload.get("rate_limits").and_then(parse_codex_quota)
                         {
-                            hint.last_token_usage = Some(token_usage);
+                            hint.quota = Some(quota);
                         }
                     }
                     "agent_message" => {
@@ -681,6 +999,7 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         if let (Some(timestamp), Some(message)) =
                             (timestamp, payload.get("message").and_then(Value::as_str))
                         {
+                            remember_latest_timestamp(&mut hint.run_started_at, timestamp);
                             let message = compact_text(message);
                             hint.last_user_message = Some((timestamp, message.clone()));
                             push_recent_event(
@@ -720,6 +1039,7 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         }
 
                         if let Some(timestamp) = timestamp {
+                            remember_latest_timestamp(&mut latest_tool_call_at, timestamp);
                             push_recent_event(
                                 &mut recent_events,
                                 ActivityEvent {
@@ -781,8 +1101,37 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
         }
     }
 
+    let open_turn_started_at = open_turns
+        .values()
+        .copied()
+        .chain(unnamed_open_turns.iter().copied())
+        .min();
+    hint.run_active = open_turn_started_at.is_some() || !hint.pending_call_ids.is_empty();
+
+    hint.run_started_at = open_turn_started_at
+        .or_else(|| {
+            (!hint.pending_call_ids.is_empty())
+                .then_some(latest_tool_call_at)
+                .flatten()
+        })
+        .or(latest_turn_first_seen_at)
+        .or(hint.run_started_at);
+
     hint.recent_events = recent_events.into_iter().collect();
     Ok(hint)
+}
+
+fn remember_latest_timestamp(slot: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
+    if slot.is_none_or(|current| timestamp > current) {
+        *slot = Some(timestamp);
+    }
+}
+
+fn extract_turn_id(payload: &Value) -> Option<&str> {
+    payload
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .filter(|turn_id| !turn_id.is_empty())
 }
 
 fn parse_transcript_static(path: &Path) -> Result<TranscriptStatic> {
@@ -959,6 +1308,178 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
         output_tokens: value.get("output_tokens").and_then(Value::as_u64),
         reasoning_output_tokens: value.get("reasoning_output_tokens").and_then(Value::as_u64),
     })
+}
+
+fn parse_context_window_usage(info: &Value) -> Option<ContextWindowUsage> {
+    let used_tokens = info
+        .get("last_token_usage")
+        .and_then(|value| value.get("input_tokens"))
+        .and_then(Value::as_u64)?;
+    let limit_tokens = info
+        .get("model_context_window")
+        .and_then(Value::as_u64)
+        .unwrap_or(CODEX_DEFAULT_CONTEXT_WINDOW);
+    let remaining_tokens = limit_tokens.saturating_sub(used_tokens);
+    let used_percent = if limit_tokens == 0 {
+        0
+    } else {
+        (((used_tokens as f64 / limit_tokens as f64) * 100.0).round() as u16).min(100) as u8
+    };
+
+    Some(ContextWindowUsage {
+        used_tokens,
+        limit_tokens,
+        remaining_tokens,
+        used_percent,
+    })
+}
+
+fn parse_codex_quota(value: &Value) -> Option<ProviderQuota> {
+    let mut windows = Vec::new();
+
+    if let Some(primary) = value
+        .get("primary")
+        .and_then(parse_quota_window)
+        .or_else(|| value.get("primary_window").and_then(parse_quota_window))
+    {
+        windows.push(QuotaWindow {
+            label: "5h".to_string(),
+            ..primary
+        });
+    }
+
+    if let Some(secondary) = value
+        .get("secondary")
+        .and_then(parse_quota_window)
+        .or_else(|| value.get("secondary_window").and_then(parse_quota_window))
+    {
+        windows.push(QuotaWindow {
+            label: "7d".to_string(),
+            ..secondary
+        });
+    }
+
+    if windows.is_empty() && value.get("plan_type").is_none() {
+        return None;
+    }
+
+    Some(ProviderQuota {
+        provider: ProviderKind::Codex,
+        plan: value
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        windows,
+        limit_reached: value
+            .get("limit_reached")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn parse_quota_window(value: &Value) -> Option<QuotaWindow> {
+    let used_percent = value
+        .get("used_percent")
+        .and_then(Value::as_f64)
+        .map(|value| value.round() as u16)
+        .or_else(|| {
+            value
+                .get("utilization")
+                .and_then(Value::as_f64)
+                .map(|value| (value * 100.0).round() as u16)
+        })?
+        .min(100) as u8;
+
+    let reset_at = value
+        .get("resets_at")
+        .or_else(|| value.get("reset_at"))
+        .and_then(parse_reset_at)
+        .or_else(|| {
+            value
+                .get("resets_in_seconds")
+                .and_then(Value::as_i64)
+                .map(|seconds| Utc::now() + Duration::seconds(seconds))
+        });
+    let window_minutes = value
+        .get("window_minutes")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("limit_window_seconds")
+                .and_then(Value::as_u64)
+                .map(|seconds| seconds / 60)
+        });
+
+    Some(QuotaWindow {
+        label: String::new(),
+        used_percent,
+        remaining_percent: 100_u8.saturating_sub(used_percent),
+        reset_at,
+        window_minutes,
+    })
+}
+
+fn parse_reset_at(value: &Value) -> Option<DateTime<Utc>> {
+    match value {
+        Value::String(text) => parse_rfc3339(text),
+        Value::Number(number) => {
+            let seconds = number.as_i64()?;
+            unix_timestamp_to_utc(seconds).ok()
+        }
+        _ => None,
+    }
+}
+
+fn parse_litellm_pricing_map(value: &Value) -> Option<LitellmPricingMap> {
+    let object = value.as_object()?;
+    let mut entries = LitellmPricingMap::new();
+
+    for (model, entry) in object {
+        let Some(entry_object) = entry.as_object() else {
+            continue;
+        };
+
+        entries.insert(
+            model.clone(),
+            LitellmPricingEntry {
+                input_cost_per_token: entry_object
+                    .get("input_cost_per_token")
+                    .and_then(Value::as_f64),
+                cache_read_input_token_cost: entry_object
+                    .get("cache_read_input_token_cost")
+                    .and_then(Value::as_f64),
+                output_cost_per_token: entry_object
+                    .get("output_cost_per_token")
+                    .and_then(Value::as_f64),
+                max_input_tokens: entry_object.get("max_input_tokens").and_then(Value::as_u64),
+                max_tokens: entry_object.get("max_tokens").and_then(Value::as_u64),
+            },
+        );
+    }
+
+    (!entries.is_empty()).then_some(entries)
+}
+
+fn pricing_cache_path() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(
+        base_dirs
+            .cache_dir()
+            .join("cow-watch")
+            .join("litellm_pricing.json"),
+    )
+}
+
+fn is_pricing_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+    let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
+    age_ms >= 0 && age_ms <= LITELLM_PRICING_CACHE_TTL.as_millis() as i64
+}
+
+fn now_epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 fn push_recent_event(events: &mut VecDeque<ActivityEvent>, event: ActivityEvent) {
@@ -1421,8 +1942,9 @@ fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        looks_like_waiting_input, normalize_codex_home, normalize_title, parse_state_db_version,
-        parse_transcript_static, state_db_candidates_for_input, user_title_candidate,
+        ReadMode, analyze_rollout, looks_like_waiting_input, normalize_codex_home, normalize_title,
+        parse_state_db_version, parse_transcript_static, state_db_candidates_for_input,
+        user_title_candidate,
     };
     use chrono::Utc;
     use directories::BaseDirs;
@@ -1580,6 +2102,38 @@ mod tests {
             Some("git@example.com:repo.git")
         );
         assert_eq!(parsed.title, "$superpowers Build the monitor");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_rollout_tracks_latest_run_start_instead_of_thread_start() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cow-watch-rollout-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path =
+            root.join("rollout-2026-04-10T20-55-21-019d73f2-20fb-70f2-9ba5-13810d786a22.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-04-09T20:32:21.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019d73f2-20fb-70f2-9ba5-13810d786a22\",\"timestamp\":\"2026-04-09T20:32:21.000Z\",\"cwd\":\"/tmp/project\"}}\n",
+                "{\"timestamp\":\"2026-04-09T20:32:22.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"old-turn\"}}\n",
+                "{\"timestamp\":\"2026-04-09T20:35:22.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"old-turn\"}}\n",
+                "{\"timestamp\":\"2026-04-10T20:55:21.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"new-turn\"}}\n",
+                "{\"timestamp\":\"2026-04-10T20:55:21.500Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"check duration\"}}\n",
+                "{\"timestamp\":\"2026-04-10T20:56:00.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"exec_command\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+        let run_started_at = hint.run_started_at.unwrap();
+
+        assert_eq!(run_started_at.to_rfc3339(), "2026-04-10T20:55:21+00:00");
+        assert!(hint.run_active);
 
         fs::remove_dir_all(root).unwrap();
     }

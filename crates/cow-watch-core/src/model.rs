@@ -82,6 +82,68 @@ pub struct TokenUsage {
     pub reasoning_output_tokens: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SessionCost {
+    pub input_usd: f64,
+    pub cached_input_usd: f64,
+    pub output_usd: f64,
+    pub total_usd: f64,
+    pub pricing_source: PricingSource,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingSource {
+    BuiltIn,
+    LiteLlm,
+    #[default]
+    Unknown,
+}
+
+impl fmt::Display for PricingSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BuiltIn => f.write_str("built_in"),
+            Self::LiteLlm => f.write_str("litellm"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextWindowUsage {
+    pub used_tokens: u64,
+    pub limit_tokens: u64,
+    pub remaining_tokens: u64,
+    pub used_percent: u8,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuotaWindow {
+    pub label: String,
+    pub used_percent: u8,
+    pub remaining_percent: u8,
+    pub reset_at: Option<DateTime<Utc>>,
+    pub window_minutes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderQuota {
+    pub provider: ProviderKind,
+    pub plan: Option<String>,
+    pub windows: Vec<QuotaWindow>,
+    pub limit_reached: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct UsageOverview {
+    pub total_tokens: u64,
+    pub total_cost_usd: f64,
+    pub sessions_with_cost: usize,
+    pub sessions_with_context: usize,
+    pub quotas: Vec<ProviderQuota>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NavigationKind {
@@ -131,12 +193,16 @@ pub struct SessionSummary {
     pub cwd: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub run_started_at: Option<DateTime<Utc>>,
+    pub run_active: bool,
     pub archived: bool,
     pub model: Option<String>,
     pub agent_role: Option<String>,
     pub git_branch: Option<String>,
     pub git_origin_url: Option<String>,
     pub tokens: TokenUsage,
+    pub cost: Option<SessionCost>,
+    pub context_window: Option<ContextWindowUsage>,
     pub status: SessionStatus,
     pub rollout_path: Option<String>,
     pub navigation: Vec<NavigationTarget>,
@@ -156,5 +222,6 @@ pub struct SessionDetail {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionList {
     pub generated_at: DateTime<Utc>,
+    pub overview: UsageOverview,
     pub sessions: Vec<SessionSummary>,
 }

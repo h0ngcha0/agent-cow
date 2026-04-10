@@ -8,7 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use cow_watch_core::{
     ActivityKind, MonitorService, NavigationKind, SessionDetail, SessionQuery, SessionStatusKind,
-    SessionSummary, TokenUsage,
+    SessionSummary, TokenUsage, UsageOverview,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -106,6 +106,7 @@ async fn run_loop(
 
 struct TuiApp {
     sessions: Vec<SessionSummary>,
+    overview: UsageOverview,
     filtered_indices: Vec<usize>,
     detail: Option<SessionDetail>,
     table_state: TableState,
@@ -133,6 +134,7 @@ impl TuiApp {
 
         Self {
             sessions: Vec::new(),
+            overview: UsageOverview::default(),
             filtered_indices: Vec::new(),
             detail: None,
             table_state,
@@ -159,6 +161,7 @@ impl TuiApp {
             .await?;
 
         self.sessions = response.sessions;
+        self.overview = response.overview;
         self.last_refresh = Instant::now();
         self.error = None;
 
@@ -556,17 +559,13 @@ fn render_brand_cluster(width: u16) -> Paragraph<'static> {
 
 fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
     vec![
-        meta_line("Host", app.visible_host_label()),
-        meta_line(
+        header_meta_line("Host", app.visible_host_label()),
+        header_meta_line(
             "Sessions",
             format!("{}/{}", app.filtered_indices.len(), app.sessions.len()),
         ),
-        meta_line(
-            "Updated",
-            app.selected_summary()
-                .map(|session| relative_age(session.updated_at))
-                .unwrap_or_else(|| "n/a".to_string()),
-        ),
+        header_meta_line("Spend", format_usd_short(app.overview.total_cost_usd)),
+        header_meta_line("Tokens", format_tokens_short(app.overview.total_tokens)),
     ]
 }
 
@@ -751,12 +750,14 @@ fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
         Cell::from("LAST").style(Style::default().fg(Color::Rgb(201, 210, 220))),
         Cell::from("DUR").style(Style::default().fg(accent_gold())),
         Cell::from("NAME").style(Style::default().fg(text_primary_color())),
+        Cell::from("PROJECT").style(Style::default().fg(accent_cyan())),
     ];
     let mut constraints = vec![
         Constraint::Length(widths.state),
         Constraint::Length(widths.age),
         Constraint::Length(widths.duration),
         Constraint::Length(widths.name),
+        Constraint::Length(widths.project),
     ];
 
     if show_provider {
@@ -771,6 +772,12 @@ fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
 
     header_cells.push(Cell::from("MODEL").style(Style::default().fg(accent_blue())));
     constraints.push(Constraint::Length(widths.model));
+
+    header_cells.push(Cell::from("COST").style(Style::default().fg(accent_green())));
+    constraints.push(Constraint::Length(widths.cost));
+
+    header_cells.push(Cell::from("CTX").style(Style::default().fg(accent_magenta())));
+    constraints.push(Constraint::Length(widths.context));
 
     header_cells.push(Cell::from("TOKENS").style(Style::default().fg(accent_gold())));
     constraints.push(Constraint::Length(widths.tokens));
@@ -795,6 +802,11 @@ fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
                     widths.name.saturating_sub(1) as usize,
                 ))
                 .style(Style::default().fg(text_primary_color())),
+                Cell::from(truncate_chars(
+                    &project_label(session),
+                    widths.project.saturating_sub(1) as usize,
+                ))
+                .style(Style::default().fg(accent_cyan())),
             ];
 
             if show_provider {
@@ -823,6 +835,28 @@ fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
                     widths.model.saturating_sub(1) as usize,
                 ))
                 .style(model_style(session.model.as_deref().unwrap_or("n/a"))),
+            );
+
+            cells.push(
+                Cell::from(
+                    session
+                        .cost
+                        .as_ref()
+                        .map(|cost| format_usd_short(cost.total_usd))
+                        .unwrap_or_else(|| "--".to_string()),
+                )
+                .style(cost_style(session.cost.as_ref().map(|cost| cost.total_usd))),
+            );
+
+            cells.push(
+                Cell::from(
+                    session
+                        .context_window
+                        .as_ref()
+                        .map(|context| format!("{}%", context.used_percent))
+                        .unwrap_or_else(|| "--".to_string()),
+                )
+                .style(context_style(session.context_window.as_ref())),
             );
 
             cells.push(
@@ -857,7 +891,10 @@ fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
 struct SessionTableWidths {
     state: u16,
     duration: u16,
+    cost: u16,
+    context: u16,
     name: u16,
+    project: u16,
     provider: Option<u16>,
     host: Option<u16>,
     model: u16,
@@ -873,7 +910,10 @@ fn session_table_widths(
     #[derive(Clone, Copy)]
     enum ColumnId {
         State,
+        Cost,
+        Context,
         Name,
+        Project,
         Provider,
         Host,
         Model,
@@ -886,7 +926,10 @@ fn session_table_widths(
         (ColumnId::State, 1_u16, 1_u16),
         (ColumnId::Age, 4, 5),
         (ColumnId::Duration, 4, 5),
-        (ColumnId::Name, 22_u16, 38_u16),
+        (ColumnId::Cost, 6, 5),
+        (ColumnId::Context, 4, 5),
+        (ColumnId::Name, 16_u16, 26_u16),
+        (ColumnId::Project, 8_u16, 10_u16),
     ];
     if show_provider {
         columns.push((ColumnId::Provider, 4, 6));
@@ -920,7 +963,10 @@ fn session_table_widths(
     let mut widths = SessionTableWidths {
         state: 1,
         duration: 4,
+        cost: 6,
+        context: 4,
         name: 24,
+        project: 10,
         provider: None,
         host: None,
         model: 8,
@@ -932,7 +978,10 @@ fn session_table_widths(
         match id {
             ColumnId::State => widths.state = width,
             ColumnId::Duration => widths.duration = width,
+            ColumnId::Cost => widths.cost = width,
+            ColumnId::Context => widths.context = width,
             ColumnId::Name => widths.name = width,
+            ColumnId::Project => widths.project = width,
             ColumnId::Provider => widths.provider = Some(width),
             ColumnId::Host => widths.host = Some(width),
             ColumnId::Model => widths.model = width,
@@ -958,24 +1007,25 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &TuiApp) {
         return;
     };
 
-    let title = format!(
-        "describe({}) {}",
-        short_status_label(&detail.summary.status.kind),
-        truncate_chars(&detail.summary.title, 42)
-    );
-
     frame.render_widget(
         Paragraph::new(Text::from(detail_lines(detail)))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(panel_border_color()))
-                    .title(Line::from(Span::styled(
-                        title,
-                        Style::default()
-                            .fg(accent_cyan())
-                            .add_modifier(Modifier::BOLD),
-                    ))),
+                    .title(Line::from(vec![
+                        Span::styled(
+                            "Describe",
+                            Style::default()
+                                .fg(accent_cyan())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(" • ", Style::default().fg(text_muted_color())),
+                        Span::styled(
+                            short_status_label(&detail.summary.status.kind),
+                            status_style(&detail.summary.status.kind).add_modifier(Modifier::BOLD),
+                        ),
+                    ])),
             )
             .wrap(Wrap { trim: true }),
         area,
@@ -1029,60 +1079,165 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
 fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
     let summary = &detail.summary;
     let mut lines = vec![
-        meta_line("Title", truncate_chars(&summary.title, 120)),
+        Line::from(Span::styled(
+            truncate_chars(&summary.title, 220),
+            Style::default()
+                .fg(text_primary_color())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        section_header("Overview"),
         Line::from(vec![
             info_label("Status"),
             Span::styled(
                 short_status_label(&summary.status.kind),
                 status_style(&summary.status.kind),
             ),
-            Span::raw("   "),
+            subtle_bullet(),
             info_label("Confidence"),
-            Span::raw(summary.status.confidence.to_string()),
+            Span::styled(
+                summary.status.confidence.to_string(),
+                Style::default().fg(text_muted_color()),
+            ),
         ]),
         Line::from(vec![
             info_label("Started"),
             Span::raw(summary.created_at.format("%Y-%m-%d %H:%M").to_string()),
-            Span::raw("   "),
-            info_label("Duration"),
-            Span::raw(session_duration(summary)),
-            Span::raw("   "),
+            subtle_bullet(),
+            info_label("Updated"),
+            Span::styled(
+                format!("{} ago", relative_age(summary.updated_at)),
+                Style::default().fg(text_primary_color()),
+            ),
+        ]),
+        Line::from(vec![
+            info_label("Model"),
+            Span::styled(
+                summary.model.clone().unwrap_or_else(|| "n/a".to_string()),
+                model_style(summary.model.as_deref().unwrap_or("n/a")),
+            ),
+            subtle_bullet(),
             info_label("Provider"),
             Span::raw(summary.provider.to_string()),
+            subtle_bullet(),
+            info_label("Machine"),
+            Span::raw(summary.machine_label.clone()),
         ]),
+        Line::from(""),
+        section_header("Usage"),
         Line::from(vec![
-            info_label("Updated"),
-            Span::raw(relative_age(summary.updated_at)),
-            Span::raw(" ago"),
-            Span::raw("   "),
-            info_label("Model"),
-            Span::raw(summary.model.clone().unwrap_or_else(|| "n/a".to_string())),
+            info_label("Cost"),
+            Span::styled(
+                summary
+                    .cost
+                    .as_ref()
+                    .map(|cost| format!("{} total", format_usd_short(cost.total_usd)))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                Style::default()
+                    .fg(accent_green())
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
+    ];
+
+    if let Some(run_started_at) = summary
+        .run_started_at
+        .filter(|run_started_at| *run_started_at > summary.created_at)
+    {
+        lines.insert(
+            5,
+            Line::from(vec![
+                info_label("Run"),
+                Span::raw(run_started_at.format("%Y-%m-%d %H:%M").to_string()),
+                subtle_bullet(),
+                info_label("Duration"),
+                Span::styled(session_duration(summary), duration_style(summary)),
+                subtle_bullet(),
+                info_label("Live"),
+                Span::styled(
+                    if summary.run_active { "yes" } else { "no" },
+                    if summary.run_active {
+                        Style::default().fg(accent_green())
+                    } else {
+                        Style::default().fg(text_muted_color())
+                    },
+                ),
+            ]),
+        );
+    } else {
+        lines.insert(
+            5,
+            Line::from(vec![
+                info_label("Duration"),
+                Span::styled(session_duration(summary), duration_style(summary)),
+            ]),
+        );
+    }
+
+    if let Some(cost) = &summary.cost {
+        lines.push(Line::from(vec![
+            indent(),
+            Span::styled(
+                format!(
+                    "input {}  •  cached {}  •  output {}",
+                    format_usd_short(cost.input_usd),
+                    format_usd_short(cost.cached_input_usd),
+                    format_usd_short(cost.output_usd)
+                ),
+                Style::default().fg(text_muted_color()),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(vec![
+        info_label("Context"),
+        Span::styled(
+            summary
+                .context_window
+                .as_ref()
+                .map(format_context_window)
+                .unwrap_or_else(|| "n/a".to_string()),
+            context_style(summary.context_window.as_ref()),
+        ),
+    ]));
+
+    if let Some(context) = &summary.context_window {
+        lines.push(context_bar_line(context));
+    }
+
+    lines.extend([
         Line::from(vec![
             info_label("Tokens"),
-            Span::raw(token_breakdown(&summary.tokens)),
-            Span::raw("   "),
-            info_label("Turns"),
-            Span::raw(format!(
-                "{} active / {} pending tools",
-                detail.active_turns, detail.pending_tool_calls
-            )),
+            Span::styled(
+                token_breakdown(&summary.tokens),
+                Style::default().fg(text_primary_color()),
+            ),
         ]),
+        Line::from(vec![
+            info_label("Turns"),
+            Span::styled(
+                format!(
+                    "{} active  •  {} pending tools",
+                    detail.active_turns, detail.pending_tool_calls
+                ),
+                Style::default().fg(text_primary_color()),
+            ),
+        ]),
+        Line::from(""),
+        section_header("Workspace"),
         meta_line("Workdir", summary.cwd.clone()),
-    ];
+    ]);
 
     if let Some(branch) = &summary.git_branch {
         lines.push(meta_line("Branch", branch.clone()));
     }
 
+    lines.push(Line::from(""));
+    lines.push(section_header("Execution"));
     lines.push(meta_line("Reason", summary.status.reason.clone()));
     lines.push(meta_line("Tools", render_tool_summary(&detail.tool_stats)));
-    lines.push(Line::from(Span::styled(
-        "Recent activity",
-        Style::default()
-            .fg(accent_cyan())
-            .add_modifier(Modifier::BOLD),
-    )));
+    lines.push(Line::from(""));
+    lines.push(section_header("Recent Activity"));
 
     let mut recent: Vec<_> = detail.recent_events.iter().rev().take(6).collect();
     recent.reverse();
@@ -1106,12 +1261,17 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
         }
     }
 
+    if detail.last_user_message.is_some() || detail.last_assistant_message.is_some() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Messages"));
+    }
+
     if let Some(message) = &detail.last_user_message {
-        lines.push(meta_line("Last user", truncate_chars(message, 120)));
+        lines.push(meta_line("Last user", truncate_chars(message, 140)));
     }
 
     if let Some(message) = &detail.last_assistant_message {
-        lines.push(meta_line("Last reply", truncate_chars(message, 120)));
+        lines.push(meta_line("Last reply", truncate_chars(message, 140)));
     }
 
     lines
@@ -1146,6 +1306,48 @@ fn meta_line(label: &str, value: String) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
     ])
+}
+
+fn header_meta_line(label: &str, value: String) -> Line<'static> {
+    meta_line(label, truncate_chars(&value, 8))
+}
+
+fn section_header(label: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        label.to_string(),
+        Style::default()
+            .fg(accent_cyan())
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn subtle_bullet() -> Span<'static> {
+    Span::styled("  •  ", Style::default().fg(text_muted_color()))
+}
+
+fn indent() -> Span<'static> {
+    Span::raw("          ")
+}
+
+fn context_bar_line(context: &cow_watch_core::ContextWindowUsage) -> Line<'static> {
+    let filled = ((context.used_percent as usize * 24) / 100).min(24);
+    let mut spans = vec![indent()];
+
+    for index in 0..24 {
+        let style = if index < filled {
+            context_style(Some(context))
+        } else {
+            Style::default().fg(Color::Rgb(86, 90, 102))
+        };
+        spans.push(Span::styled("━", style));
+    }
+
+    spans.push(Span::styled(
+        format!("  {}%", context.used_percent),
+        Style::default().fg(text_muted_color()),
+    ));
+
+    Line::from(spans)
 }
 
 fn info_label(label: &str) -> Span<'static> {
@@ -1200,6 +1402,15 @@ fn short_provider(session: &SessionSummary) -> String {
     session.provider.to_string().chars().take(3).collect()
 }
 
+fn project_label(session: &SessionSummary) -> String {
+    std::path::Path::new(&session.cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("n/a")
+        .to_string()
+}
+
 fn header_border_color() -> Color {
     Color::Rgb(46, 210, 153)
 }
@@ -1241,11 +1452,18 @@ fn text_muted_color() -> Color {
 }
 
 fn session_elapsed(session: &SessionSummary) -> chrono::Duration {
-    let end = match session.status.kind {
-        SessionStatusKind::Completed | SessionStatusKind::Failed => session.updated_at,
-        _ => Utc::now(),
+    let start = session.run_started_at.unwrap_or(session.created_at);
+    let end = if session.run_active {
+        Utc::now()
+    } else {
+        session.updated_at
     };
-    end.signed_duration_since(session.created_at)
+
+    if end < start {
+        chrono::Duration::zero()
+    } else {
+        end.signed_duration_since(start)
+    }
 }
 
 fn relative_age_style(updated_at: DateTime<Utc>) -> Style {
@@ -1274,6 +1492,32 @@ fn duration_style(session: &SessionSummary) -> Style {
         Style::default().fg(accent_gold())
     } else {
         Style::default().fg(accent_magenta())
+    }
+}
+
+fn cost_style(total_cost: Option<f64>) -> Style {
+    match total_cost.unwrap_or(0.0) {
+        value if value >= 25.0 => Style::default()
+            .fg(accent_red())
+            .add_modifier(Modifier::BOLD),
+        value if value >= 5.0 => Style::default().fg(accent_gold()),
+        value if value > 0.0 => Style::default().fg(accent_green()),
+        _ => Style::default().fg(text_muted_color()),
+    }
+}
+
+fn context_style(context: Option<&cow_watch_core::ContextWindowUsage>) -> Style {
+    let used_percent = context.map(|context| context.used_percent).unwrap_or(0);
+    if used_percent >= 85 {
+        Style::default()
+            .fg(accent_red())
+            .add_modifier(Modifier::BOLD)
+    } else if used_percent >= 65 {
+        Style::default().fg(accent_gold())
+    } else if context.is_some() {
+        Style::default().fg(accent_magenta())
+    } else {
+        Style::default().fg(text_muted_color())
     }
 }
 
@@ -1384,6 +1628,16 @@ fn render_tool_summary(tools: &[cow_watch_core::ToolCallStat]) -> String {
         .join(", ")
 }
 
+fn format_context_window(context: &cow_watch_core::ContextWindowUsage) -> String {
+    format!(
+        "{} / {} used  •  {} left  •  {}%",
+        format_tokens_short(context.used_tokens),
+        format_tokens_short(context.limit_tokens),
+        format_tokens_short(context.remaining_tokens),
+        context.used_percent
+    )
+}
+
 fn aggregate_label<I>(mut values: I, plural_label: &str) -> Option<String>
 where
     I: Iterator<Item = String>,
@@ -1457,6 +1711,22 @@ fn format_tokens_short(tokens: u64) -> String {
         format!("{:.0}K", tokens as f64 / 1_000.0)
     } else {
         tokens.to_string()
+    }
+}
+
+fn format_usd_short(value: f64) -> String {
+    if value >= 100.0 {
+        format!("${value:.0}")
+    } else if value >= 10.0 {
+        format!("${value:.1}")
+    } else if value >= 1.0 {
+        format!("${value:.2}")
+    } else if value >= 0.01 {
+        format!("${value:.3}")
+    } else if value > 0.0 {
+        format!("${value:.4}")
+    } else {
+        "$0".to_string()
     }
 }
 

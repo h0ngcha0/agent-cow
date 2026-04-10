@@ -248,7 +248,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
       .pulse-strip {
         display: grid;
-        grid-template-columns: repeat(7, minmax(0, 1fr));
+        grid-template-columns: repeat(9, minmax(0, 1fr));
         gap: 10px;
         padding: 12px 18px;
         border-bottom: 1px solid rgba(128, 167, 173, 0.12);
@@ -568,7 +568,9 @@ const INDEX_HTML: &str = r#"<!doctype html>
         <div class="hero">
           <h1>cow-watch</h1>
           <div class="hero-meta">
-            <span>session console</span>
+            <span id="hero-spend">spend --</span>
+            <span id="hero-tokens">tokens --</span>
+            <span id="hero-quota">quota --</span>
             <span id="last-sync">syncing…</span>
           </div>
         </div>
@@ -585,10 +587,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <thead>
               <tr>
                 <th style="width:78px;">St</th>
-                <th style="width:72px;">Prv</th>
+                <th style="width:140px;">Project</th>
+                <th style="width:150px;">Model</th>
+                <th style="width:82px;">Cost</th>
+                <th style="width:72px;">Ctx</th>
                 <th style="width:96px;">Tokens</th>
                 <th style="width:74px;">Age</th>
-                <th style="width:150px;">Workdir</th>
                 <th>Session</th>
               </tr>
             </thead>
@@ -613,6 +617,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
     <script>
       let selectedId = null;
       let sessionsCache = [];
+      let overviewCache = null;
       let filterQuery = "";
 
       function escapeHtml(value) {
@@ -656,6 +661,33 @@ const INDEX_HTML: &str = r#"<!doctype html>
         return `${tokens}`;
       }
 
+      function formatUsd(value) {
+        if (!value || value <= 0) return "$0";
+        if (value >= 100) return `$${value.toFixed(0)}`;
+        if (value >= 10) return `$${value.toFixed(1)}`;
+        if (value >= 1) return `$${value.toFixed(2)}`;
+        if (value >= 0.01) return `$${value.toFixed(3)}`;
+        return `$${value.toFixed(4)}`;
+      }
+
+      function formatContext(context) {
+        if (!context) return "--";
+        return `${context.used_percent}%`;
+      }
+
+      function quotaSummary(quotas) {
+        const quota = (quotas || [])[0];
+        if (!quota) return "quota n/a";
+
+        const parts = [];
+        if (quota.plan) parts.push(quota.plan);
+        for (const window of quota.windows || []) {
+          parts.push(`${window.label} ${window.used_percent}%`);
+        }
+        if (quota.limit_reached) parts.push("limit");
+        return `quota ${parts.join("  ") || "n/a"}`;
+      }
+
       function pulseCounts(sessions) {
         return sessions.reduce((acc, session) => {
           const key = session.status.kind || "unknown";
@@ -689,10 +721,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
         });
       }
 
-      function renderPulseStrip(sessions) {
+      function renderPulseStrip(sessions, overview) {
         const counts = pulseCounts(sessions);
         const root = document.getElementById("pulse-strip");
         const metrics = [
+          ["SPEND", formatUsd(overview?.total_cost_usd || 0)],
+          ["TOKENS", formatTokens(overview?.total_tokens || 0)],
           ["RUN", counts.running],
           ["BUSY", counts.tool_busy],
           ["WAIT", counts.waiting_input],
@@ -710,14 +744,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
         `).join("");
       }
 
-      function renderSessions(sessions) {
+      function renderSessions(sessions, overview) {
         sessionsCache = sessions;
+        overviewCache = overview || null;
         const filtered = filterSessions(sessions);
         const tbody = document.getElementById("session-table-body");
 
-        renderPulseStrip(sessions);
+        renderPulseStrip(sessions, overview);
         document.getElementById("session-count").textContent = `${filtered.length}/${sessions.length} visible`;
         document.getElementById("last-sync").textContent = `sync ${new Date().toLocaleTimeString()}`;
+        document.getElementById("hero-spend").textContent = `spend ${formatUsd(overview?.total_cost_usd || 0)}`;
+        document.getElementById("hero-tokens").textContent = `tokens ${formatTokens(overview?.total_tokens || 0)}`;
+        document.getElementById("hero-quota").textContent = quotaSummary(overview?.quotas);
 
         if (!filtered.some((session) => session.id === selectedId)) {
           selectedId = filtered[0]?.id || null;
@@ -726,7 +764,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         if (!filtered.length) {
           tbody.innerHTML = `
             <tr>
-              <td class="empty-state" colspan="6">No sessions match the current filter.</td>
+              <td class="empty-state" colspan="8">No sessions match the current filter.</td>
             </tr>
           `;
           document.getElementById("detail-title").textContent = "No matching session";
@@ -740,16 +778,18 @@ const INDEX_HTML: &str = r#"<!doctype html>
           return;
         }
 
-        tbody.innerHTML = filtered.map((session) => `
+          tbody.innerHTML = filtered.map((session) => `
           <tr class="${session.id === selectedId ? "active" : ""}" data-session-id="${escapeHtml(session.id)}">
             <td><span class="status ${statusClass(session.status.kind)}">${escapeHtml(session.status.kind)}</span></td>
-            <td>${escapeHtml(session.provider)}</td>
+            <td class="mono">${escapeHtml(pathTail(session.cwd))}</td>
+            <td>${escapeHtml(session.model || "n/a")}</td>
+            <td>${escapeHtml(formatUsd(session.cost?.total_usd || 0))}</td>
+            <td>${escapeHtml(formatContext(session.context_window))}</td>
             <td>${escapeHtml(formatTokens(session.tokens.total_tokens))}</td>
             <td>${escapeHtml(relativeTime(session.updated_at))}</td>
-            <td class="mono">${escapeHtml(pathTail(session.cwd))}</td>
             <td class="title-cell">
               <strong>${escapeHtml(truncateText(session.title, 150))}</strong>
-              <div class="subline">${escapeHtml(truncateText(session.cwd, 90))}</div>
+              <div class="subline">${escapeHtml(truncateText(`${session.cwd}${session.context_window ? ` · ${session.context_window.used_tokens.toLocaleString()}/${session.context_window.limit_tokens.toLocaleString()}` : ""}`, 120))}</div>
             </td>
           </tr>
         `).join("");
@@ -757,7 +797,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         tbody.querySelectorAll("tr[data-session-id]").forEach((row) => {
           row.addEventListener("click", () => {
             selectedId = row.dataset.sessionId;
-            renderSessions(sessionsCache);
+            renderSessions(sessionsCache, overview);
             loadDetail(selectedId);
           });
         });
@@ -805,15 +845,19 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <div><strong>Provider</strong>${escapeHtml(detail.summary.provider)}</div>
               <div><strong>Status</strong>${escapeHtml(detail.summary.status.kind)} (${escapeHtml(detail.summary.status.confidence)})</div>
               <div><strong>Tokens</strong>${detail.summary.tokens.total_tokens.toLocaleString()}</div>
+              <div><strong>Cost</strong>${escapeHtml(formatUsd(detail.summary.cost?.total_usd || 0))}</div>
               <div><strong>Updated</strong>${escapeHtml(relativeTime(detail.summary.updated_at))}</div>
               <div><strong>Model</strong>${escapeHtml(detail.summary.model || "n/a")}</div>
               <div><strong>Machine</strong>${escapeHtml(detail.summary.machine_label)}</div>
+              <div><strong>Context</strong>${detail.summary.context_window ? `${detail.summary.context_window.used_tokens.toLocaleString()} / ${detail.summary.context_window.limit_tokens.toLocaleString()} (${detail.summary.context_window.used_percent}%)` : "n/a"}</div>
+              <div><strong>Remaining</strong>${detail.summary.context_window ? detail.summary.context_window.remaining_tokens.toLocaleString() : "n/a"}</div>
               <div><strong>Active Turns</strong>${escapeHtml(detail.active_turns)}</div>
               <div><strong>Pending Tools</strong>${escapeHtml(detail.pending_tool_calls)}</div>
               <div><strong>Workdir</strong><span class="mono">${escapeHtml(detail.summary.cwd)}</span></div>
               <div><strong>Branch</strong>${escapeHtml(detail.summary.git_branch || "n/a")}</div>
             </div>
             <div class="summary-line">${escapeHtml(detail.summary.status.reason)}</div>
+            ${detail.summary.cost ? `<div class="summary-line">input ${escapeHtml(formatUsd(detail.summary.cost.input_usd))} · cached ${escapeHtml(formatUsd(detail.summary.cost.cached_input_usd))} · output ${escapeHtml(formatUsd(detail.summary.cost.output_usd))} · ${escapeHtml(detail.summary.cost.pricing_source)}</div>` : ""}
           </div>
 
           ${(appAction || actions) ? `
@@ -850,12 +894,12 @@ const INDEX_HTML: &str = r#"<!doctype html>
             throw new Error(`session list failed (${response.status})`);
           }
           const data = await response.json();
-          renderSessions(data.sessions);
+          renderSessions(data.sessions, data.overview);
         } catch (error) {
           document.getElementById("session-count").textContent = "failed";
           document.getElementById("session-table-body").innerHTML = `
             <tr>
-              <td class="empty-state error" colspan="6">${escapeHtml(error.message)}</td>
+              <td class="empty-state error" colspan="8">${escapeHtml(error.message)}</td>
             </tr>
           `;
         }
@@ -944,7 +988,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
       document.getElementById("filter-input").addEventListener("input", (event) => {
         filterQuery = event.target.value || "";
-        renderSessions(sessionsCache);
+        renderSessions(sessionsCache, overviewCache);
       });
 
       loadSessions();
