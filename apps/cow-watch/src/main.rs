@@ -7,15 +7,15 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use eaglewatch_codex::CodexSource;
-use eaglewatch_core::{MonitorService, SessionDetail, SessionQuery, SessionSummary};
+use cow_watch_codex::CodexSource;
+use cow_watch_core::{MonitorService, SessionDetail, SessionQuery, SessionSummary};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser, Debug)]
-#[command(name = "eaglewatch")]
+#[command(name = "cow-watch")]
 #[command(about = "Local-first observability for coding-agent sessions")]
 struct Cli {
-    #[arg(long, env = "EAGLEWATCH_CODEX_HOME")]
+    #[arg(long, env = "COW_WATCH_CODEX_HOME")]
     codex_home: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -66,7 +66,10 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let source = match cli.codex_home {
+    let codex_home = cli
+        .codex_home
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from));
+    let source = match codex_home {
         Some(path) => CodexSource::new(path),
         None => CodexSource::from_default_home()?,
     };
@@ -125,15 +128,15 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("eaglewatch=info,eaglewatch_codex=info"));
+        .unwrap_or_else(|_| EnvFilter::new("cow_watch=info,cow_watch_codex=info"));
 
     fmt().with_env_filter(filter).without_time().init();
 }
 
 fn print_sessions(sessions: &[SessionSummary]) {
     println!(
-        "{:<14} {:>10} {:<8} {:<18} {}",
-        "status", "tokens", "archived", "updated", "title"
+        "{:<14} {:>10} {:<8} {:<18} title",
+        "status", "tokens", "archived", "updated"
     );
     println!("{}", "-".repeat(96));
 

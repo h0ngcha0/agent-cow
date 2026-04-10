@@ -296,6 +296,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cow-watch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "cow-watch-codex",
+ "cow-watch-core",
+ "crossterm 0.29.0",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cow-watch-codex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "cow-watch-core",
+ "directories",
+ "rusqlite",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "cow-watch-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "crossterm"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -422,50 +466,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
-]
-
-[[package]]
-name = "eaglewatch"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "clap",
- "crossterm 0.29.0",
- "eaglewatch-codex",
- "eaglewatch-core",
- "ratatui",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "eaglewatch-codex"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "directories",
- "eaglewatch-core",
- "rusqlite",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "eaglewatch-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "serde",
- "serde_json",
 ]
 
 [[package]]

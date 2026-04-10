@@ -1,7 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
 use anyhow::{Context, Result, anyhow};
-use eaglewatch_core::{NavigationKind, ProviderKind, SessionSummary};
+use cow_watch_core::{NavigationKind, ProviderKind, SessionSummary};
 
 pub struct OpenAction {
     pub label: String,

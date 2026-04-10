@@ -1,5 +1,5 @@
 [package]
-name = "eaglewatch"
+name = "cow-watch"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,8 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
-eaglewatch-codex = { path = "../../crates/eaglewatch-codex" }
-eaglewatch-core = { path = "../../crates/eaglewatch-core" }
+cow-watch-codex = { path = "../../crates/cow-watch-codex" }
+cow-watch-core = { path = "../../crates/cow-watch-core" }
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

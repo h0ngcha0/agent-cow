@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "apps/eaglewatch",
-    "crates/eaglewatch-codex",
-    "crates/eaglewatch-core",
+    "apps/cow-watch",
+    "crates/cow-watch-codex",
+    "crates/cow-watch-core",
 ]
 resolver = "2"
 
