@@ -750,7 +750,7 @@ fn draw_loading(frame: &mut Frame) {
         ])
         .split(layout[1]);
 
-    let brand_width = body[0].width.min(22);
+    let brand_width = body[0].width.saturating_sub(6).clamp(22, 76);
     let brand_row = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -808,15 +808,13 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
             Constraint::Length(18),
             Constraint::Length(action_gap),
             Constraint::Length(action_width),
-            Constraint::Min(0),
-            Constraint::Length(20),
-            Constraint::Length(2),
+            Constraint::Min(22),
         ])
         .split(body);
 
     frame.render_widget(render_header_meta(app), columns[0]);
     frame.render_widget(render_action_grid(&action_rows), columns[2]);
-    frame.render_widget(render_brand_cluster(columns[4].width), columns[4]);
+    frame.render_widget(render_brand_cluster(columns[3].width), columns[3]);
 }
 
 fn render_brand_cluster(width: u16) -> Paragraph<'static> {
@@ -990,44 +988,191 @@ fn keymap_cell_spans(
 }
 
 fn cow_watch_brand_cluster_lines(width: u16) -> Vec<Line<'static>> {
-    let frame = animated_cow_frame(Utc::now());
-    let area_width = width as usize;
-    let ascii_lines = animated_cow_lines(frame.eyes, frame.tail);
-    let block_width = ascii_lines
+    let now = Utc::now();
+    let frame = animated_cow_frame(now);
+    let ascii_lines = animated_cow_lines(frame.eyes, frame.mouth, frame.tail);
+    brand_cluster_lines(width as usize, &ascii_lines, now)
+}
+
+fn brand_cluster_lines(
+    width: usize,
+    cow_lines: &[String],
+    now: DateTime<Utc>,
+) -> Vec<Line<'static>> {
+    let cow_width = cow_lines
         .iter()
         .map(|line| line.chars().count())
         .max()
         .unwrap_or(0);
-    let left_pad = width_for_alignment(area_width, block_width);
-    ascii_lines
-        .into_iter()
-        .map(|line| positioned_brand_line(left_pad, &line))
-        .collect()
-}
 
-fn positioned_brand_line(offset: usize, value: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(" ".repeat(offset)),
-        Span::styled(
-            value.to_string(),
-            Style::default()
-                .fg(accent_gold())
-                .add_modifier(Modifier::BOLD),
-        ),
-    ])
+    if let Some(bubble) = header_bubble_layout(width, cow_width, now) {
+        return compose_brand_cluster(width, cow_lines, &bubble);
+    }
+
+    let left_pad = width_for_alignment(width, cow_width);
+    cow_lines
+        .iter()
+        .map(|line| Line::from(vec![Span::raw(" ".repeat(left_pad)), cow_span(line)]))
+        .collect()
 }
 
 fn width_for_alignment(area_width: usize, block_width: usize) -> usize {
     area_width.saturating_sub(block_width + 2)
 }
 
+struct BubbleLayout {
+    line_one: String,
+    line_two: String,
+    inner_width: usize,
+}
+
+const HEADER_BUBBLE_INNER_WIDTH: usize = 34;
+const HEADER_BUBBLE_MIN_INNER_WIDTH: usize = 24;
+const HEADER_BUBBLE_ROTATE_MS: i64 = 20_000;
+const HEADER_BUBBLE_TALK_MS: i64 = 2_400;
+
+fn header_bubble_layout(
+    total_width: usize,
+    cow_width: usize,
+    now: DateTime<Utc>,
+) -> Option<BubbleLayout> {
+    let connector_width = 3usize;
+    let border_width = 4usize;
+    let max_inner_width = total_width
+        .saturating_sub(cow_width)
+        .saturating_sub(connector_width)
+        .saturating_sub(border_width);
+
+    if max_inner_width < HEADER_BUBBLE_MIN_INNER_WIDTH {
+        return None;
+    }
+
+    let (raw_one, raw_two) = header_bubble_message(now);
+    let inner_width = HEADER_BUBBLE_INNER_WIDTH.min(max_inner_width);
+
+    Some(BubbleLayout {
+        line_one: truncate_chars(raw_one, inner_width),
+        line_two: truncate_chars(raw_two, inner_width),
+        inner_width,
+    })
+}
+
+fn compose_brand_cluster(
+    width: usize,
+    cow_lines: &[String],
+    bubble: &BubbleLayout,
+) -> Vec<Line<'static>> {
+    let cow_width = cow_lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let top = format!(".{}.", "-".repeat(bubble.inner_width + 2));
+    let line_one = format!(
+        "| {:<width$} |",
+        bubble.line_one,
+        width = bubble.inner_width
+    );
+    let line_two = format!(
+        "| {:<width$} |",
+        bubble.line_two,
+        width = bubble.inner_width
+    );
+    let bottom = format!("'{}'", "-".repeat(bubble.inner_width + 2));
+    let blank = " ".repeat(bottom.chars().count());
+    let gap_plain = "   ";
+    let gap_tail_one = " \\ ";
+    let gap_tail_two = "   ";
+    let block_width = bottom.chars().count() + gap_plain.chars().count() + cow_width;
+    let left_pad = width_for_alignment(width, block_width);
+
+    vec![
+        brand_cluster_line(width, left_pad, &top, gap_plain, &cow_lines[0], true),
+        brand_cluster_line(width, left_pad, &line_one, gap_plain, &cow_lines[1], false),
+        brand_cluster_line(width, left_pad, &line_two, gap_plain, &cow_lines[2], false),
+        brand_cluster_line(width, left_pad, &bottom, gap_tail_one, &cow_lines[3], false),
+        brand_cluster_line(width, left_pad, &blank, gap_tail_two, &cow_lines[4], false),
+    ]
+}
+
+fn brand_cluster_line(
+    total_width: usize,
+    left_pad: usize,
+    bubble: &str,
+    connector: &str,
+    cow: &str,
+    top_border: bool,
+) -> Line<'static> {
+    let bubble_style = if top_border {
+        Style::default()
+            .fg(accent_cyan())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(120, 229, 255))
+    };
+
+    let used_width =
+        left_pad + bubble.chars().count() + connector.chars().count() + cow.chars().count();
+    let trailing = total_width.saturating_sub(used_width);
+
+    Line::from(vec![
+        Span::raw(" ".repeat(left_pad)),
+        Span::styled(bubble.to_string(), bubble_style),
+        Span::styled(
+            connector.to_string(),
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
+        cow_span(cow),
+        Span::raw(" ".repeat(trailing)),
+    ])
+}
+
+fn cow_span(value: &str) -> Span<'static> {
+    Span::styled(
+        value.to_string(),
+        Style::default()
+            .fg(accent_gold())
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn header_bubble_message(now: DateTime<Utc>) -> (&'static str, &'static str) {
+    const MESSAGES: &[(&str, &str)] = &[
+        ("Follow the hottest threads", "Catch who needs you next"),
+        ("Watch the live agent herd", "See who is waiting now"),
+        ("Keep context pressure in view", "Spot compaction early"),
+        (
+            "Track what the model is doing",
+            "Open the thread that matters",
+        ),
+    ];
+
+    let index = ((now.timestamp_millis() / HEADER_BUBBLE_ROTATE_MS)
+        .rem_euclid(MESSAGES.len() as i64)) as usize;
+    MESSAGES[index]
+}
+
 struct CowFrame {
     eyes: &'static str,
+    mouth: &'static str,
     tail: &'static str,
 }
 
 fn animated_cow_frame(now: DateTime<Utc>) -> CowFrame {
     let blink = ((now.timestamp_millis() / 350).rem_euclid(6)) as usize;
+    let cycle_ms = now.timestamp_millis().rem_euclid(HEADER_BUBBLE_ROTATE_MS);
+    let mouth = if cycle_ms < HEADER_BUBBLE_TALK_MS {
+        match ((cycle_ms / 240).rem_euclid(4)) as usize {
+            0 => "__",
+            1 => "~~",
+            2 => "--",
+            _ => "oo",
+        }
+    } else {
+        "__"
+    };
     let tail = match blink {
         1 | 2 => "/",
         4 | 5 => "\\",
@@ -1035,14 +1180,14 @@ fn animated_cow_frame(now: DateTime<Utc>) -> CowFrame {
     };
     let eyes = if matches!(blink, 2 | 5) { "--" } else { "oo" };
 
-    CowFrame { eyes, tail }
+    CowFrame { eyes, mouth, tail }
 }
 
-fn animated_cow_lines(eyes: &str, tail: &str) -> Vec<String> {
+fn animated_cow_lines(eyes: &str, mouth: &str, tail: &str) -> Vec<String> {
     vec![
         "^__^".to_string(),
         format!("({eyes})\\_______"),
-        "(__)\\       )\\/\\".to_string(),
+        format!("({mouth})\\       )\\/\\"),
         format!("    ||----w {tail}"),
         "    ||     ||".to_string(),
     ]
@@ -2926,16 +3071,63 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::animated_cow_lines;
+    use super::{animated_cow_lines, brand_cluster_lines};
+    use chrono::{TimeZone, Utc};
+    use ratatui::text::Line;
+
+    fn flatten_line(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 
     #[test]
     fn animated_cow_lines_match_standard_body() {
-        let lines = animated_cow_lines("oo", "|");
+        let lines = animated_cow_lines("oo", "__", "|");
 
         assert_eq!(lines[0], "^__^");
         assert_eq!(lines[1], "(oo)\\_______");
         assert_eq!(lines[2], "(__)\\       )\\/\\");
         assert_eq!(lines[3], "    ||----w |");
         assert_eq!(lines[4], "    ||     ||");
+    }
+
+    #[test]
+    fn brand_cluster_keeps_cow_alignment_across_messages() {
+        let cow = animated_cow_lines("oo", "__", "|");
+        let first = brand_cluster_lines(
+            70,
+            &cow,
+            Utc.with_ymd_and_hms(2026, 4, 11, 10, 0, 0).unwrap(),
+        );
+        let second = brand_cluster_lines(
+            70,
+            &cow,
+            Utc.with_ymd_and_hms(2026, 4, 11, 10, 1, 0).unwrap(),
+        );
+
+        let first_strings = first.iter().map(flatten_line).collect::<Vec<_>>();
+        let second_strings = second.iter().map(flatten_line).collect::<Vec<_>>();
+
+        for row in 0..5 {
+            let first_cow = first_strings[row]
+                .find('^')
+                .or_else(|| first_strings[row].find('('))
+                .or_else(|| first_strings[row].find('|'));
+            let second_cow = second_strings[row]
+                .find('^')
+                .or_else(|| second_strings[row].find('('))
+                .or_else(|| second_strings[row].find('|'));
+            assert_eq!(first_cow, second_cow, "row {row} cow column drifted");
+        }
+    }
+
+    #[test]
+    fn animated_cow_mouth_keeps_row_width_constant() {
+        let closed = animated_cow_lines("oo", "__", "|");
+        let talking = animated_cow_lines("oo", "~~", "|");
+
+        assert_eq!(closed[2].chars().count(), talking[2].chars().count());
     }
 }
