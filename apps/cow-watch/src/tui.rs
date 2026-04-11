@@ -716,21 +716,16 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
         height: area.height.saturating_sub(1),
     };
 
-    let (action_column_a, action_column_b, action_column_c) = header_action_columns(app);
-    let action_a_width = keymap_column_width(&action_column_a, 10);
-    let action_b_width = keymap_column_width(&action_column_b, 7);
-    let action_c_width = keymap_column_width(&action_column_c, 8);
+    let action_rows = header_action_rows(app);
+    let action_width = keymap_grid_width(&action_rows);
+    let action_gap = u16::from(action_width > 0) * 5;
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(18),
-            Constraint::Length(4),
-            Constraint::Length(action_a_width),
-            Constraint::Length(4),
-            Constraint::Length(action_b_width),
-            Constraint::Length(4),
-            Constraint::Length(action_c_width),
+            Constraint::Length(action_gap),
+            Constraint::Length(action_width),
             Constraint::Min(0),
             Constraint::Length(20),
             Constraint::Length(2),
@@ -738,20 +733,8 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
         .split(body);
 
     frame.render_widget(render_header_meta(app), columns[0]);
-    frame.render_widget(render_action_column(&action_column_a, 10), columns[2]);
-    frame.render_widget(render_action_column(&action_column_b, 7), columns[4]);
-    frame.render_widget(render_action_column(&action_column_c, 8), columns[6]);
-    frame.render_widget(render_brand_cluster(columns[8].width), columns[8]);
-}
-
-fn render_action_column(items: &[Option<KeymapItem>], key_width: usize) -> Paragraph<'static> {
-    Paragraph::new(Text::from(
-        items
-            .iter()
-            .cloned()
-            .map(|item| keymap_grid_line(item, key_width))
-            .collect::<Vec<_>>(),
-    ))
+    frame.render_widget(render_action_grid(&action_rows), columns[2]);
+    frame.render_widget(render_brand_cluster(columns[4].width), columns[4]);
 }
 
 fn render_brand_cluster(width: u16) -> Paragraph<'static> {
@@ -783,100 +766,128 @@ fn render_header_meta(app: &TuiApp) -> Paragraph<'static> {
     Paragraph::new(Text::from(header_meta_lines(app)))
 }
 
-type HeaderActionColumns = (
-    Vec<Option<KeymapItem>>,
-    Vec<Option<KeymapItem>>,
-    Vec<Option<KeymapItem>>,
-);
+type HeaderActionRows = Vec<(Option<KeymapItem>, Option<KeymapItem>)>;
 
-fn header_action_columns(app: &TuiApp) -> HeaderActionColumns {
-    let primary = vec![
-        Some(action_item(
-            "enter",
-            if app.detail_mode { "Back" } else { "Describe" },
-            true,
-        )),
-        Some(action_item("/", "Filter", !app.detail_mode)),
-        Some(action_item(
-            "esc",
-            if app.detail_mode { "Back" } else { "Clear" },
-            true,
-        )),
-        Some(action_item("r", "Refresh", true)),
-        None,
-        None,
-        None,
-    ];
-    let secondary = vec![
-        Some(action_item("o", "Open", true)),
-        Some(action_item("f", "Folder", true)),
-        Some(action_item("j/k", "Move", true)),
-        Some(action_item("Home", "Top", true)),
-        Some(action_item("End", "End", true)),
-        None,
-        None,
-    ];
-    let tertiary = vec![
-        Some(action_item("PgUp", "Page Up", true)),
-        Some(action_item("PgDn", "Page Down", true)),
-        Some(action_item("q", "Quit", true)),
-        None,
-        None,
-        None,
-        None,
-    ];
-
-    (primary, secondary, tertiary)
+fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
+    if app.detail_mode {
+        vec![
+            (
+                Some(action_item("enter/esc", "Back", true)),
+                Some(action_item("o", "Open", true)),
+            ),
+            (
+                Some(action_item("j/k", "Scroll", true)),
+                Some(action_item("f", "Folder", true)),
+            ),
+            (
+                Some(action_item("r", "Refresh", true)),
+                Some(action_item("q", "Quit", true)),
+            ),
+        ]
+    } else if app.filter_input.is_empty() {
+        vec![
+            (
+                Some(action_item("enter", "Describe", true)),
+                Some(action_item("o", "Open", true)),
+            ),
+            (
+                Some(action_item("j/k", "Move", true)),
+                Some(action_item("f", "Folder", true)),
+            ),
+            (
+                Some(action_item("/", "Filter", true)),
+                Some(action_item("r", "Refresh", true)),
+            ),
+            (Some(action_item("q", "Quit", true)), None),
+        ]
+    } else {
+        vec![
+            (
+                Some(action_item("enter", "Describe", true)),
+                Some(action_item("o", "Open", true)),
+            ),
+            (
+                Some(action_item("j/k", "Move", true)),
+                Some(action_item("f", "Folder", true)),
+            ),
+            (
+                Some(action_item("/", "Filter", true)),
+                Some(action_item("r", "Refresh", true)),
+            ),
+            (
+                Some(action_item("esc", "Clear", true)),
+                Some(action_item("q", "Quit", true)),
+            ),
+        ]
+    }
 }
 
 fn render_header_actions(frame: &mut Frame, area: Rect, app: &TuiApp) {
-    let (action_column_a, action_column_b, action_column_c) = header_action_columns(app);
-    render_header_actions_compact(
-        frame,
-        area,
-        &action_column_a,
-        &action_column_b,
-        &action_column_c,
-    );
+    let rows = header_action_rows(app);
+    frame.render_widget(render_action_grid(&rows), area);
 }
 
-fn render_header_actions_compact(
-    frame: &mut Frame,
-    area: Rect,
-    action_column_a: &[Option<KeymapItem>],
-    action_column_b: &[Option<KeymapItem>],
-    action_column_c: &[Option<KeymapItem>],
-) {
-    let action_a_width = keymap_column_width(action_column_a, 10);
-    let action_b_width = keymap_column_width(action_column_b, 7);
-    let action_c_width = keymap_column_width(action_column_c, 8);
+fn render_action_grid(rows: &HeaderActionRows) -> Paragraph<'static> {
+    let left_metrics = keymap_column_metrics(rows.iter().filter_map(|(left, _)| left.as_ref()));
+    let right_metrics = keymap_column_metrics(rows.iter().filter_map(|(_, right)| right.as_ref()));
+    let gap = if left_metrics.cell_width > 0 && right_metrics.cell_width > 0 {
+        6
+    } else {
+        0
+    };
 
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(action_a_width),
-            Constraint::Length(1),
-            Constraint::Length(action_b_width),
-            Constraint::Length(1),
-            Constraint::Length(action_c_width),
-        ])
-        .split(area);
-
-    frame.render_widget(render_action_column(action_column_a, 10), columns[0]);
-    frame.render_widget(render_action_column(action_column_b, 7), columns[2]);
-    frame.render_widget(render_action_column(action_column_c, 8), columns[4]);
+    Paragraph::new(Text::from(
+        rows.iter()
+            .map(|(left, right)| {
+                keymap_grid_row(
+                    left.as_ref(),
+                    right.as_ref(),
+                    &left_metrics,
+                    &right_metrics,
+                    gap,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ))
 }
 
-fn keymap_grid_line(item: Option<KeymapItem>, key_width: usize) -> Line<'static> {
+fn keymap_grid_row(
+    left: Option<&KeymapItem>,
+    right: Option<&KeymapItem>,
+    left_metrics: &KeymapColumnMetrics,
+    right_metrics: &KeymapColumnMetrics,
+    gap: usize,
+) -> Line<'static> {
+    let mut spans = keymap_cell_spans(left, left_metrics);
+    if right_metrics.cell_width > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(keymap_cell_spans(right, right_metrics));
+    }
+    Line::from(spans)
+}
+
+fn keymap_cell_spans(
+    item: Option<&KeymapItem>,
+    metrics: &KeymapColumnMetrics,
+) -> Vec<Span<'static>> {
     match item {
         Some(item) => {
-            let key = format!("<{}>", item.key);
-            Line::from(vec![
-                Span::styled(format!("{key:<width$}", width = key_width), item.key_style),
-                Span::styled(item.label, item.label_style),
-            ])
+            let key = item.display_key();
+            let key_padding = metrics
+                .key_width
+                .saturating_sub(key.chars().count())
+                .saturating_add(2);
+            let label_width = metrics.cell_width.saturating_sub(metrics.key_width + 2);
+            vec![
+                Span::styled(key, item.key_style),
+                Span::raw(" ".repeat(key_padding)),
+                Span::styled(
+                    format!("{:<width$}", item.label, width = label_width),
+                    item.label_style,
+                ),
+            ]
         }
-        None => Line::from(""),
+        None => vec![Span::raw(" ".repeat(metrics.cell_width))],
     }
 }
 
@@ -939,13 +950,40 @@ fn animated_cow_lines(eyes: &str, tail: &str) -> Vec<String> {
     ]
 }
 
-fn keymap_column_width(items: &[Option<KeymapItem>], key_width: usize) -> u16 {
-    items
-        .iter()
-        .filter_map(|item| item.as_ref())
-        .map(|item| (key_width + item.label.chars().count()) as u16)
-        .max()
-        .unwrap_or(key_width as u16)
+fn keymap_grid_width(rows: &HeaderActionRows) -> u16 {
+    let left_metrics = keymap_column_metrics(rows.iter().filter_map(|(left, _)| left.as_ref()));
+    let right_metrics = keymap_column_metrics(rows.iter().filter_map(|(_, right)| right.as_ref()));
+    let gap = u16::from(left_metrics.cell_width > 0 && right_metrics.cell_width > 0) * 6;
+    (left_metrics.cell_width as u16)
+        .saturating_add(gap)
+        .saturating_add(right_metrics.cell_width as u16)
+}
+
+#[derive(Default)]
+struct KeymapColumnMetrics {
+    key_width: usize,
+    cell_width: usize,
+}
+
+fn keymap_column_metrics<'a>(items: impl Iterator<Item = &'a KeymapItem>) -> KeymapColumnMetrics {
+    let mut key_width = 0;
+    let mut label_width = 0;
+    let mut has_items = false;
+
+    for item in items {
+        has_items = true;
+        key_width = key_width.max(item.display_key().chars().count());
+        label_width = label_width.max(item.label.chars().count());
+    }
+
+    if !has_items {
+        return KeymapColumnMetrics::default();
+    }
+
+    KeymapColumnMetrics {
+        key_width,
+        cell_width: key_width + 2 + label_width,
+    }
 }
 
 fn render_sessions_table(
@@ -1369,9 +1407,17 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
     };
 
     let line2 = if app.detail_mode {
-        Line::from("j/k scroll  •  PgUp/PgDn page  •  g/G top/end  •  enter/esc back  •  q quit")
+        Line::from(
+            "j/k scroll  •  enter/esc back  •  o open app  •  f folder  •  r refresh  •  q quit",
+        )
+    } else if app.filter_input.is_empty() {
+        Line::from(
+            "j/k move  •  enter details  •  o open app  •  f folder  •  / filter  •  r refresh  •  q quit",
+        )
     } else {
-        Line::from("j/k move  •  PgUp/PgDn jump  •  enter details  •  o open app  •  / filter")
+        Line::from(
+            "j/k move  •  enter details  •  o open app  •  f folder  •  / filter  •  esc clear  •  q quit",
+        )
     };
 
     Paragraph::new(Text::from(vec![line1, line2]))
@@ -1652,14 +1698,52 @@ struct KeymapItem {
     label_style: Style,
 }
 
+impl KeymapItem {
+    fn display_key(&self) -> String {
+        format!("<{}>", self.key)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ActionTone {
+    Primary,
+    Secondary,
+    Quiet,
+}
+
+fn action_tone(key: &str) -> ActionTone {
+    match key {
+        "enter" | "enter/esc" | "o" => ActionTone::Primary,
+        "q" | "esc" => ActionTone::Quiet,
+        _ => ActionTone::Secondary,
+    }
+}
+
 fn action_item(key: &str, label: &str, enabled: bool) -> KeymapItem {
+    let tone = action_tone(key);
     let key_style = if enabled {
-        Style::default().fg(accent_blue())
+        match tone {
+            ActionTone::Primary => Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+            ActionTone::Secondary => Style::default()
+                .fg(accent_blue())
+                .add_modifier(Modifier::BOLD),
+            ActionTone::Quiet => Style::default().fg(Color::Rgb(140, 160, 185)),
+        }
     } else {
         Style::default().fg(Color::DarkGray)
     };
     let label_style = if enabled {
-        Style::default().fg(text_muted_color())
+        match tone {
+            ActionTone::Primary => Style::default()
+                .fg(text_primary_color())
+                .add_modifier(Modifier::BOLD),
+            ActionTone::Secondary => Style::default().fg(Color::Rgb(198, 206, 218)),
+            ActionTone::Quiet => Style::default()
+                .fg(text_muted_color())
+                .add_modifier(Modifier::DIM),
+        }
     } else {
         Style::default().fg(Color::DarkGray)
     };
