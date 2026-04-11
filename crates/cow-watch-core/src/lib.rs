@@ -7,4 +7,4 @@ pub use model::{
     SessionDetail, SessionList, SessionStatus, SessionStatusKind, SessionSummary, StatusConfidence,
     TokenUsage, ToolCallStat, UsageOverview,
 };
-pub use service::{MonitorService, SessionQuery, SessionSource};
+pub use service::{CombinedSource, MonitorService, SessionQuery, SessionSource};

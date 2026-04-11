@@ -656,6 +656,14 @@ const INDEX_HTML: &str = r#"<!doctype html>
         return parts[parts.length - 1] || path;
       }
 
+      function titleCase(value) {
+        return String(value || "")
+          .split(/[_\s-]+/)
+          .filter(Boolean)
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(" ");
+      }
+
       function formatTokens(tokens) {
         if (tokens >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(1)}B`;
         if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
@@ -683,16 +691,21 @@ const INDEX_HTML: &str = r#"<!doctype html>
       }
 
       function quotaSummary(quotas) {
-        const quota = (quotas || [])[0];
-        if (!quota) return "quota n/a";
-
-        const parts = [];
-        if (quota.plan) parts.push(quota.plan);
-        for (const window of quota.windows || []) {
-          parts.push(`${window.label} ${window.used_percent}%`);
-        }
-        if (quota.limit_reached) parts.push("limit");
-        return `quota ${parts.join("  ") || "n/a"}`;
+        const items = (quotas || []).map((quota) => {
+          const provider = titleCase(quota.provider || "provider");
+          const parts = [];
+          if (quota.plan) parts.push(quota.plan);
+          if ((quota.windows || []).length) {
+            for (const window of quota.windows) {
+              parts.push(`${window.label} ${window.used_percent}%`);
+            }
+          } else if (quota.plan) {
+            parts.push("active");
+          }
+          if (quota.limit_reached) parts.push("limit");
+          return `${provider} ${parts.join(" ")}`.trim();
+        });
+        return items.length ? items.join("  ·  ") : "quota n/a";
       }
 
       function pulseCounts(sessions) {

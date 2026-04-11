@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/cow-watch",
+    "crates/cow-watch-claude",
     "crates/cow-watch-codex",
     "crates/cow-watch-core",
 ]

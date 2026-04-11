@@ -33,6 +33,7 @@ const RUNNING_TTL_SECONDS: i64 = 90;
 const STALE_AFTER_MINUTES: i64 = 20;
 const ACTIVITY_WINDOW_SECONDS: i64 = 30;
 const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
+const COMPACTION_ACTIVITY_WINDOW_SECONDS: i64 = 12;
 const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 const CODEX_AUTOCOMPACT_THRESHOLD: f64 = 0.835;
 const LITELLM_PRICING_URL: &str =
@@ -87,6 +88,7 @@ struct TranscriptStatic {
 struct RolloutHint {
     active_turns: usize,
     pending_call_ids: HashSet<String>,
+    pending_approval_call_ids: HashSet<String>,
     pending_call_names: HashMap<String, String>,
     run_started_at: Option<DateTime<Utc>>,
     run_active: bool,
@@ -94,6 +96,7 @@ struct RolloutHint {
     cost_by_day: HashMap<String, RawCostBucket>,
     cost_by_hour: HashMap<String, RawCostBucket>,
     context_window: Option<ContextWindowUsage>,
+    recent_compaction_at: Option<DateTime<Utc>>,
     quota: Option<ProviderQuota>,
     last_user_message: Option<(DateTime<Utc>, String)>,
     last_assistant_message: Option<(DateTime<Utc>, String)>,
@@ -814,6 +817,15 @@ fn derive_activity_state(
         .context_window
         .as_ref()
         .is_some_and(|context| context.used_percent >= 100)
+        && hint.recent_compaction_at.is_some_and(|timestamp| {
+            now - timestamp <= Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS)
+        })
+        && hint
+            .recent_events
+            .iter()
+            .rev()
+            .find(|event| !matches!(event.kind, ActivityKind::User))
+            .is_some_and(is_compaction_event)
     {
         return SessionActivityState::Compacting;
     }
@@ -841,6 +853,10 @@ fn activity_recent_window(status: &SessionStatus, hint: Option<&RolloutHint>) ->
     } else {
         Duration::seconds(ACTIVITY_WINDOW_SECONDS)
     }
+}
+
+fn is_compaction_event(event: &ActivityEvent) -> bool {
+    matches!(event.kind, ActivityKind::System) && event.summary == "Context compacted"
 }
 
 fn is_exploration_tool(summary: &str) -> bool {
@@ -1065,6 +1081,21 @@ fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>
     }
 
     if let Some(hint) = hint {
+        if !hint.pending_approval_call_ids.is_empty() {
+            let tool_name = hint
+                .pending_approval_call_ids
+                .iter()
+                .find_map(|call_id| hint.pending_call_names.get(call_id))
+                .cloned()
+                .unwrap_or_else(|| "tool".to_string());
+
+            return SessionStatus {
+                kind: SessionStatusKind::WaitingInput,
+                confidence: StatusConfidence::Exact,
+                reason: format!("Waiting for your approval to run `{tool_name}`"),
+            };
+        }
+
         if !hint.pending_call_ids.is_empty() {
             let tool_name = hint
                 .pending_call_ids
@@ -1288,6 +1319,19 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                             hint.quota = Some(quota);
                         }
                     }
+                    "context_compacted" => {
+                        if let Some(timestamp) = timestamp {
+                            hint.recent_compaction_at = Some(timestamp);
+                            push_recent_event(
+                                &mut recent_events,
+                                ActivityEvent {
+                                    timestamp,
+                                    kind: ActivityKind::System,
+                                    summary: "Context compacted".to_string(),
+                                },
+                            );
+                        }
+                    }
                     "agent_message" => {
                         if let (Some(timestamp), Some(message)) =
                             (timestamp, payload.get("message").and_then(Value::as_str))
@@ -1320,6 +1364,19 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                     _ => {}
                 }
             }
+            "compacted" => {
+                if let Some(timestamp) = timestamp {
+                    hint.recent_compaction_at = Some(timestamp);
+                    push_recent_event(
+                        &mut recent_events,
+                        ActivityEvent {
+                            timestamp,
+                            kind: ActivityKind::System,
+                            summary: "Context compacted".to_string(),
+                        },
+                    );
+                }
+            }
             "response_item" => {
                 let response_kind = payload
                     .get("type")
@@ -1340,7 +1397,16 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
 
                         if !call_id.is_empty() {
                             hint.pending_call_ids.insert(call_id.clone());
-                            hint.pending_call_names.insert(call_id, name.clone());
+                            hint.pending_call_names
+                                .insert(call_id.clone(), name.clone());
+                        }
+                        if payload
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .is_some_and(function_call_requires_approval)
+                            && !call_id.is_empty()
+                        {
+                            hint.pending_approval_call_ids.insert(call_id.clone());
                         }
 
                         if let Some(timestamp) = timestamp {
@@ -1370,6 +1436,7 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
                             let tool_name = hint.pending_call_names.get(call_id).cloned();
                             hint.pending_call_ids.remove(call_id);
+                            hint.pending_approval_call_ids.remove(call_id);
 
                             if let Some(timestamp) = timestamp {
                                 push_recent_event(
@@ -2049,7 +2116,21 @@ fn looks_like_waiting_input(
         || lowercase.contains("please provide")
         || lowercase.contains("how would you like")
         || lowercase.contains("which option")
-        || lowercase.contains("what should")
+        || lowercase.contains("what should i ")
+        || lowercase.contains("what should we ")
+        || lowercase.contains("what should happen next")
+}
+
+fn function_call_requires_approval(arguments: &str) -> bool {
+    serde_json::from_str::<Value>(arguments)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("sandbox_permissions")
+                .and_then(Value::as_str)
+                .map(|value| value == "require_escalated")
+        })
+        .unwrap_or(false)
 }
 
 fn extract_message_text(payload: &Value) -> Option<String> {
@@ -2596,12 +2677,13 @@ mod tests {
     use super::{
         ReadMode, RolloutHint, SessionActivityState, SessionStatus, SessionStatusKind,
         StatusConfidence, activity_recent_window, analyze_rollout, derive_activity_state,
-        local_date_key, local_hour_key, looks_like_waiting_input, normalize_codex_home,
-        normalize_title, parse_context_window_usage, parse_state_db_version,
-        parse_transcript_static, state_db_candidates_for_input, stream_usage_index,
-        user_title_candidate,
+        derive_status, function_call_requires_approval, local_date_key, local_hour_key,
+        looks_like_waiting_input, normalize_codex_home, normalize_title,
+        parse_context_window_usage, parse_state_db_version, parse_transcript_static,
+        state_db_candidates_for_input, stream_usage_index, user_title_candidate,
     };
     use chrono::Utc;
+    use cow_watch_core::{ActivityEvent, ActivityKind, ContextWindowUsage};
     use directories::BaseDirs;
     use std::{
         collections::HashSet,
@@ -2625,6 +2707,14 @@ mod tests {
         let assistant = (now, "Which repo should I inspect first?".to_string());
 
         assert!(looks_like_waiting_input(Some(&assistant), None));
+    }
+
+    #[test]
+    fn function_call_requires_approval_detects_escalated_exec() {
+        let arguments = r#"{"cmd":"npx @ccusage/codex@latest --help","sandbox_permissions":"require_escalated","justification":"Need npm access"}"#;
+
+        assert!(function_call_requires_approval(arguments));
+        assert!(!function_call_requires_approval(r#"{"cmd":"cargo check"}"#));
     }
 
     #[test]
@@ -2960,5 +3050,187 @@ mod tests {
             activity_recent_window(&status, Some(&hint)),
             chrono::Duration::seconds(super::TOOL_BUSY_ACTIVITY_WINDOW_SECONDS)
         );
+    }
+
+    #[test]
+    fn derive_activity_state_needs_explicit_compaction_signal() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let hint = RolloutHint {
+            run_active: true,
+            context_window: Some(ContextWindowUsage {
+                used_tokens: 215_764,
+                limit_tokens: 215_764,
+                remaining_tokens: 0,
+                used_percent: 100,
+            }),
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(2),
+                kind: ActivityKind::System,
+                summary: "Task started".to_string(),
+            }],
+            ..RolloutHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            Some(&hint),
+            now - chrono::Duration::seconds(2),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Thinking);
+    }
+
+    #[test]
+    fn derive_activity_state_compacts_only_while_compaction_is_latest_signal() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let compacted_at = now - chrono::Duration::seconds(2);
+        let compacting_hint = RolloutHint {
+            run_active: true,
+            recent_compaction_at: Some(compacted_at),
+            context_window: Some(ContextWindowUsage {
+                used_tokens: 215_764,
+                limit_tokens: 215_764,
+                remaining_tokens: 0,
+                used_percent: 100,
+            }),
+            recent_events: vec![ActivityEvent {
+                timestamp: compacted_at,
+                kind: ActivityKind::System,
+                summary: "Context compacted".to_string(),
+            }],
+            ..RolloutHint::default()
+        };
+
+        let compacting = derive_activity_state(
+            &status,
+            Some(&compacting_hint),
+            now - chrono::Duration::seconds(2),
+            now,
+        );
+        assert_eq!(compacting, SessionActivityState::Compacting);
+
+        let thinking_hint = RolloutHint {
+            recent_events: vec![
+                ActivityEvent {
+                    timestamp: compacted_at,
+                    kind: ActivityKind::System,
+                    summary: "Context compacted".to_string(),
+                },
+                ActivityEvent {
+                    timestamp: now - chrono::Duration::seconds(1),
+                    kind: ActivityKind::ToolCall,
+                    summary: "exec_command  cargo check -q  in ~/Development/AI/monitor"
+                        .to_string(),
+                },
+            ],
+            ..compacting_hint
+        };
+        let thinking = derive_activity_state(
+            &status,
+            Some(&thinking_hint),
+            now - chrono::Duration::seconds(1),
+            now,
+        );
+        assert_eq!(thinking, SessionActivityState::Thinking);
+    }
+
+    #[test]
+    fn derive_status_marks_pending_approval_as_waiting_input() {
+        let now = Utc::now();
+        let row = super::ThreadRow {
+            id: "thread".to_string(),
+            rollout_path: String::new(),
+            created_at: now,
+            updated_at: now,
+            cwd: "/tmp/project".to_string(),
+            title: "Session".to_string(),
+            tokens_used: 0,
+            archived: false,
+            git_branch: None,
+            git_origin_url: None,
+            agent_role: None,
+            model: None,
+        };
+        let hint = RolloutHint {
+            pending_call_ids: HashSet::from([String::from("call_1")]),
+            pending_approval_call_ids: HashSet::from([String::from("call_1")]),
+            pending_call_names: std::iter::once(("call_1".to_string(), "exec_command".to_string()))
+                .collect(),
+            ..RolloutHint::default()
+        };
+
+        let status = derive_status(&row, Some(&hint), now);
+
+        assert_eq!(status.kind, SessionStatusKind::WaitingInput);
+        assert_eq!(status.confidence, StatusConfidence::Exact);
+        assert!(status.reason.contains("approval"));
+    }
+
+    #[test]
+    fn analyze_rollout_tracks_pending_approval_requests() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cow-watch-rollout-approval-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-approval.jsonl");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-04-11T15:54:04.744Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"npx @ccusage/codex@latest --help\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\",\\\"justification\\\":\\\"Need npm access\\\"}\",\"call_id\":\"call_approval\"}}\n",
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+
+        assert!(hint.pending_call_ids.contains("call_approval"));
+        assert!(hint.pending_approval_call_ids.contains("call_approval"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_rollout_tracks_context_compaction_events() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cow-watch-rollout-compaction-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-compaction.jsonl");
+        fs::write(
+            &path,
+            "{\"timestamp\":\"2026-04-11T16:00:06.461Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"context_compacted\"}}\n",
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+
+        assert_eq!(
+            hint.recent_compaction_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-11T16:00:06.461Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert!(
+            hint.recent_events
+                .iter()
+                .any(|event| event.summary == "Context compacted")
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

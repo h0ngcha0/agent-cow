@@ -620,13 +620,6 @@ impl TuiApp {
         )
     }
 
-    fn show_provider_column(&self) -> bool {
-        has_multiple_strings(
-            self.visible_sessions()
-                .map(|session| session.provider.to_string()),
-        )
-    }
-
     fn visible_host_label(&self) -> String {
         aggregate_label(
             self.visible_sessions()
@@ -989,12 +982,18 @@ fn subscription_windows_line(
     compact: bool,
 ) -> Line<'static> {
     if quota.windows.is_empty() {
-        let mut line = Line::from(vec![Span::styled(
-            "quota unavailable",
-            Style::default()
-                .fg(text_muted_color())
-                .add_modifier(Modifier::ITALIC),
-        )]);
+        let label = subscription_empty_state_label(quota, compact);
+        let style =
+            if label == "subscribed" || label == "subscription active" || label == "plan active" {
+                Style::default()
+                    .fg(accent_green())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(text_muted_color())
+                    .add_modifier(Modifier::ITALIC)
+            };
+        let mut line = Line::from(vec![Span::styled(label, style)]);
         pad_line_to_width(&mut line, width);
         return line;
     }
@@ -1011,6 +1010,25 @@ fn subscription_windows_line(
     let mut line = Line::from(spans);
     pad_line_to_width(&mut line, width);
     line
+}
+
+fn subscription_empty_state_label(quota: &ProviderQuota, compact: bool) -> &'static str {
+    let plan = quota
+        .plan
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if plan.contains("subscription") {
+        if compact {
+            "subscribed"
+        } else {
+            "subscription active"
+        }
+    } else if quota.plan.is_some() {
+        "plan active"
+    } else {
+        "quota unavailable"
+    }
 }
 
 fn subscription_window_spans(
@@ -1515,8 +1533,7 @@ fn render_sessions_table(
     let title = format!("Sessions ({})", app.filtered_indices.len());
 
     let show_host = app.show_host_column();
-    let show_provider = app.show_provider_column();
-    let widths = session_table_widths(table_width, show_provider, show_host);
+    let widths = session_table_widths(table_width, show_host);
 
     let mut header_cells = vec![
         Cell::from("").style(Style::default().fg(text_muted_color())),
@@ -1535,11 +1552,6 @@ fn render_sessions_table(
         Constraint::Length(widths.name),
         Constraint::Length(widths.project),
     ];
-
-    if show_provider {
-        header_cells.push(Cell::from("PVD").style(Style::default().fg(accent_magenta())));
-        constraints.push(Constraint::Length(widths.provider.unwrap_or(4)));
-    }
 
     if show_host {
         header_cells.push(Cell::from("HOST").style(Style::default().fg(accent_cyan())));
@@ -1595,16 +1607,6 @@ fn render_sessions_table(
                 ))
                 .style(Style::default().fg(accent_cyan())),
             ];
-
-            if show_provider {
-                cells.push(
-                    Cell::from(truncate_chars(
-                        &short_provider(session),
-                        widths.provider.unwrap_or(4).saturating_sub(1) as usize,
-                    ))
-                    .style(Style::default().fg(accent_magenta())),
-                );
-            }
 
             if show_host {
                 cells.push(
@@ -1748,18 +1750,13 @@ struct SessionTableWidths {
     context: u16,
     name: u16,
     project: u16,
-    provider: Option<u16>,
     host: Option<u16>,
     model: u16,
     tokens: u16,
     age: u16,
 }
 
-fn session_table_widths(
-    table_width: u16,
-    show_provider: bool,
-    show_host: bool,
-) -> SessionTableWidths {
+fn session_table_widths(table_width: u16, show_host: bool) -> SessionTableWidths {
     #[derive(Clone, Copy)]
     enum ColumnId {
         State,
@@ -1770,7 +1767,6 @@ fn session_table_widths(
         Context,
         Name,
         Project,
-        Provider,
         Host,
         Model,
         Tokens,
@@ -1790,9 +1786,6 @@ fn session_table_widths(
         (ColumnId::Name, 12_u16, 26_u16),
         (ColumnId::Project, 7_u16, 10_u16),
     ];
-    if show_provider {
-        columns.push((ColumnId::Provider, 4, 6));
-    }
     if show_host {
         columns.push((ColumnId::Host, 8, 10));
     }
@@ -1829,7 +1822,6 @@ fn session_table_widths(
         context: 4,
         name: 18,
         project: 8,
-        provider: None,
         host: None,
         model: 7,
         tokens: 6,
@@ -1847,7 +1839,6 @@ fn session_table_widths(
             ColumnId::Context => widths.context = width,
             ColumnId::Name => widths.name = width,
             ColumnId::Project => widths.project = width,
-            ColumnId::Provider => widths.provider = Some(width),
             ColumnId::Host => widths.host = Some(width),
             ColumnId::Model => widths.model = width,
             ColumnId::Tokens => widths.tokens = width,
@@ -2818,10 +2809,6 @@ fn short_status_label(kind: &SessionStatusKind) -> &'static str {
         SessionStatusKind::Failed => "failed",
         SessionStatusKind::Unknown => "unknown",
     }
-}
-
-fn short_provider(session: &SessionSummary) -> String {
-    session.provider.to_string().chars().take(3).collect()
 }
 
 fn project_label(session: &SessionSummary) -> String {

@@ -7,8 +7,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use cow_watch_claude::ClaudeSource;
 use cow_watch_codex::CodexSource;
-use cow_watch_core::{MonitorService, SessionDetail, SessionQuery, SessionSummary};
+use cow_watch_core::{CombinedSource, MonitorService, SessionDetail, SessionQuery, SessionSummary};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser, Debug)]
@@ -17,6 +18,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 struct Cli {
     #[arg(long, env = "COW_WATCH_CODEX_HOME")]
     codex_home: Option<PathBuf>,
+
+    #[arg(long, env = "COW_WATCH_CLAUDE_HOME")]
+    claude_home: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -69,10 +73,29 @@ async fn main() -> Result<()> {
     let codex_home = cli
         .codex_home
         .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from));
-    let source = match codex_home {
-        Some(path) => CodexSource::new(path),
-        None => CodexSource::from_default_home()?,
-    };
+    let claude_home = cli
+        .claude_home
+        .or_else(|| std::env::var_os("CLAUDE_HOME").map(PathBuf::from));
+
+    let mut source = CombinedSource::new();
+    if let Some(path) = codex_home {
+        source.push_source("codex", Arc::new(CodexSource::new(path)));
+    } else if let Some(path) = default_provider_home(".codex").filter(|path| path.exists()) {
+        source.push_source("codex", Arc::new(CodexSource::new(path)));
+    }
+
+    if let Some(path) = claude_home {
+        source.push_source("claude", Arc::new(ClaudeSource::new(path)));
+    } else if let Some(path) = default_provider_home(".claude").filter(|path| path.exists()) {
+        source.push_source("claude", Arc::new(ClaudeSource::new(path)));
+    }
+
+    if source.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no provider homes were found; looked for ~/.codex and ~/.claude"
+        ));
+    }
+
     let service = MonitorService::new(Arc::new(source));
 
     match cli.command {
@@ -127,22 +150,28 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("cow_watch=info,cow_watch_codex=info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("cow_watch=info,cow_watch_codex=info,cow_watch_claude=info")
+    });
 
     fmt().with_env_filter(filter).without_time().init();
 }
 
+fn default_provider_home(dir_name: &str) -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(dir_name))
+}
+
 fn print_sessions(sessions: &[SessionSummary]) {
     println!(
-        "{:<14} {:>8} {:>8} {:>8} {:>7} {:>10} {:<8} {:<18} title",
-        "status", "cost", "$/1h", "$/1d", "ctx", "tokens", "archived", "updated"
+        "{:<8} {:<14} {:>8} {:>8} {:>8} {:>7} {:>10} {:<8} {:<18} title",
+        "provider", "status", "cost", "$/1h", "$/1d", "ctx", "tokens", "archived", "updated"
     );
-    println!("{}", "-".repeat(134));
+    println!("{}", "-".repeat(143));
 
     for session in sessions {
         println!(
-            "{:<14} {:>8} {:>8} {:>8} {:>7} {:>10} {:<8} {:<18} {}",
+            "{:<8} {:<14} {:>8} {:>8} {:>8} {:>7} {:>10} {:<8} {:<18} {}",
+            session.provider,
             session.status.kind,
             session
                 .cost

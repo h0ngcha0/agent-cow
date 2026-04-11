@@ -315,6 +315,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "cow-watch-claude",
  "cow-watch-codex",
  "cow-watch-core",
  "crossterm 0.29.0",
@@ -324,6 +325,22 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cow-watch-claude"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "cow-watch-core",
+ "directories",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
