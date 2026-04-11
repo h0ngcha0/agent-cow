@@ -5,10 +5,10 @@ use std::{
 
 use crate::open;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use cow_watch_core::{
-    ActivityKind, MonitorService, NavigationKind, SessionDetail, SessionList, SessionQuery,
-    SessionStatusKind, SessionSummary, TokenUsage, UsageOverview,
+    ActivityEvent, ActivityKind, MonitorService, SessionActivityState, SessionDetail, SessionList,
+    SessionQuery, SessionStatusKind, SessionSummary, TokenUsage, UsageOverview,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -206,14 +206,36 @@ async fn run_loop(
                             list_refresh = Some(spawn_list_refresh(service.clone(), app.limit));
                         }
                     }
-                    KeyCode::Enter => {
-                        let entering_detail = app.toggle_detail_mode();
-                        if entering_detail {
+                    KeyCode::Enter if !app.detail_mode => {
+                        let needs_refresh = app.open_detail_pane(DetailPane::Describe);
+                        if needs_refresh {
                             queue_detail_refresh(&mut app, &service, &mut detail_refresh);
                         }
                     }
+                    KeyCode::Char('f') if app.detail_mode => {
+                        let target = match app.detail_pane {
+                            DetailPane::Describe => DetailPane::Follow,
+                            DetailPane::Follow => DetailPane::Follow,
+                        };
+                        let needs_refresh = app.open_detail_pane(target);
+                        if needs_refresh {
+                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                        }
+                    }
+                    KeyCode::Char('f') => {
+                        let needs_refresh = app.open_detail_pane(DetailPane::Follow);
+                        if needs_refresh {
+                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                        }
+                    }
+                    KeyCode::Char('d') if app.detail_mode => {
+                        let needs_refresh = app.open_detail_pane(DetailPane::Describe);
+                        if needs_refresh {
+                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                        }
+                    }
+                    KeyCode::Enter => app.close_detail_mode(),
                     KeyCode::Char('o') => app.open_selected_app(),
-                    KeyCode::Char('f') => app.open_selected_working_directory(),
                     _ => {}
                 }
             }
@@ -243,7 +265,9 @@ struct TuiApp {
     detail_loading_session_id: Option<String>,
     table_state: TableState,
     detail_mode: bool,
+    detail_pane: DetailPane,
     detail_scroll: u16,
+    follow_stick_to_bottom: bool,
     local_machine_id: String,
     limit: Option<usize>,
     refresh_every: Duration,
@@ -260,6 +284,12 @@ struct UiNotice {
     is_error: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailPane {
+    Describe,
+    Follow,
+}
+
 impl TuiApp {
     fn new(limit: Option<usize>, refresh_every: Duration) -> Self {
         let mut table_state = TableState::default();
@@ -274,7 +304,9 @@ impl TuiApp {
             detail_loading_session_id: None,
             table_state,
             detail_mode: false,
+            detail_pane: DetailPane::Describe,
             detail_scroll: 0,
+            follow_stick_to_bottom: false,
             local_machine_id: open::local_machine_id(),
             limit,
             refresh_every,
@@ -301,6 +333,7 @@ impl TuiApp {
             self.detail_loading_session_id = None;
             self.detail_mode = false;
             self.detail_scroll = 0;
+            self.follow_stick_to_bottom = false;
         }
     }
 
@@ -502,30 +535,7 @@ impl TuiApp {
         );
     }
 
-    fn open_selected_working_directory(&mut self) {
-        let Some(summary) = self.selected_summary().cloned() else {
-            self.notice = Some(UiNotice {
-                message: "No session selected.".to_string(),
-                is_error: true,
-            });
-            return;
-        };
-
-        self.notice = Some(
-            match open::open_session_navigation(&summary, NavigationKind::WorkingDirectory) {
-                Ok(action) => UiNotice {
-                    message: format!("Opened {}.", action.label),
-                    is_error: false,
-                },
-                Err(error) => UiNotice {
-                    message: error.to_string(),
-                    is_error: true,
-                },
-            },
-        );
-    }
-
-    fn toggle_detail_mode(&mut self) -> bool {
+    fn open_detail_pane(&mut self, pane: DetailPane) -> bool {
         if self.selected_summary().is_none() {
             self.notice = Some(UiNotice {
                 message: "No session selected.".to_string(),
@@ -534,43 +544,61 @@ impl TuiApp {
             return false;
         }
 
-        let entering = !self.detail_mode;
-        self.detail_mode = entering;
-        if entering {
-            self.detail_scroll = 0;
-            self.detail_loading = false;
-            self.detail_loading_session_id = None;
-        } else {
+        let selected_id = self.selected_session_id().map(ToOwned::to_owned);
+        let matches_selected_detail = selected_id.as_deref()
+            == self
+                .detail
+                .as_ref()
+                .map(|detail| detail.summary.id.as_str());
+
+        self.detail_mode = true;
+        self.detail_pane = pane;
+        self.detail_scroll = 0;
+        self.follow_stick_to_bottom = pane == DetailPane::Follow;
+        if !matches_selected_detail {
             self.detail = None;
             self.detail_loading = false;
             self.detail_loading_session_id = None;
-            self.detail_scroll = 0;
         }
         self.notice = None;
-        entering
+        !matches_selected_detail
     }
 
     fn close_detail_mode(&mut self) {
         self.detail_mode = false;
+        self.detail_pane = DetailPane::Describe;
         self.detail_loading = false;
         self.detail_loading_session_id = None;
         self.detail_scroll = 0;
+        self.follow_stick_to_bottom = false;
     }
 
     fn detail_scroll_up(&mut self, step: u16) {
         self.detail_scroll = self.detail_scroll.saturating_sub(step);
+        if self.detail_pane == DetailPane::Follow {
+            self.follow_stick_to_bottom = false;
+        }
     }
 
     fn detail_scroll_down(&mut self, step: u16, max_scroll: u16) {
         self.detail_scroll = self.detail_scroll.saturating_add(step).min(max_scroll);
+        if self.detail_pane == DetailPane::Follow {
+            self.follow_stick_to_bottom = self.detail_scroll >= max_scroll;
+        }
     }
 
     fn detail_scroll_top(&mut self) {
         self.detail_scroll = 0;
+        if self.detail_pane == DetailPane::Follow {
+            self.follow_stick_to_bottom = false;
+        }
     }
 
     fn detail_scroll_bottom(&mut self, max_scroll: u16) {
         self.detail_scroll = max_scroll;
+        if self.detail_pane == DetailPane::Follow {
+            self.follow_stick_to_bottom = true;
+        }
     }
 
     fn show_host_column(&self) -> bool {
@@ -612,12 +640,25 @@ impl TuiApp {
         let Some(detail) = &self.detail else {
             return 0;
         };
-        let content_height = detail_content_height(content_area) as usize;
+        let status_height = if self.detail_pane == DetailPane::Follow {
+            follow_status_height(detail)
+        } else {
+            0
+        };
+        let content_height =
+            detail_content_height(content_area).saturating_sub(status_height) as usize;
         if content_height == 0 {
             return 0;
         }
-        let rendered_lines =
-            wrapped_line_count(&detail_lines(detail), detail_content_width(content_area));
+        let rendered_lines = match self.detail_pane {
+            DetailPane::Describe => {
+                wrapped_line_count(&detail_lines(detail), detail_content_width(content_area))
+            }
+            DetailPane::Follow => wrapped_line_count(
+                &follow_lines(detail, detail_content_width(content_area)),
+                detail_content_width(content_area),
+            ),
+        };
         rendered_lines
             .saturating_sub(content_height)
             .min(u16::MAX as usize) as u16
@@ -811,29 +852,45 @@ type HeaderActionRows = Vec<(Option<KeymapItem>, Option<KeymapItem>)>;
 
 fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
     if app.detail_mode {
-        vec![
-            (
-                Some(action_item("enter/esc", "Back", true)),
-                Some(action_item("o", "Open", true)),
-            ),
-            (
-                Some(action_item("j/k", "Scroll", true)),
-                Some(action_item("f", "Folder", true)),
-            ),
-            (
-                Some(action_item("r", "Refresh", true)),
-                Some(action_item("q", "Quit", true)),
-            ),
-        ]
+        match app.detail_pane {
+            DetailPane::Describe => vec![
+                (
+                    Some(action_item("enter/esc", "Back", true)),
+                    Some(action_item("f", "Latest", true)),
+                ),
+                (
+                    Some(action_item("j/k", "Scroll", true)),
+                    Some(action_item("o", "Open", true)),
+                ),
+                (
+                    Some(action_item("r", "Refresh", true)),
+                    Some(action_item("q", "Quit", true)),
+                ),
+            ],
+            DetailPane::Follow => vec![
+                (
+                    Some(action_item("enter/esc", "Back", true)),
+                    Some(action_item("d", "Describe", true)),
+                ),
+                (
+                    Some(action_item("j/k", "Scroll", true)),
+                    Some(action_item("o", "Open", true)),
+                ),
+                (
+                    Some(action_item("r", "Refresh", true)),
+                    Some(action_item("q", "Quit", true)),
+                ),
+            ],
+        }
     } else if app.filter_input.is_empty() {
         vec![
             (
                 Some(action_item("enter", "Describe", true)),
-                Some(action_item("o", "Open", true)),
+                Some(action_item("f", "Latest", true)),
             ),
             (
                 Some(action_item("j/k", "Move", true)),
-                Some(action_item("f", "Folder", true)),
+                Some(action_item("o", "Open", true)),
             ),
             (
                 Some(action_item("/", "Filter", true)),
@@ -845,11 +902,11 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
         vec![
             (
                 Some(action_item("enter", "Describe", true)),
-                Some(action_item("o", "Open", true)),
+                Some(action_item("f", "Latest", true)),
             ),
             (
                 Some(action_item("j/k", "Move", true)),
-                Some(action_item("f", "Folder", true)),
+                Some(action_item("o", "Open", true)),
             ),
             (
                 Some(action_item("/", "Filter", true)),
@@ -1040,6 +1097,8 @@ fn render_sessions_table(
 
     let mut header_cells = vec![
         Cell::from("").style(Style::default().fg(text_muted_color())),
+        Cell::from(session_activity_header_label(widths.activity))
+            .style(Style::default().fg(accent_green())),
         Cell::from("LAST").style(Style::default().fg(Color::Rgb(201, 210, 220))),
         Cell::from("DUR").style(Style::default().fg(accent_gold())),
         Cell::from("NAME").style(Style::default().fg(text_primary_color())),
@@ -1047,6 +1106,7 @@ fn render_sessions_table(
     ];
     let mut constraints = vec![
         Constraint::Length(widths.state),
+        Constraint::Length(widths.activity),
         Constraint::Length(widths.age),
         Constraint::Length(widths.duration),
         Constraint::Length(widths.name),
@@ -1092,8 +1152,12 @@ fn render_sessions_table(
         .filter_map(|index| app.sessions.get(*index))
         .map(|session| {
             let mut cells = vec![
-                Cell::from(status_symbol(&session.status.kind))
-                    .style(status_style(&session.status.kind)),
+                Cell::from(session_state_symbol(session)).style(session_state_style(session)),
+                Cell::from(session_activity_label_for_width(
+                    &session.activity_state,
+                    widths.activity,
+                ))
+                .style(session_activity_style(&session.activity_state)),
                 Cell::from(relative_age(session.updated_at))
                     .style(relative_age_style(session.updated_at)),
                 Cell::from(session_duration(session)).style(duration_style(session)),
@@ -1253,6 +1317,7 @@ fn table_visible_window(app: &mut TuiApp, area: Rect) -> VisibleRowWindow {
 #[derive(Clone, Copy)]
 struct SessionTableWidths {
     state: u16,
+    activity: u16,
     duration: u16,
     cost: u16,
     cost_hour: u16,
@@ -1275,6 +1340,7 @@ fn session_table_widths(
     #[derive(Clone, Copy)]
     enum ColumnId {
         State,
+        Activity,
         Cost,
         CostHour,
         CostDay,
@@ -1291,14 +1357,15 @@ fn session_table_widths(
 
     let mut columns = vec![
         (ColumnId::State, 1_u16, 1_u16),
+        (ColumnId::Activity, 5_u16, 9_u16),
         (ColumnId::Age, 4, 5),
         (ColumnId::Duration, 4, 5),
-        (ColumnId::Cost, 6, 5),
-        (ColumnId::CostHour, 6, 5),
-        (ColumnId::CostDay, 6, 5),
+        (ColumnId::Cost, 5, 5),
+        (ColumnId::CostHour, 5, 5),
+        (ColumnId::CostDay, 5, 5),
         (ColumnId::Context, 4, 5),
-        (ColumnId::Name, 16_u16, 26_u16),
-        (ColumnId::Project, 8_u16, 10_u16),
+        (ColumnId::Name, 12_u16, 26_u16),
+        (ColumnId::Project, 7_u16, 10_u16),
     ];
     if show_provider {
         columns.push((ColumnId::Provider, 4, 6));
@@ -1306,7 +1373,7 @@ fn session_table_widths(
     if show_host {
         columns.push((ColumnId::Host, 8, 10));
     }
-    columns.extend([(ColumnId::Model, 9, 15), (ColumnId::Tokens, 7, 10)]);
+    columns.extend([(ColumnId::Model, 7, 15), (ColumnId::Tokens, 6, 10)]);
 
     let inner_width = table_width.saturating_sub(2);
     let spacing = columns.len().saturating_sub(1) as u16;
@@ -1330,24 +1397,26 @@ fn session_table_widths(
     }
 
     let mut widths = SessionTableWidths {
-        state: 1,
+        state: 2,
+        activity: 5,
         duration: 4,
-        cost: 6,
-        cost_hour: 6,
-        cost_day: 6,
+        cost: 5,
+        cost_hour: 5,
+        cost_day: 5,
         context: 4,
-        name: 24,
-        project: 10,
+        name: 18,
+        project: 8,
         provider: None,
         host: None,
-        model: 8,
-        tokens: 7,
+        model: 7,
+        tokens: 6,
         age: 4,
     };
 
     for (id, width) in resolved {
         match id {
             ColumnId::State => widths.state = width,
+            ColumnId::Activity => widths.activity = width,
             ColumnId::Duration => widths.duration = width,
             ColumnId::Cost => widths.cost = width,
             ColumnId::CostHour => widths.cost_hour = width,
@@ -1368,7 +1437,7 @@ fn session_table_widths(
 
 fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     if app.detail_loading && app.detail.is_none() {
-        render_detail_loading(frame, area);
+        render_detail_loading(frame, area, app.detail_pane);
         return;
     }
 
@@ -1385,45 +1454,94 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         return;
     };
 
-    let lines = detail_lines(detail);
-    let max_scroll = wrapped_line_count(&lines, detail_content_width(area))
-        .saturating_sub(detail_content_height(area) as usize)
-        .min(u16::MAX as usize) as u16;
-    app.detail_scroll = app.detail_scroll.min(max_scroll);
+    let title = detail_pane_title(app.detail_pane);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(panel_border_color()))
+        .title(if app.detail_pane == DetailPane::Follow {
+            Line::from(vec![Span::styled(
+                title,
+                Style::default()
+                    .fg(accent_cyan())
+                    .add_modifier(Modifier::BOLD),
+            )])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    title,
+                    Style::default()
+                        .fg(accent_cyan())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" • ", Style::default().fg(text_muted_color())),
+                Span::styled(
+                    short_status_label(&detail.summary.status.kind),
+                    status_style(&detail.summary.status.kind).add_modifier(Modifier::BOLD),
+                ),
+            ])
+        });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(panel_border_color()))
-                    .title(Line::from(vec![
-                        Span::styled(
-                            "Describe",
-                            Style::default()
-                                .fg(accent_cyan())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(" • ", Style::default().fg(text_muted_color())),
-                        Span::styled(
-                            short_status_label(&detail.summary.status.kind),
-                            status_style(&detail.summary.status.kind).add_modifier(Modifier::BOLD),
-                        ),
-                    ])),
-            )
-            .scroll((app.detail_scroll, 0))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    match app.detail_pane {
+        DetailPane::Describe => {
+            let lines = detail_lines(detail);
+            let max_scroll = wrapped_line_count(&lines, inner.width.max(1))
+                .saturating_sub(inner.height.max(1) as usize)
+                .min(u16::MAX as usize) as u16;
+            app.detail_scroll = app.detail_scroll.min(max_scroll);
+            frame.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .scroll((app.detail_scroll, 0))
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        DetailPane::Follow => {
+            let status_line = follow_status_line(detail);
+            let status_height = u16::from(status_line.is_some());
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(status_height)])
+                .split(inner);
+            let lines = follow_lines(detail, sections[0].width.max(1));
+            let max_scroll = wrapped_line_count(&lines, sections[0].width.max(1))
+                .saturating_sub(sections[0].height.max(1) as usize)
+                .min(u16::MAX as usize) as u16;
+            if app.follow_stick_to_bottom {
+                app.detail_scroll = max_scroll;
+            } else {
+                app.detail_scroll = app.detail_scroll.min(max_scroll);
+            }
+            frame.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .scroll((app.detail_scroll, 0))
+                    .wrap(Wrap { trim: true }),
+                sections[0],
+            );
+            if let Some(status_line) = status_line {
+                frame.render_widget(Paragraph::new(status_line), sections[1]);
+            }
+        }
+    }
 }
 
-fn render_detail_loading(frame: &mut Frame, area: Rect) {
+fn render_detail_loading(frame: &mut Frame, area: Rect, pane: DetailPane) {
+    let title = detail_pane_title(pane);
+    let loading_label = match pane {
+        DetailPane::Describe => "Loading details",
+        DetailPane::Follow => "Loading latest conversation",
+    };
+    let loading_hint = match pane {
+        DetailPane::Describe => "Fetching session detail and recent activity",
+        DetailPane::Follow => "Following the latest user and assistant exchange",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(panel_border_color()))
         .title(Line::from(vec![
             Span::styled(
-                "Describe",
+                title,
                 Style::default()
                     .fg(accent_cyan())
                     .add_modifier(Modifier::BOLD),
@@ -1458,7 +1576,7 @@ fn render_detail_loading(frame: &mut Frame, area: Rect) {
     frame.render_widget(render_brand_cluster(brand_width), brand_row[1]);
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            format!("Loading details{}", loading_dots()),
+            format!("{loading_label}{}", loading_dots()),
             Style::default()
                 .fg(accent_cyan())
                 .add_modifier(Modifier::BOLD),
@@ -1468,12 +1586,19 @@ fn render_detail_loading(frame: &mut Frame, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            "Fetching session detail and recent activity",
+            loading_hint,
             Style::default().fg(text_muted_color()),
         )]))
         .alignment(Alignment::Center),
         body[3],
     );
+}
+
+fn detail_pane_title(pane: DetailPane) -> &'static str {
+    match pane {
+        DetailPane::Describe => "Describe",
+        DetailPane::Follow => "Latest Conversation",
+    }
 }
 
 fn render_footer(app: &TuiApp) -> Paragraph<'static> {
@@ -1657,7 +1782,7 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
         for event in recent {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {} ", event.timestamp.format("%H:%M")),
+                    format!("  {} ", local_timestamp(event.timestamp)),
                     Style::default().fg(text_muted_color()),
                 ),
                 Span::styled(
@@ -1684,6 +1809,484 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn follow_lines(detail: &SessionDetail, width: u16) -> Vec<Line<'static>> {
+    let timeline = follow_timeline_events(detail);
+    let mut lines = Vec::new();
+
+    if timeline.is_empty() {
+        lines.push(Line::from(vec![
+            indent(),
+            Span::styled(
+                "No recent conversation captured.",
+                Style::default().fg(text_muted_color()),
+            ),
+        ]));
+        return lines;
+    }
+
+    for event in timeline {
+        lines.extend(follow_event_block(detail, &event, width));
+    }
+
+    lines
+}
+
+fn follow_status_height(detail: &SessionDetail) -> u16 {
+    u16::from(follow_status_line(detail).is_some())
+}
+
+fn follow_status_line(detail: &SessionDetail) -> Option<Line<'static>> {
+    let status = follow_status(detail)?;
+    let label = if status.animated() {
+        format!("{}{}", status.label(), loading_dots())
+    } else {
+        status.label().to_string()
+    };
+
+    Some(Line::from(vec![Span::styled(label, status.style())]))
+}
+
+#[derive(Clone, Copy)]
+enum FollowStatus {
+    Compacting,
+    Exploring,
+    Thinking,
+    Waiting,
+    Idle,
+}
+
+impl FollowStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Compacting => "Compacting",
+            Self::Exploring => "Exploring",
+            Self::Thinking => "Thinking",
+            Self::Waiting => "Waiting for you",
+            Self::Idle => "Idle",
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Self::Compacting => Style::default()
+                .fg(accent_gold())
+                .add_modifier(Modifier::BOLD),
+            Self::Exploring => Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+            Self::Thinking => Style::default()
+                .fg(accent_green())
+                .add_modifier(Modifier::BOLD),
+            Self::Waiting => Style::default()
+                .fg(accent_magenta())
+                .add_modifier(Modifier::BOLD),
+            Self::Idle => Style::default().fg(text_muted_color()),
+        }
+    }
+
+    fn animated(self) -> bool {
+        matches!(self, Self::Compacting | Self::Exploring | Self::Thinking)
+    }
+}
+
+fn follow_status(detail: &SessionDetail) -> Option<FollowStatus> {
+    if matches!(detail.summary.status.kind, SessionStatusKind::WaitingInput) {
+        return Some(FollowStatus::Waiting);
+    }
+
+    if follow_has_recent_feedback(detail)
+        && detail
+            .summary
+            .context_window
+            .as_ref()
+            .is_some_and(|context| context.used_percent >= 100)
+    {
+        return Some(FollowStatus::Compacting);
+    }
+
+    if follow_has_recent_feedback(detail)
+        && latest_recent_tool_call(detail).is_some_and(|event| is_exploration_tool(&event.summary))
+    {
+        return Some(FollowStatus::Exploring);
+    }
+
+    if follow_has_recent_feedback(detail) {
+        return Some(FollowStatus::Thinking);
+    }
+
+    Some(FollowStatus::Idle)
+}
+
+fn follow_has_recent_feedback(detail: &SessionDetail) -> bool {
+    let now = Utc::now();
+    let recent_window = chrono::Duration::seconds(8);
+    let has_live_signal =
+        detail.summary.run_active || detail.active_turns > 0 || detail.pending_tool_calls > 0;
+
+    if !has_live_signal {
+        return false;
+    }
+
+    if now - detail.summary.updated_at <= recent_window {
+        return true;
+    }
+
+    latest_recent_non_user_event(detail).is_some_and(|event| now - event.timestamp <= recent_window)
+}
+
+fn latest_recent_tool_call(detail: &SessionDetail) -> Option<&ActivityEvent> {
+    let now = Utc::now();
+    detail.recent_events.iter().rev().find(|event| {
+        matches!(event.kind, ActivityKind::ToolCall)
+            && now - event.timestamp <= chrono::Duration::seconds(8)
+    })
+}
+
+fn latest_recent_non_user_event(detail: &SessionDetail) -> Option<&ActivityEvent> {
+    detail
+        .recent_events
+        .iter()
+        .rev()
+        .find(|event| !matches!(event.kind, ActivityKind::User))
+}
+
+fn is_exploration_tool(summary: &str) -> bool {
+    let lowered = format!(" {summary} ").to_ascii_lowercase();
+    if !lowered.contains("exec_command") {
+        return false;
+    }
+
+    [
+        " rg ",
+        " rg -",
+        " sed ",
+        " cat ",
+        " ls ",
+        " find ",
+        " head ",
+        " tail ",
+        " wc ",
+        " nl ",
+        " git diff",
+        " git show",
+        " git status",
+        " grep ",
+        " jq ",
+        " fd ",
+        " tree ",
+        " stat ",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn follow_timeline_events(detail: &SessionDetail) -> Vec<ActivityEvent> {
+    let conversation = latest_conversation_events(detail);
+    let conversation_start = conversation.first().map(|event| event.timestamp);
+    let mut timeline: Vec<ActivityEvent> = if conversation.is_empty() {
+        detail
+            .recent_events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    ActivityKind::User | ActivityKind::Assistant | ActivityKind::ToolCall
+                )
+            })
+            .cloned()
+            .collect()
+    } else {
+        let mut events: Vec<ActivityEvent> = conversation.into_iter().cloned().collect();
+        events.extend(
+            detail
+                .recent_events
+                .iter()
+                .filter(|event| {
+                    matches!(event.kind, ActivityKind::ToolCall)
+                        && conversation_start.is_none_or(|ts| event.timestamp >= ts)
+                })
+                .cloned(),
+        );
+        events
+    };
+
+    timeline.sort_by_key(|event| event.timestamp);
+    timeline = dedupe_follow_timeline(timeline);
+
+    if timeline.len() > 20 {
+        timeline = timeline.split_off(timeline.len() - 20);
+    }
+
+    timeline
+}
+
+fn latest_conversation_events(detail: &SessionDetail) -> Vec<&ActivityEvent> {
+    let deduped: Vec<_> = detail
+        .recent_conversation
+        .iter()
+        .filter(|event| matches!(event.kind, ActivityKind::User | ActivityKind::Assistant))
+        .fold(Vec::<&ActivityEvent>::new(), |mut acc, event| {
+            let is_duplicate = acc.last().is_some_and(|previous| {
+                previous.kind == event.kind && previous.summary == event.summary
+            });
+            if !is_duplicate {
+                acc.push(event);
+            }
+            acc
+        });
+
+    if deduped.is_empty() {
+        return Vec::new();
+    }
+
+    let start = deduped
+        .iter()
+        .rposition(|event| matches!(event.kind, ActivityKind::User))
+        .unwrap_or_else(|| deduped.len().saturating_sub(12));
+    let mut tail = deduped[start..].to_vec();
+
+    if tail.len() > 18 {
+        let keep_head = usize::from(matches!(
+            tail.first().map(|event| &event.kind),
+            Some(ActivityKind::User)
+        ));
+        let keep_tail = 18usize.saturating_sub(keep_head);
+        let mut trimmed = Vec::with_capacity(keep_head + keep_tail);
+        if keep_head == 1 {
+            trimmed.push(tail[0]);
+        }
+        let tail_start = tail.len().saturating_sub(keep_tail);
+        trimmed.extend_from_slice(&tail[tail_start..]);
+        tail = trimmed;
+    }
+
+    tail
+}
+
+fn dedupe_follow_timeline(events: Vec<ActivityEvent>) -> Vec<ActivityEvent> {
+    let mut deduped = Vec::with_capacity(events.len());
+
+    for event in events {
+        let is_duplicate = deduped.last().is_some_and(|previous: &ActivityEvent| {
+            previous.kind == event.kind && previous.summary == event.summary
+        });
+
+        if !is_duplicate {
+            deduped.push(event);
+        }
+    }
+
+    deduped
+}
+
+fn follow_event_block(
+    detail: &SessionDetail,
+    event: &ActivityEvent,
+    width: u16,
+) -> Vec<Line<'static>> {
+    match event.kind {
+        ActivityKind::ToolCall => follow_tool_call_block(detail, event, width),
+        ActivityKind::ToolResult | ActivityKind::System => follow_text_block(
+            detail,
+            event,
+            width,
+            Style::default().fg(text_muted_color()),
+        ),
+        ActivityKind::User | ActivityKind::Assistant => follow_text_block(
+            detail,
+            event,
+            width,
+            Style::default().fg(text_primary_color()),
+        ),
+    }
+}
+
+fn follow_header_line(
+    timestamp: DateTime<Utc>,
+    speaker: String,
+    speaker_style: Style,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            local_timestamp(timestamp),
+            Style::default().fg(text_muted_color()),
+        ),
+        Span::raw("  "),
+        Span::styled(speaker, speaker_style.add_modifier(Modifier::BOLD)),
+    ])
+}
+
+fn push_follow_body(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    for line in wrap_display_text(text, width) {
+        if line.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(line, style),
+            ]));
+        }
+    }
+}
+
+fn follow_text_block(
+    detail: &SessionDetail,
+    event: &ActivityEvent,
+    width: u16,
+    body_style: Style,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![follow_header_line(
+        event.timestamp,
+        follow_sender_name(detail, &event.kind),
+        follow_sender_style(detail, &event.kind),
+    )];
+
+    push_follow_body(
+        &mut lines,
+        &event.summary,
+        follow_body_width(width),
+        body_style,
+    );
+
+    lines.push(Line::from(""));
+    lines
+}
+
+fn follow_tool_call_block(
+    detail: &SessionDetail,
+    event: &ActivityEvent,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let (tool_name, body_lines) = parse_tool_call_block(&event.summary);
+    let mut lines = vec![follow_header_line(
+        event.timestamp,
+        follow_sender_name(detail, &ActivityKind::Assistant),
+        follow_sender_style(detail, &ActivityKind::Assistant),
+    )];
+
+    lines.push(Line::from(vec![
+        Span::raw("        "),
+        Span::styled("used ", Style::default().fg(text_muted_color())),
+        Span::styled(
+            tool_name,
+            Style::default()
+                .fg(accent_gold())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let detail_style = Style::default().fg(Color::Rgb(176, 208, 233));
+    let body_width = follow_body_width(width);
+    for body_line in body_lines {
+        push_follow_body(&mut lines, &body_line, body_width, detail_style);
+    }
+
+    lines.push(Line::from(""));
+    lines
+}
+
+fn parse_tool_call_block(summary: &str) -> (String, Vec<String>) {
+    if let Some(rest) = summary.strip_prefix("exec_command  ") {
+        return match rest.rsplit_once("  in ") {
+            Some((command, workdir)) => (
+                "exec_command".to_string(),
+                vec![command.to_string(), format!("in {workdir}")],
+            ),
+            None => ("exec_command".to_string(), vec![rest.to_string()]),
+        };
+    }
+
+    if let Some(rest) = summary.strip_prefix("write_stdin  ") {
+        return match rest.rsplit_once("  session ") {
+            Some((action, session)) => (
+                "write_stdin".to_string(),
+                vec![action.to_string(), format!("session {session}")],
+            ),
+            None => ("write_stdin".to_string(), vec![rest.to_string()]),
+        };
+    }
+
+    ("tool".to_string(), vec![summary.to_string()])
+}
+
+fn follow_body_width(width: u16) -> usize {
+    width.saturating_sub(10).max(28) as usize
+}
+
+fn follow_sender_name(detail: &SessionDetail, kind: &ActivityKind) -> String {
+    match kind {
+        ActivityKind::User => "You".to_string(),
+        ActivityKind::Assistant => detail
+            .summary
+            .model
+            .clone()
+            .unwrap_or_else(|| detail.summary.provider.to_string()),
+        ActivityKind::ToolCall => "Tool".to_string(),
+        ActivityKind::ToolResult => "Result".to_string(),
+        ActivityKind::System => "System".to_string(),
+    }
+}
+
+fn follow_sender_style(detail: &SessionDetail, kind: &ActivityKind) -> Style {
+    match kind {
+        ActivityKind::User => follow_style(kind),
+        ActivityKind::Assistant => detail
+            .summary
+            .model
+            .as_deref()
+            .map(model_style)
+            .unwrap_or_else(|| model_style(&detail.summary.provider.to_string())),
+        _ => follow_style(kind),
+    }
+}
+
+fn wrap_display_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            if !wrapped
+                .last()
+                .is_some_and(|previous: &String| previous.is_empty())
+            {
+                wrapped.push(String::new());
+            }
+            continue;
+        }
+
+        let mut current = String::new();
+        for word in line.split_whitespace() {
+            let candidate_len = if current.is_empty() {
+                word.chars().count()
+            } else {
+                current.chars().count() + 1 + word.chars().count()
+            };
+
+            if !current.is_empty() && candidate_len > width {
+                wrapped.push(current);
+                current = word.to_string();
+            } else if current.is_empty() {
+                current = word.to_string();
+            } else {
+                current.push(' ');
+                current.push_str(word);
+            }
+        }
+
+        if !current.is_empty() {
+            wrapped.push(current);
+        }
+    }
+
+    if wrapped.is_empty() {
+        vec![String::new()]
+    } else {
+        wrapped
+    }
 }
 
 fn wrapped_line_count(lines: &[Line<'static>], width: u16) -> usize {
@@ -2038,6 +2641,87 @@ fn activity_style(kind: &ActivityKind) -> Style {
     }
 }
 
+fn follow_style(kind: &ActivityKind) -> Style {
+    match kind {
+        ActivityKind::User => Style::default()
+            .fg(accent_blue())
+            .add_modifier(Modifier::BOLD),
+        ActivityKind::Assistant => Style::default()
+            .fg(accent_green())
+            .add_modifier(Modifier::BOLD),
+        ActivityKind::ToolCall => Style::default().fg(accent_gold()),
+        ActivityKind::ToolResult => Style::default().fg(accent_magenta()),
+        ActivityKind::System => Style::default().fg(text_muted_color()),
+    }
+}
+
+fn session_activity_header_label(width: u16) -> &'static str {
+    match width {
+        0..=3 => "ST",
+        4..=6 => "ACT",
+        _ => "STATE",
+    }
+}
+
+fn session_activity_label_for_width(state: &SessionActivityState, width: u16) -> &'static str {
+    let full = session_activity_label(state);
+    if width as usize >= full.len() {
+        return full;
+    }
+
+    match width {
+        0..=1 => match state {
+            SessionActivityState::Thinking => "T",
+            SessionActivityState::Exploring => "E",
+            SessionActivityState::Compacting => "C",
+            SessionActivityState::Waiting => "W",
+            SessionActivityState::Idle => "I",
+        },
+        2..=4 => match state {
+            SessionActivityState::Thinking => "Thnk",
+            SessionActivityState::Exploring => "Expl",
+            SessionActivityState::Compacting => "Comp",
+            SessionActivityState::Waiting => "Wait",
+            SessionActivityState::Idle => "Idle",
+        },
+        _ => match state {
+            SessionActivityState::Thinking => "Think",
+            SessionActivityState::Exploring => "Explore",
+            SessionActivityState::Compacting => "Compact",
+            SessionActivityState::Waiting => "Waiting",
+            SessionActivityState::Idle => "Idle",
+        },
+    }
+}
+
+fn session_activity_label(state: &SessionActivityState) -> &'static str {
+    match state {
+        SessionActivityState::Thinking => "Thinking",
+        SessionActivityState::Exploring => "Exploring",
+        SessionActivityState::Compacting => "Compacting",
+        SessionActivityState::Waiting => "Waiting",
+        SessionActivityState::Idle => "Idle",
+    }
+}
+
+fn session_activity_style(state: &SessionActivityState) -> Style {
+    match state {
+        SessionActivityState::Thinking => Style::default()
+            .fg(accent_green())
+            .add_modifier(Modifier::BOLD),
+        SessionActivityState::Exploring => Style::default()
+            .fg(accent_cyan())
+            .add_modifier(Modifier::BOLD),
+        SessionActivityState::Compacting => Style::default()
+            .fg(accent_gold())
+            .add_modifier(Modifier::BOLD),
+        SessionActivityState::Waiting => Style::default()
+            .fg(accent_magenta())
+            .add_modifier(Modifier::BOLD),
+        SessionActivityState::Idle => Style::default().fg(text_muted_color()),
+    }
+}
+
 fn status_style(kind: &SessionStatusKind) -> Style {
     match kind {
         SessionStatusKind::Running => Style::default().fg(accent_green()),
@@ -2048,6 +2732,28 @@ fn status_style(kind: &SessionStatusKind) -> Style {
         SessionStatusKind::Completed => Style::default().fg(Color::Rgb(109, 214, 156)),
         SessionStatusKind::Failed => Style::default().fg(accent_red()),
         SessionStatusKind::Unknown => Style::default().fg(text_muted_color()),
+    }
+}
+
+fn needs_attention(summary: &SessionSummary) -> bool {
+    matches!(summary.status.kind, SessionStatusKind::WaitingInput)
+}
+
+fn session_state_symbol(summary: &SessionSummary) -> &'static str {
+    if needs_attention(summary) {
+        "!"
+    } else {
+        status_symbol(&summary.status.kind)
+    }
+}
+
+fn session_state_style(summary: &SessionSummary) -> Style {
+    if needs_attention(summary) {
+        Style::default()
+            .fg(accent_red())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        status_style(&summary.status.kind)
     }
 }
 
@@ -2154,6 +2860,10 @@ fn relative_age(timestamp: DateTime<Utc>) -> String {
     } else {
         format!("{}d", delta.num_days())
     }
+}
+
+fn local_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.with_timezone(&Local).format("%H:%M").to_string()
 }
 
 fn session_duration(session: &SessionSummary) -> String {

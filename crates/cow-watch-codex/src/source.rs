@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Local, Utc};
 use cow_watch_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
-    PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionCost, SessionDetail,
-    SessionList, SessionQuery, SessionSource, SessionStatus, SessionStatusKind, SessionSummary,
-    StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
+    PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionActivityState, SessionCost,
+    SessionDetail, SessionList, SessionQuery, SessionSource, SessionStatus, SessionStatusKind,
+    SessionSummary, StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
 };
 use directories::BaseDirs;
 use reqwest::Client;
@@ -28,6 +28,7 @@ use serde_json::Value;
 const SUMMARY_TAIL_LINES: usize = 384;
 const DETAIL_TAIL_LINES: usize = 320;
 const RECENT_EVENT_LIMIT: usize = 48;
+const RECENT_CONVERSATION_LIMIT: usize = 32;
 const RUNNING_TTL_SECONDS: i64 = 90;
 const STALE_AFTER_MINUTES: i64 = 20;
 const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
@@ -95,6 +96,7 @@ struct RolloutHint {
     last_user_message: Option<(DateTime<Utc>, String)>,
     last_assistant_message: Option<(DateTime<Utc>, String)>,
     recent_events: Vec<ActivityEvent>,
+    recent_conversation: Vec<ActivityEvent>,
     tool_stats: HashMap<String, ToolCallStat>,
 }
 
@@ -681,6 +683,7 @@ impl SessionSource for CodexSource {
         Ok(SessionDetail {
             summary,
             recent_events: hint.recent_events,
+            recent_conversation: hint.recent_conversation,
             tool_stats,
             last_user_message: hint.last_user_message.map(|(_, text)| text),
             last_assistant_message: hint.last_assistant_message.map(|(_, text)| text),
@@ -724,6 +727,7 @@ fn build_summary(
         )
     });
     let status = derive_status(row, hint, now);
+    let activity_state = derive_activity_state(&status, hint, now);
     let rollout_path = (!row.rollout_path.is_empty()).then_some(row.rollout_path.clone());
     let navigation = build_navigation(row, rollout_path.clone());
 
@@ -747,9 +751,94 @@ fn build_summary(
         cost,
         context_window: hint.and_then(|hint| hint.context_window.clone()),
         status,
+        activity_state,
         rollout_path,
         navigation,
     }
+}
+
+fn derive_activity_state(
+    status: &SessionStatus,
+    hint: Option<&RolloutHint>,
+    now: DateTime<Utc>,
+) -> SessionActivityState {
+    if matches!(status.kind, SessionStatusKind::WaitingInput) {
+        return SessionActivityState::Waiting;
+    }
+
+    let Some(hint) = hint else {
+        return SessionActivityState::Idle;
+    };
+
+    let has_live_signal =
+        hint.run_active || hint.active_turns > 0 || !hint.pending_call_ids.is_empty();
+    if !has_live_signal {
+        return SessionActivityState::Idle;
+    }
+
+    let recent_window = Duration::seconds(8);
+    let has_recent_feedback = hint
+        .recent_events
+        .iter()
+        .rev()
+        .find(|event| !matches!(event.kind, ActivityKind::User))
+        .is_some_and(|event| now - event.timestamp <= recent_window);
+
+    if !has_recent_feedback {
+        return SessionActivityState::Idle;
+    }
+
+    if hint
+        .context_window
+        .as_ref()
+        .is_some_and(|context| context.used_percent >= 100)
+    {
+        return SessionActivityState::Compacting;
+    }
+
+    if hint
+        .recent_events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.kind, ActivityKind::ToolCall))
+        .is_some_and(|event| {
+            now - event.timestamp <= recent_window && is_exploration_tool(&event.summary)
+        })
+    {
+        return SessionActivityState::Exploring;
+    }
+
+    SessionActivityState::Thinking
+}
+
+fn is_exploration_tool(summary: &str) -> bool {
+    let lowered = format!(" {summary} ").to_ascii_lowercase();
+    if !lowered.contains("exec_command") {
+        return false;
+    }
+
+    [
+        " rg ",
+        " rg -",
+        " sed ",
+        " cat ",
+        " ls ",
+        " find ",
+        " head ",
+        " tail ",
+        " wc ",
+        " nl ",
+        " git diff",
+        " git show",
+        " git status",
+        " grep ",
+        " jq ",
+        " fd ",
+        " tree ",
+        " stat ",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
 }
 
 fn build_navigation(row: &ThreadRow, rollout_path: Option<String>) -> Vec<NavigationTarget> {
@@ -1070,6 +1159,7 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
         ..RolloutHint::default()
     };
     let mut recent_events = VecDeque::with_capacity(RECENT_EVENT_LIMIT);
+    let mut recent_conversation = VecDeque::with_capacity(RECENT_CONVERSATION_LIMIT);
     let mut open_turns = HashMap::<String, DateTime<Utc>>::new();
     let mut unnamed_open_turns = Vec::<DateTime<Utc>>::new();
     let mut latest_tool_call_at = None;
@@ -1170,15 +1260,13 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         if let (Some(timestamp), Some(message)) =
                             (timestamp, payload.get("message").and_then(Value::as_str))
                         {
-                            let message = compact_text(message);
-                            hint.last_assistant_message = Some((timestamp, message.clone()));
-                            push_recent_event(
+                            record_message(
+                                &mut hint,
                                 &mut recent_events,
-                                ActivityEvent {
-                                    timestamp,
-                                    kind: ActivityKind::Assistant,
-                                    summary: message,
-                                },
+                                &mut recent_conversation,
+                                timestamp,
+                                ActivityKind::Assistant,
+                                message,
                             );
                         }
                     }
@@ -1187,15 +1275,13 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                             (timestamp, payload.get("message").and_then(Value::as_str))
                         {
                             remember_latest_timestamp(&mut hint.run_started_at, timestamp);
-                            let message = compact_text(message);
-                            hint.last_user_message = Some((timestamp, message.clone()));
-                            push_recent_event(
+                            record_message(
+                                &mut hint,
                                 &mut recent_events,
-                                ActivityEvent {
-                                    timestamp,
-                                    kind: ActivityKind::User,
-                                    summary: message,
-                                },
+                                &mut recent_conversation,
+                                timestamp,
+                                ActivityKind::User,
+                                message,
                             );
                         }
                     }
@@ -1232,7 +1318,10 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                                 ActivityEvent {
                                     timestamp,
                                     kind: ActivityKind::ToolCall,
-                                    summary: format!("Called `{name}`"),
+                                    summary: summarize_tool_call(
+                                        &name,
+                                        payload.get("arguments").and_then(Value::as_str),
+                                    ),
                                 },
                             );
                         }
@@ -1269,15 +1358,13 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         if let (Some(timestamp), Some(message)) =
                             (timestamp, extract_message_text(payload))
                         {
-                            let message = compact_text(&message);
-                            hint.last_assistant_message = Some((timestamp, message.clone()));
-                            push_recent_event(
+                            record_message(
+                                &mut hint,
                                 &mut recent_events,
-                                ActivityEvent {
-                                    timestamp,
-                                    kind: ActivityKind::Assistant,
-                                    summary: message,
-                                },
+                                &mut recent_conversation,
+                                timestamp,
+                                ActivityKind::Assistant,
+                                &message,
                             );
                         }
                     }
@@ -1305,6 +1392,7 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
     }
 
     hint.recent_events = recent_events.into_iter().collect();
+    hint.recent_conversation = recent_conversation.into_iter().collect();
     Ok(hint)
 }
 
@@ -1858,6 +1946,57 @@ fn push_recent_event(events: &mut VecDeque<ActivityEvent>, event: ActivityEvent)
     events.push_back(event);
 }
 
+fn push_recent_conversation(events: &mut VecDeque<ActivityEvent>, event: ActivityEvent) {
+    if let Some(previous) = events.back_mut()
+        && previous.kind == event.kind
+        && previous.summary == event.summary
+    {
+        previous.timestamp = event.timestamp;
+        return;
+    }
+    if events.len() == RECENT_CONVERSATION_LIMIT {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+fn record_message(
+    hint: &mut RolloutHint,
+    recent_events: &mut VecDeque<ActivityEvent>,
+    recent_conversation: &mut VecDeque<ActivityEvent>,
+    timestamp: DateTime<Utc>,
+    kind: ActivityKind,
+    message: &str,
+) {
+    let full_message = normalize_message_text(message);
+    let compact_message = compact_text(message);
+
+    match kind {
+        ActivityKind::User => hint.last_user_message = Some((timestamp, full_message.clone())),
+        ActivityKind::Assistant => {
+            hint.last_assistant_message = Some((timestamp, full_message.clone()))
+        }
+        _ => {}
+    }
+
+    push_recent_event(
+        recent_events,
+        ActivityEvent {
+            timestamp,
+            kind: kind.clone(),
+            summary: compact_message,
+        },
+    );
+    push_recent_conversation(
+        recent_conversation,
+        ActivityEvent {
+            timestamp,
+            kind,
+            summary: full_message,
+        },
+    );
+}
+
 fn looks_like_waiting_input(
     assistant_message: Option<&(DateTime<Utc>, String)>,
     user_message: Option<&(DateTime<Utc>, String)>,
@@ -1910,14 +2049,108 @@ fn extract_message_text(payload: &Value) -> Option<String> {
     }
 }
 
+fn summarize_tool_call(name: &str, arguments: Option<&str>) -> String {
+    match name {
+        "exec_command" => {
+            summarize_exec_command(arguments).unwrap_or_else(|| format!("exec_command  {}", "run"))
+        }
+        "write_stdin" => summarize_write_stdin(arguments)
+            .unwrap_or_else(|| "write_stdin  session input".to_string()),
+        _ => format!("Called `{name}`"),
+    }
+}
+
+fn summarize_exec_command(arguments: Option<&str>) -> Option<String> {
+    let arguments = arguments?;
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let command = value
+        .get("cmd")
+        .and_then(Value::as_str)
+        .map(normalize_single_line_text)
+        .or_else(|| {
+            value.get("command").and_then(Value::as_array).map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        })?;
+    let command = truncate_chars(&command, 140);
+    let workdir = value
+        .get("workdir")
+        .and_then(Value::as_str)
+        .map(display_path)
+        .unwrap_or_else(|| ".".to_string());
+    Some(format!("exec_command  {command}  in {workdir}"))
+}
+
+fn summarize_write_stdin(arguments: Option<&str>) -> Option<String> {
+    let arguments = arguments?;
+    let value: Value = serde_json::from_str(arguments).ok()?;
+    let session_id = value.get("session_id").and_then(Value::as_i64)?;
+    let chars = value
+        .get("chars")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let action = if chars.is_empty() {
+        "poll".to_string()
+    } else {
+        let normalized = normalize_single_line_text(chars);
+        if normalized.chars().count() <= 16 {
+            format!("send {:?}", normalized)
+        } else {
+            format!("send {} chars", normalized.chars().count())
+        }
+    };
+    Some(format!("write_stdin  {action}  session {session_id}"))
+}
+
+fn normalize_message_text(text: &str) -> String {
+    let mut lines = Vec::new();
+    let mut previous_blank = false;
+
+    for raw_line in collapse_markdown_links(text).lines() {
+        let normalized = raw_line
+            .split_whitespace()
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if normalized.is_empty() {
+            if !lines.is_empty() && !previous_blank {
+                lines.push(String::new());
+            }
+            previous_blank = true;
+            continue;
+        }
+
+        lines.push(normalized);
+        previous_blank = false;
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn normalize_single_line_text(text: &str) -> String {
+    normalize_inline_text(text)
+}
+
 fn compact_text(text: &str) -> String {
-    let text = text
-        .split_whitespace()
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = normalize_single_line_text(text);
 
     truncate_chars(&text, 140)
+}
+
+fn display_path(path: &str) -> String {
+    std::env::var("HOME")
+        .ok()
+        .and_then(|home| path.strip_prefix(&home).map(|suffix| format!("~{suffix}")))
+        .unwrap_or_else(|| path.to_string())
 }
 
 fn normalize_title(text: &str) -> String {

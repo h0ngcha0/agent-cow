@@ -73,6 +73,16 @@ pub struct SessionStatus {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivityState {
+    Thinking,
+    Exploring,
+    Compacting,
+    Waiting,
+    Idle,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
     pub total_tokens: u64,
@@ -206,6 +216,7 @@ pub struct SessionSummary {
     pub cost: Option<SessionCost>,
     pub context_window: Option<ContextWindowUsage>,
     pub status: SessionStatus,
+    pub activity_state: SessionActivityState,
     pub rollout_path: Option<String>,
     pub navigation: Vec<NavigationTarget>,
 }
@@ -214,6 +225,7 @@ pub struct SessionSummary {
 pub struct SessionDetail {
     pub summary: SessionSummary,
     pub recent_events: Vec<ActivityEvent>,
+    pub recent_conversation: Vec<ActivityEvent>,
     pub tool_stats: Vec<ToolCallStat>,
     pub last_user_message: Option<String>,
     pub last_assistant_message: Option<String>,
