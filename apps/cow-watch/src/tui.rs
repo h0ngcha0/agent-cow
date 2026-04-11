@@ -66,16 +66,29 @@ fn spawn_detail_refresh(
 }
 
 fn queue_detail_refresh(
-    app: &TuiApp,
+    app: &mut TuiApp,
     service: &MonitorService,
     detail_refresh: &mut Option<JoinHandle<Result<(String, SessionDetail)>>>,
 ) {
     let Some(session_id) = app.selected_session_id().map(ToOwned::to_owned) else {
+        app.detail_loading = false;
+        app.detail_loading_session_id = None;
         return;
     };
+    if app.detail_loading && app.detail_loading_session_id.as_deref() == Some(session_id.as_str()) {
+        return;
+    }
     if let Some(handle) = detail_refresh.take() {
         handle.abort();
     }
+    let current_detail_matches =
+        app.detail.as_ref().map(|detail| detail.summary.id.as_str()) == Some(session_id.as_str());
+    if !current_detail_matches {
+        app.detail = None;
+        app.detail_scroll = 0;
+    }
+    app.detail_loading = true;
+    app.detail_loading_session_id = Some(session_id.clone());
     *detail_refresh = Some(spawn_detail_refresh(service.clone(), session_id));
 }
 
@@ -116,7 +129,7 @@ async fn run_loop(
             let response = list_refresh.take().unwrap().await??;
             app.apply_session_list(response);
             if app.detail_mode {
-                queue_detail_refresh(&app, &service, &mut detail_refresh);
+                queue_detail_refresh(&mut app, &service, &mut detail_refresh);
             }
         }
 
@@ -126,7 +139,12 @@ async fn run_loop(
             let (session_id, detail) = detail_refresh.take().unwrap().await??;
             if app.detail_mode && app.selected_session_id() == Some(session_id.as_str()) {
                 app.detail = Some(detail);
+                app.detail_loading = false;
+                app.detail_loading_session_id = None;
                 app.error = None;
+            } else {
+                app.detail_loading = false;
+                app.detail_loading_session_id = None;
             }
         }
 
@@ -191,7 +209,7 @@ async fn run_loop(
                     KeyCode::Enter => {
                         let entering_detail = app.toggle_detail_mode();
                         if entering_detail {
-                            queue_detail_refresh(&app, &service, &mut detail_refresh);
+                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
                         }
                     }
                     KeyCode::Char('o') => app.open_selected_app(),
@@ -202,7 +220,7 @@ async fn run_loop(
 
             if app.selection_changed {
                 if app.detail_mode {
-                    queue_detail_refresh(&app, &service, &mut detail_refresh);
+                    queue_detail_refresh(&mut app, &service, &mut detail_refresh);
                 }
                 app.selection_changed = false;
             }
@@ -221,6 +239,8 @@ struct TuiApp {
     overview: UsageOverview,
     filtered_indices: Vec<usize>,
     detail: Option<SessionDetail>,
+    detail_loading: bool,
+    detail_loading_session_id: Option<String>,
     table_state: TableState,
     detail_mode: bool,
     detail_scroll: u16,
@@ -250,6 +270,8 @@ impl TuiApp {
             overview: UsageOverview::default(),
             filtered_indices: Vec::new(),
             detail: None,
+            detail_loading: false,
+            detail_loading_session_id: None,
             table_state,
             detail_mode: false,
             detail_scroll: 0,
@@ -275,6 +297,8 @@ impl TuiApp {
 
         if self.filtered_indices.is_empty() {
             self.detail = None;
+            self.detail_loading = false;
+            self.detail_loading_session_id = None;
             self.detail_mode = false;
             self.detail_scroll = 0;
         }
@@ -338,6 +362,9 @@ impl TuiApp {
 
         if self.filtered_indices.is_empty() {
             self.table_state.select(None);
+            self.detail = None;
+            self.detail_loading = false;
+            self.detail_loading_session_id = None;
             self.detail_mode = false;
             self.detail_scroll = 0;
             return;
@@ -511,8 +538,12 @@ impl TuiApp {
         self.detail_mode = entering;
         if entering {
             self.detail_scroll = 0;
+            self.detail_loading = false;
+            self.detail_loading_session_id = None;
         } else {
             self.detail = None;
+            self.detail_loading = false;
+            self.detail_loading_session_id = None;
             self.detail_scroll = 0;
         }
         self.notice = None;
@@ -521,6 +552,8 @@ impl TuiApp {
 
     fn close_detail_mode(&mut self) {
         self.detail_mode = false;
+        self.detail_loading = false;
+        self.detail_loading_session_id = None;
         self.detail_scroll = 0;
     }
 
@@ -567,12 +600,13 @@ impl TuiApp {
         if !self.detail_mode {
             return 0;
         }
+        let footer_height = self.footer_height();
         let content_area = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(6),
                 Constraint::Min(0),
-                Constraint::Length(2),
+                Constraint::Length(footer_height),
             ])
             .split(frame_area)[1];
         let Some(detail) = &self.detail else {
@@ -588,16 +622,21 @@ impl TuiApp {
             .saturating_sub(content_height)
             .min(u16::MAX as usize) as u16
     }
+
+    fn footer_height(&self) -> u16 {
+        u16::from(self.notice.is_some() || self.error.is_some() || self.filter_mode)
+    }
 }
 
 fn draw(frame: &mut Frame, app: &mut TuiApp) {
     let wide_header = frame.area().width >= 150;
+    let footer_height = app.footer_height();
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),
             Constraint::Min(0),
-            Constraint::Length(2),
+            Constraint::Length(footer_height),
         ])
         .split(frame.area());
 
@@ -630,7 +669,9 @@ fn draw(frame: &mut Frame, app: &mut TuiApp) {
         );
     }
 
-    frame.render_widget(render_footer(app), layout[2]);
+    if footer_height > 0 {
+        frame.render_widget(render_footer(app), layout[2]);
+    }
 }
 
 fn detail_content_height(area: Rect) -> u16 {
@@ -1326,6 +1367,11 @@ fn session_table_widths(
 }
 
 fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
+    if app.detail_loading && app.detail.is_none() {
+        render_detail_loading(frame, area);
+        return;
+    }
+
     let Some(detail) = &app.detail else {
         frame.render_widget(
             Paragraph::new("No session selected.").block(
@@ -1371,8 +1417,67 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     );
 }
 
+fn render_detail_loading(frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(panel_border_color()))
+        .title(Line::from(vec![
+            Span::styled(
+                "Describe",
+                Style::default()
+                    .fg(accent_cyan())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" • ", Style::default().fg(text_muted_color())),
+            Span::styled("loading", Style::default().fg(accent_gold())),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let brand_width = body[1].width.min(18);
+    let brand_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(brand_width),
+            Constraint::Min(0),
+        ])
+        .split(body[1]);
+
+    frame.render_widget(render_brand_cluster(brand_width), brand_row[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!("Loading details{}", loading_dots()),
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )]))
+        .alignment(Alignment::Center),
+        body[2],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "Fetching session detail and recent activity",
+            Style::default().fg(text_muted_color()),
+        )]))
+        .alignment(Alignment::Center),
+        body[3],
+    );
+}
+
 fn render_footer(app: &TuiApp) -> Paragraph<'static> {
-    let line1 = if let Some(notice) = &app.notice {
+    let line = if let Some(notice) = &app.notice {
         Line::from(Span::styled(
             notice.message.clone(),
             Style::default().fg(if notice.is_error {
@@ -1406,21 +1511,7 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
         Line::from("")
     };
 
-    let line2 = if app.detail_mode {
-        Line::from(
-            "j/k scroll  •  enter/esc back  •  o open app  •  f folder  •  r refresh  •  q quit",
-        )
-    } else if app.filter_input.is_empty() {
-        Line::from(
-            "j/k move  •  enter details  •  o open app  •  f folder  •  / filter  •  r refresh  •  q quit",
-        )
-    } else {
-        Line::from(
-            "j/k move  •  enter details  •  o open app  •  f folder  •  / filter  •  esc clear  •  q quit",
-        )
-    };
-
-    Paragraph::new(Text::from(vec![line1, line2]))
+    Paragraph::new(Text::from(vec![line]))
 }
 
 fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
