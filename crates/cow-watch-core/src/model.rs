@@ -88,6 +88,8 @@ pub struct SessionCost {
     pub cached_input_usd: f64,
     pub output_usd: f64,
     pub total_usd: f64,
+    pub hour_usd: f64,
+    pub day_usd: f64,
     pub pricing_source: PricingSource,
 }
 

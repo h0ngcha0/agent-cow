@@ -590,6 +590,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
                 <th style="width:140px;">Project</th>
                 <th style="width:150px;">Model</th>
                 <th style="width:82px;">Cost</th>
+                <th style="width:82px;">$/1H</th>
+                <th style="width:82px;">$/1D</th>
                 <th style="width:72px;">Ctx</th>
                 <th style="width:96px;">Tokens</th>
                 <th style="width:74px;">Age</th>
@@ -668,6 +670,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
         if (value >= 1) return `$${value.toFixed(2)}`;
         if (value >= 0.01) return `$${value.toFixed(3)}`;
         return `$${value.toFixed(4)}`;
+      }
+
+      function formatUsdWindow(value) {
+        if (!value || value <= 0) return "--";
+        return formatUsd(value);
       }
 
       function formatContext(context) {
@@ -764,7 +771,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
         if (!filtered.length) {
           tbody.innerHTML = `
             <tr>
-              <td class="empty-state" colspan="8">No sessions match the current filter.</td>
+              <td class="empty-state" colspan="10">No sessions match the current filter.</td>
             </tr>
           `;
           document.getElementById("detail-title").textContent = "No matching session";
@@ -784,6 +791,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <td class="mono">${escapeHtml(pathTail(session.cwd))}</td>
             <td>${escapeHtml(session.model || "n/a")}</td>
             <td>${escapeHtml(formatUsd(session.cost?.total_usd || 0))}</td>
+            <td>${escapeHtml(formatUsdWindow(session.cost?.hour_usd || 0))}</td>
+            <td>${escapeHtml(formatUsdWindow(session.cost?.day_usd || 0))}</td>
             <td>${escapeHtml(formatContext(session.context_window))}</td>
             <td>${escapeHtml(formatTokens(session.tokens.total_tokens))}</td>
             <td>${escapeHtml(relativeTime(session.updated_at))}</td>
@@ -846,6 +855,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <div><strong>Status</strong>${escapeHtml(detail.summary.status.kind)} (${escapeHtml(detail.summary.status.confidence)})</div>
               <div><strong>Tokens</strong>${detail.summary.tokens.total_tokens.toLocaleString()}</div>
               <div><strong>Cost</strong>${escapeHtml(formatUsd(detail.summary.cost?.total_usd || 0))}</div>
+              <div><strong>$/1H</strong>${escapeHtml(formatUsdWindow(detail.summary.cost?.hour_usd || 0))}</div>
+              <div><strong>$/1D</strong>${escapeHtml(formatUsdWindow(detail.summary.cost?.day_usd || 0))}</div>
               <div><strong>Updated</strong>${escapeHtml(relativeTime(detail.summary.updated_at))}</div>
               <div><strong>Model</strong>${escapeHtml(detail.summary.model || "n/a")}</div>
               <div><strong>Machine</strong>${escapeHtml(detail.summary.machine_label)}</div>
@@ -857,7 +868,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <div><strong>Branch</strong>${escapeHtml(detail.summary.git_branch || "n/a")}</div>
             </div>
             <div class="summary-line">${escapeHtml(detail.summary.status.reason)}</div>
-            ${detail.summary.cost ? `<div class="summary-line">input ${escapeHtml(formatUsd(detail.summary.cost.input_usd))} · cached ${escapeHtml(formatUsd(detail.summary.cost.cached_input_usd))} · output ${escapeHtml(formatUsd(detail.summary.cost.output_usd))} · ${escapeHtml(detail.summary.cost.pricing_source)}</div>` : ""}
+            ${detail.summary.cost ? `<div class="summary-line">1h ${escapeHtml(formatUsdWindow(detail.summary.cost.hour_usd))} · 1d ${escapeHtml(formatUsdWindow(detail.summary.cost.day_usd))} · input ${escapeHtml(formatUsd(detail.summary.cost.input_usd))} · cached ${escapeHtml(formatUsd(detail.summary.cost.cached_input_usd))} · output ${escapeHtml(formatUsd(detail.summary.cost.output_usd))} · ${escapeHtml(detail.summary.cost.pricing_source)}</div>` : ""}
           </div>
 
           ${(appAction || actions) ? `
@@ -899,7 +910,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           document.getElementById("session-count").textContent = "failed";
           document.getElementById("session-table-body").innerHTML = `
             <tr>
-              <td class="empty-state error" colspan="8">${escapeHtml(error.message)}</td>
+              <td class="empty-state error" colspan="10">${escapeHtml(error.message)}</td>
             </tr>
           `;
         }

@@ -990,6 +990,12 @@ fn render_sessions_table(
     header_cells.push(Cell::from("COST").style(Style::default().fg(accent_green())));
     constraints.push(Constraint::Length(widths.cost));
 
+    header_cells.push(Cell::from("$/1H").style(Style::default().fg(accent_gold())));
+    constraints.push(Constraint::Length(widths.cost_hour));
+
+    header_cells.push(Cell::from("$/1D").style(Style::default().fg(accent_red())));
+    constraints.push(Constraint::Length(widths.cost_day));
+
     header_cells.push(Cell::from("CTX").style(Style::default().fg(accent_magenta())));
     constraints.push(Constraint::Length(widths.context));
 
@@ -1061,6 +1067,30 @@ fn render_sessions_table(
                         .unwrap_or_else(|| "--".to_string()),
                 )
                 .style(cost_style(session.cost.as_ref().map(|cost| cost.total_usd))),
+            );
+
+            cells.push(
+                Cell::from(
+                    session
+                        .cost
+                        .as_ref()
+                        .filter(|cost| cost.hour_usd > 0.0)
+                        .map(|cost| format_usd_short(cost.hour_usd))
+                        .unwrap_or_else(|| "--".to_string()),
+                )
+                .style(cost_style(session.cost.as_ref().map(|cost| cost.hour_usd))),
+            );
+
+            cells.push(
+                Cell::from(
+                    session
+                        .cost
+                        .as_ref()
+                        .filter(|cost| cost.day_usd > 0.0)
+                        .map(|cost| format_usd_short(cost.day_usd))
+                        .unwrap_or_else(|| "--".to_string()),
+                )
+                .style(cost_style(session.cost.as_ref().map(|cost| cost.day_usd))),
             );
 
             cells.push(
@@ -1146,6 +1176,8 @@ struct SessionTableWidths {
     state: u16,
     duration: u16,
     cost: u16,
+    cost_hour: u16,
+    cost_day: u16,
     context: u16,
     name: u16,
     project: u16,
@@ -1165,6 +1197,8 @@ fn session_table_widths(
     enum ColumnId {
         State,
         Cost,
+        CostHour,
+        CostDay,
         Context,
         Name,
         Project,
@@ -1181,6 +1215,8 @@ fn session_table_widths(
         (ColumnId::Age, 4, 5),
         (ColumnId::Duration, 4, 5),
         (ColumnId::Cost, 6, 5),
+        (ColumnId::CostHour, 6, 5),
+        (ColumnId::CostDay, 6, 5),
         (ColumnId::Context, 4, 5),
         (ColumnId::Name, 16_u16, 26_u16),
         (ColumnId::Project, 8_u16, 10_u16),
@@ -1218,6 +1254,8 @@ fn session_table_widths(
         state: 1,
         duration: 4,
         cost: 6,
+        cost_hour: 6,
+        cost_day: 6,
         context: 4,
         name: 24,
         project: 10,
@@ -1233,6 +1271,8 @@ fn session_table_widths(
             ColumnId::State => widths.state = width,
             ColumnId::Duration => widths.duration = width,
             ColumnId::Cost => widths.cost = width,
+            ColumnId::CostHour => widths.cost_hour = width,
+            ColumnId::CostDay => widths.cost_day = width,
             ColumnId::Context => widths.context = width,
             ColumnId::Name => widths.name = width,
             ColumnId::Project => widths.project = width,
@@ -1409,7 +1449,9 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
             indent(),
             Span::styled(
                 format!(
-                    "input {}  •  cached {}  •  output {}",
+                    "1h {}  •  1d {}  •  input {}  •  cached {}  •  output {}",
+                    format_usd_short(cost.hour_usd),
+                    format_usd_short(cost.day_usd),
                     format_usd_short(cost.input_usd),
                     format_usd_short(cost.cached_input_usd),
                     format_usd_short(cost.output_usd)

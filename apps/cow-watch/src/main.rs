@@ -135,19 +135,31 @@ fn init_tracing() {
 
 fn print_sessions(sessions: &[SessionSummary]) {
     println!(
-        "{:<14} {:>8} {:>7} {:>10} {:<8} {:<18} title",
-        "status", "cost", "ctx", "tokens", "archived", "updated"
+        "{:<14} {:>8} {:>8} {:>8} {:>7} {:>10} {:<8} {:<18} title",
+        "status", "cost", "$/1h", "$/1d", "ctx", "tokens", "archived", "updated"
     );
-    println!("{}", "-".repeat(116));
+    println!("{}", "-".repeat(134));
 
     for session in sessions {
         println!(
-            "{:<14} {:>8} {:>7} {:>10} {:<8} {:<18} {}",
+            "{:<14} {:>8} {:>8} {:>8} {:>7} {:>10} {:<8} {:<18} {}",
             session.status.kind,
             session
                 .cost
                 .as_ref()
                 .map(|cost| format_usd_short(cost.total_usd))
+                .unwrap_or_else(|| "--".to_string()),
+            session
+                .cost
+                .as_ref()
+                .filter(|cost| cost.hour_usd > 0.0)
+                .map(|cost| format_usd_short(cost.hour_usd))
+                .unwrap_or_else(|| "--".to_string()),
+            session
+                .cost
+                .as_ref()
+                .filter(|cost| cost.day_usd > 0.0)
+                .map(|cost| format_usd_short(cost.day_usd))
                 .unwrap_or_else(|| "--".to_string()),
             session
                 .context_window
@@ -175,8 +187,10 @@ fn print_session_detail(detail: &SessionDetail) {
     println!("Tokens: {}", summary.tokens.total_tokens);
     if let Some(cost) = &summary.cost {
         println!(
-            "Cost: ${:.4} (input ${:.4}, cached ${:.4}, output ${:.4}, {})",
+            "Cost: ${:.4} ($/1h ${:.4}, $/1d ${:.4}, input ${:.4}, cached ${:.4}, output ${:.4}, {})",
             cost.total_usd,
+            cost.hour_usd,
+            cost.day_usd,
             cost.input_usd,
             cost.cached_input_usd,
             cost.output_usd,

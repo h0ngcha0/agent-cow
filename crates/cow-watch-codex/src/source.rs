@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use cow_watch_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
     PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionCost, SessionDetail,
@@ -80,6 +80,7 @@ struct TranscriptStatic {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct RolloutHint {
     active_turns: usize,
     pending_call_ids: HashSet<String>,
@@ -87,6 +88,8 @@ struct RolloutHint {
     run_started_at: Option<DateTime<Utc>>,
     run_active: bool,
     cumulative_token_usage: Option<TokenUsage>,
+    cost_by_day: HashMap<String, RawCostBucket>,
+    cost_by_hour: HashMap<String, RawCostBucket>,
     context_window: Option<ContextWindowUsage>,
     quota: Option<ProviderQuota>,
     last_user_message: Option<(DateTime<Utc>, String)>,
@@ -101,6 +104,13 @@ struct CodexPricing {
     cached_input_per_million: f64,
     output_per_million: f64,
     source: PricingSource,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct RawCostBucket {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
 }
 
 type LitellmPricingMap = HashMap<String, LitellmPricingEntry>;
@@ -142,6 +152,13 @@ struct SummaryHintCacheFile {
 struct SummaryHintCacheRecord {
     path: String,
     entry: SummaryHintCacheEntry,
+}
+
+#[derive(Default)]
+struct UsageIndex {
+    cumulative_token_usage: Option<TokenUsage>,
+    cost_by_day: HashMap<String, RawCostBucket>,
+    cost_by_hour: HashMap<String, RawCostBucket>,
 }
 
 #[derive(Clone, Debug)]
@@ -696,7 +713,16 @@ fn build_summary(
         .model
         .as_deref()
         .and_then(|model| resolve_codex_pricing(model, litellm_pricing));
-    let cost = pricing.and_then(|pricing| estimate_session_cost(&tokens, pricing));
+    let cost = pricing.as_ref().and_then(|pricing| {
+        estimate_session_cost(
+            &tokens,
+            pricing,
+            hint.map(|hint| current_hour_cost_usd(&hint.cost_by_hour, pricing, now))
+                .unwrap_or(0.0),
+            hint.map(|hint| current_day_cost_usd(&hint.cost_by_day, pricing, now))
+                .unwrap_or(0.0),
+        )
+    });
     let status = derive_status(row, hint, now);
     let rollout_path = (!row.rollout_path.is_empty()).then_some(row.rollout_path.clone());
     let navigation = build_navigation(row, rollout_path.clone());
@@ -842,7 +868,12 @@ fn litellm_to_codex_pricing(entry: &LitellmPricingEntry) -> Option<CodexPricing>
     })
 }
 
-fn estimate_session_cost(tokens: &TokenUsage, pricing: CodexPricing) -> Option<SessionCost> {
+fn estimate_session_cost(
+    tokens: &TokenUsage,
+    pricing: &CodexPricing,
+    hour_usd: f64,
+    day_usd: f64,
+) -> Option<SessionCost> {
     let input_tokens = tokens.input_tokens?;
     let cached_input_tokens = tokens.cached_input_tokens.unwrap_or(0);
     let output_tokens = tokens.output_tokens?;
@@ -857,8 +888,44 @@ fn estimate_session_cost(tokens: &TokenUsage, pricing: CodexPricing) -> Option<S
         cached_input_usd,
         output_usd,
         total_usd: input_usd + cached_input_usd + output_usd,
-        pricing_source: pricing.source,
+        hour_usd,
+        day_usd,
+        pricing_source: pricing.source.clone(),
     })
+}
+
+fn estimate_raw_cost_bucket(bucket: &RawCostBucket, pricing: &CodexPricing) -> f64 {
+    let uncached_input_tokens = bucket
+        .input_tokens
+        .saturating_sub(bucket.cached_input_tokens);
+    token_cost(uncached_input_tokens, pricing.input_per_million)
+        + token_cost(bucket.cached_input_tokens, pricing.cached_input_per_million)
+        + token_cost(bucket.output_tokens, pricing.output_per_million)
+}
+
+fn current_hour_cost_usd(
+    buckets: &HashMap<String, RawCostBucket>,
+    pricing: &CodexPricing,
+    now: DateTime<Utc>,
+) -> f64 {
+    let hour_key = local_hour_key(now);
+    buckets
+        .get(&hour_key)
+        .map(|bucket| estimate_raw_cost_bucket(bucket, pricing))
+        .unwrap_or(0.0)
+}
+
+fn current_day_cost_usd(
+    buckets: &HashMap<String, RawCostBucket>,
+    pricing: &CodexPricing,
+    now: DateTime<Utc>,
+) -> f64 {
+    let today_key = local_date_key(now);
+    buckets
+        .iter()
+        .filter(|(day, _)| day.as_str() >= today_key.as_str())
+        .map(|(_, bucket)| estimate_raw_cost_bucket(bucket, pricing))
+        .sum()
 }
 
 fn token_cost(tokens: u64, rate_per_million: f64) -> f64 {
@@ -995,8 +1062,11 @@ fn enrich_thread_from_db(row: &mut ThreadRow, sqlite_row: ThreadRow) {
 
 fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
     let lines = read_rollout_lines(path, mode)?;
+    let usage_index = stream_usage_index(path)?;
     let mut hint = RolloutHint {
-        cumulative_token_usage: stream_cumulative_token_usage(path)?,
+        cumulative_token_usage: usage_index.cumulative_token_usage,
+        cost_by_day: usage_index.cost_by_day,
+        cost_by_hour: usage_index.cost_by_hour,
         ..RolloutHint::default()
     };
     let mut recent_events = VecDeque::with_capacity(RECENT_EVENT_LIMIT);
@@ -1455,13 +1525,46 @@ fn accumulate_token_usage(total: &mut TokenUsage, delta: &TokenUsage) {
     );
 }
 
-fn stream_cumulative_token_usage(path: &Path) -> Result<Option<TokenUsage>> {
+fn add_raw_cost_bucket(
+    buckets: &mut HashMap<String, RawCostBucket>,
+    key: String,
+    delta: &TokenUsage,
+) {
+    let bucket = buckets.entry(key).or_default();
+    bucket.input_tokens = bucket
+        .input_tokens
+        .saturating_add(delta.input_tokens.unwrap_or(0));
+    bucket.cached_input_tokens = bucket
+        .cached_input_tokens
+        .saturating_add(delta.cached_input_tokens.unwrap_or(0));
+    bucket.output_tokens = bucket
+        .output_tokens
+        .saturating_add(delta.output_tokens.unwrap_or(0));
+}
+
+fn local_date_key(timestamp: DateTime<Utc>) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn local_hour_key(timestamp: DateTime<Utc>) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format("%Y-%m-%dT%H")
+        .to_string()
+}
+
+fn stream_usage_index(path: &Path) -> Result<UsageIndex> {
     let reader = BufReader::new(
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
     );
     let mut cumulative = TokenUsage::default();
     let mut saw_delta = false;
     let mut latest_total = None;
+    let mut cost_by_day = HashMap::new();
+    let mut cost_by_hour = HashMap::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -1486,6 +1589,14 @@ fn stream_cumulative_token_usage(path: &Path) -> Result<Option<TokenUsage>> {
         if let Some(delta) = info.get("last_token_usage").and_then(parse_token_usage) {
             accumulate_token_usage(&mut cumulative, &delta);
             saw_delta = true;
+            if let Some(timestamp) = value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339)
+            {
+                add_raw_cost_bucket(&mut cost_by_day, local_date_key(timestamp), &delta);
+                add_raw_cost_bucket(&mut cost_by_hour, local_hour_key(timestamp), &delta);
+            }
         }
 
         if let Some(total) = info.get("total_token_usage").and_then(parse_token_usage) {
@@ -1493,11 +1604,15 @@ fn stream_cumulative_token_usage(path: &Path) -> Result<Option<TokenUsage>> {
         }
     }
 
-    if saw_delta {
-        Ok(Some(cumulative))
-    } else {
-        Ok(latest_total)
-    }
+    Ok(UsageIndex {
+        cumulative_token_usage: if saw_delta {
+            Some(cumulative)
+        } else {
+            latest_total
+        },
+        cost_by_day,
+        cost_by_hour,
+    })
 }
 
 fn parse_context_window_usage(info: &Value) -> Option<ContextWindowUsage> {
@@ -2214,9 +2329,10 @@ fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadMode, analyze_rollout, looks_like_waiting_input, normalize_codex_home, normalize_title,
-        parse_context_window_usage, parse_state_db_version, parse_transcript_static,
-        state_db_candidates_for_input, user_title_candidate,
+        ReadMode, analyze_rollout, local_date_key, local_hour_key, looks_like_waiting_input,
+        normalize_codex_home, normalize_title, parse_context_window_usage, parse_state_db_version,
+        parse_transcript_static, state_db_candidates_for_input, stream_usage_index,
+        user_title_candidate,
     };
     use chrono::Utc;
     use directories::BaseDirs;
@@ -2489,5 +2605,46 @@ mod tests {
         assert_eq!(context.used_tokens, 222_238);
         assert_eq!(context.remaining_tokens, 0);
         assert_eq!(context.used_percent, 103);
+    }
+
+    #[test]
+    fn stream_usage_index_tracks_current_hour_and_day_buckets() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cow-watch-rollout-cost-buckets-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-2026-04-11T05-07-04-costs.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-04-11T10:05:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":400,\"output_tokens\":20,\"reasoning_output_tokens\":0,\"total_tokens\":1020},\"total_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":400,\"output_tokens\":20,\"reasoning_output_tokens\":0,\"total_tokens\":1020}}}}\n",
+                "{\"timestamp\":\"2026-04-11T10:45:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":500,\"cached_input_tokens\":100,\"output_tokens\":10,\"reasoning_output_tokens\":0,\"total_tokens\":510},\"total_token_usage\":{\"input_tokens\":1500,\"cached_input_tokens\":500,\"output_tokens\":30,\"reasoning_output_tokens\":0,\"total_tokens\":1530}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let usage = stream_usage_index(&path).unwrap();
+        let cumulative = usage.cumulative_token_usage.unwrap();
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-04-11T10:05:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let day_key = local_date_key(timestamp);
+        let hour_key = local_hour_key(timestamp);
+
+        assert_eq!(cumulative.total_tokens, 1530);
+        assert_eq!(usage.cost_by_day.get(&day_key).unwrap().input_tokens, 1500);
+        assert_eq!(
+            usage.cost_by_day.get(&day_key).unwrap().cached_input_tokens,
+            500
+        );
+        assert_eq!(usage.cost_by_day.get(&day_key).unwrap().output_tokens, 30);
+        assert_eq!(
+            usage.cost_by_hour.get(&hour_key).unwrap().input_tokens,
+            1500
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
