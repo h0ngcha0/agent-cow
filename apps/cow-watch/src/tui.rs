@@ -328,6 +328,17 @@ impl TuiApp {
         self.error = None;
         self.rebuild_filter(selected_id.as_deref());
 
+        if let Some(selected_id) = selected_id.as_deref()
+            && let Some(detail) = self.detail.as_mut()
+            && detail.summary.id == selected_id
+            && let Some(summary) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == selected_id)
+        {
+            detail.summary = summary.clone();
+        }
+
         if self.filtered_indices.is_empty() {
             self.detail = None;
             self.detail_loading = false;
@@ -642,7 +653,7 @@ impl TuiApp {
             return 0;
         };
         let status_height = if self.detail_pane == DetailPane::Follow {
-            follow_status_height(detail)
+            follow_status_height(current_detail_summary(self, detail))
         } else {
             0
         };
@@ -1865,6 +1876,7 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         );
         return;
     };
+    let summary = current_detail_summary(app, detail);
 
     let title = detail_pane_title(app.detail_pane);
     let block = Block::default()
@@ -1887,8 +1899,8 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
                 ),
                 Span::styled(" • ", Style::default().fg(text_muted_color())),
                 Span::styled(
-                    short_status_label(&detail.summary.status.kind),
-                    status_style(&detail.summary.status.kind).add_modifier(Modifier::BOLD),
+                    short_status_label(&summary.status.kind),
+                    status_style(&summary.status.kind).add_modifier(Modifier::BOLD),
                 ),
             ])
         });
@@ -1910,7 +1922,7 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
             );
         }
         DetailPane::Follow => {
-            let status_line = follow_status_line(detail);
+            let status_line = follow_status_line(summary);
             let status_height = u16::from(status_line.is_some());
             let sections = Layout::default()
                 .direction(Direction::Vertical)
@@ -1936,6 +1948,16 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
             }
         }
     }
+}
+
+fn current_detail_summary<'a>(app: &'a TuiApp, detail: &'a SessionDetail) -> &'a SessionSummary {
+    app.selected_session_id()
+        .and_then(|selected_id| {
+            app.sessions
+                .iter()
+                .find(|session| session.id == selected_id)
+        })
+        .unwrap_or(&detail.summary)
 }
 
 fn render_detail_loading(frame: &mut Frame, area: Rect, pane: DetailPane) {
@@ -2245,12 +2267,12 @@ fn follow_lines(detail: &SessionDetail, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn follow_status_height(detail: &SessionDetail) -> u16 {
-    u16::from(follow_status_line(detail).is_some())
+fn follow_status_height(summary: &SessionSummary) -> u16 {
+    u16::from(follow_status_line(summary).is_some())
 }
 
-fn follow_status_line(detail: &SessionDetail) -> Option<Line<'static>> {
-    let status = follow_status(detail)?;
+fn follow_status_line(summary: &SessionSummary) -> Option<Line<'static>> {
+    let status = follow_status(summary)?;
     let label = if status.animated() {
         format!("{}{}", status.label(), loading_dots())
     } else {
@@ -2270,6 +2292,16 @@ enum FollowStatus {
 }
 
 impl FollowStatus {
+    fn from_activity_state(state: &SessionActivityState) -> Self {
+        match state {
+            SessionActivityState::Compacting => Self::Compacting,
+            SessionActivityState::Exploring => Self::Exploring,
+            SessionActivityState::Thinking => Self::Thinking,
+            SessionActivityState::Waiting => Self::Waiting,
+            SessionActivityState::Idle => Self::Idle,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Compacting => "Compacting",
@@ -2303,95 +2335,8 @@ impl FollowStatus {
     }
 }
 
-fn follow_status(detail: &SessionDetail) -> Option<FollowStatus> {
-    if matches!(detail.summary.status.kind, SessionStatusKind::WaitingInput) {
-        return Some(FollowStatus::Waiting);
-    }
-
-    if follow_has_recent_feedback(detail)
-        && detail
-            .summary
-            .context_window
-            .as_ref()
-            .is_some_and(|context| context.used_percent >= 100)
-    {
-        return Some(FollowStatus::Compacting);
-    }
-
-    if follow_has_recent_feedback(detail)
-        && latest_recent_tool_call(detail).is_some_and(|event| is_exploration_tool(&event.summary))
-    {
-        return Some(FollowStatus::Exploring);
-    }
-
-    if follow_has_recent_feedback(detail) {
-        return Some(FollowStatus::Thinking);
-    }
-
-    Some(FollowStatus::Idle)
-}
-
-fn follow_has_recent_feedback(detail: &SessionDetail) -> bool {
-    let now = Utc::now();
-    let recent_window = chrono::Duration::seconds(8);
-    let has_live_signal =
-        detail.summary.run_active || detail.active_turns > 0 || detail.pending_tool_calls > 0;
-
-    if !has_live_signal {
-        return false;
-    }
-
-    if now - detail.summary.updated_at <= recent_window {
-        return true;
-    }
-
-    latest_recent_non_user_event(detail).is_some_and(|event| now - event.timestamp <= recent_window)
-}
-
-fn latest_recent_tool_call(detail: &SessionDetail) -> Option<&ActivityEvent> {
-    let now = Utc::now();
-    detail.recent_events.iter().rev().find(|event| {
-        matches!(event.kind, ActivityKind::ToolCall)
-            && now - event.timestamp <= chrono::Duration::seconds(8)
-    })
-}
-
-fn latest_recent_non_user_event(detail: &SessionDetail) -> Option<&ActivityEvent> {
-    detail
-        .recent_events
-        .iter()
-        .rev()
-        .find(|event| !matches!(event.kind, ActivityKind::User))
-}
-
-fn is_exploration_tool(summary: &str) -> bool {
-    let lowered = format!(" {summary} ").to_ascii_lowercase();
-    if !lowered.contains("exec_command") {
-        return false;
-    }
-
-    [
-        " rg ",
-        " rg -",
-        " sed ",
-        " cat ",
-        " ls ",
-        " find ",
-        " head ",
-        " tail ",
-        " wc ",
-        " nl ",
-        " git diff",
-        " git show",
-        " git status",
-        " grep ",
-        " jq ",
-        " fd ",
-        " tree ",
-        " stat ",
-    ]
-    .iter()
-    .any(|needle| lowered.contains(needle))
+fn follow_status(summary: &SessionSummary) -> Option<FollowStatus> {
+    Some(FollowStatus::from_activity_state(&summary.activity_state))
 }
 
 fn follow_timeline_events(detail: &SessionDetail) -> Vec<ActivityEvent> {

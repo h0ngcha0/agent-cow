@@ -31,6 +31,8 @@ const RECENT_EVENT_LIMIT: usize = 48;
 const RECENT_CONVERSATION_LIMIT: usize = 32;
 const RUNNING_TTL_SECONDS: i64 = 90;
 const STALE_AFTER_MINUTES: i64 = 20;
+const ACTIVITY_WINDOW_SECONDS: i64 = 30;
+const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
 const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 const CODEX_AUTOCOMPACT_THRESHOLD: f64 = 0.835;
 const LITELLM_PRICING_URL: &str =
@@ -727,7 +729,7 @@ fn build_summary(
         )
     });
     let status = derive_status(row, hint, now);
-    let activity_state = derive_activity_state(&status, hint, now);
+    let activity_state = derive_activity_state(&status, hint, row.updated_at, now);
     let rollout_path = (!row.rollout_path.is_empty()).then_some(row.rollout_path.clone());
     let navigation = build_navigation(row, rollout_path.clone());
 
@@ -760,29 +762,49 @@ fn build_summary(
 fn derive_activity_state(
     status: &SessionStatus,
     hint: Option<&RolloutHint>,
+    updated_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> SessionActivityState {
     if matches!(status.kind, SessionStatusKind::WaitingInput) {
         return SessionActivityState::Waiting;
     }
 
-    let Some(hint) = hint else {
+    if matches!(
+        status.kind,
+        SessionStatusKind::Completed | SessionStatusKind::Failed | SessionStatusKind::Stale
+    ) {
         return SessionActivityState::Idle;
+    }
+
+    let recent_window = activity_recent_window(status, hint);
+    let status_is_active = matches!(
+        status.kind,
+        SessionStatusKind::Running | SessionStatusKind::ToolBusy
+    );
+
+    let Some(hint) = hint else {
+        return if status_is_active && now - updated_at <= recent_window {
+            SessionActivityState::Thinking
+        } else {
+            SessionActivityState::Idle
+        };
     };
 
-    let has_live_signal =
-        hint.run_active || hint.active_turns > 0 || !hint.pending_call_ids.is_empty();
+    let has_live_signal = status_is_active
+        || hint.run_active
+        || hint.active_turns > 0
+        || !hint.pending_call_ids.is_empty();
     if !has_live_signal {
         return SessionActivityState::Idle;
     }
 
-    let recent_window = Duration::seconds(8);
-    let has_recent_feedback = hint
-        .recent_events
-        .iter()
-        .rev()
-        .find(|event| !matches!(event.kind, ActivityKind::User))
-        .is_some_and(|event| now - event.timestamp <= recent_window);
+    let has_recent_feedback = now - updated_at <= recent_window
+        || hint
+            .recent_events
+            .iter()
+            .rev()
+            .find(|event| !matches!(event.kind, ActivityKind::User))
+            .is_some_and(|event| now - event.timestamp <= recent_window);
 
     if !has_recent_feedback {
         return SessionActivityState::Idle;
@@ -809,6 +831,16 @@ fn derive_activity_state(
     }
 
     SessionActivityState::Thinking
+}
+
+fn activity_recent_window(status: &SessionStatus, hint: Option<&RolloutHint>) -> Duration {
+    if matches!(status.kind, SessionStatusKind::ToolBusy)
+        || hint.is_some_and(|hint| !hint.pending_call_ids.is_empty())
+    {
+        Duration::seconds(TOOL_BUSY_ACTIVITY_WINDOW_SECONDS)
+    } else {
+        Duration::seconds(ACTIVITY_WINDOW_SECONDS)
+    }
 }
 
 fn is_exploration_tool(summary: &str) -> bool {
@@ -2562,14 +2594,17 @@ fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadMode, analyze_rollout, local_date_key, local_hour_key, looks_like_waiting_input,
-        normalize_codex_home, normalize_title, parse_context_window_usage, parse_state_db_version,
+        ReadMode, RolloutHint, SessionActivityState, SessionStatus, SessionStatusKind,
+        StatusConfidence, activity_recent_window, analyze_rollout, derive_activity_state,
+        local_date_key, local_hour_key, looks_like_waiting_input, normalize_codex_home,
+        normalize_title, parse_context_window_usage, parse_state_db_version,
         parse_transcript_static, state_db_candidates_for_input, stream_usage_index,
         user_title_candidate,
     };
     use chrono::Utc;
     use directories::BaseDirs;
     use std::{
+        collections::HashSet,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -2879,5 +2914,51 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_activity_state_keeps_recent_running_sessions_thinking() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+
+        let activity =
+            derive_activity_state(&status, None, now - chrono::Duration::seconds(20), now);
+
+        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(
+            activity_recent_window(&status, None),
+            chrono::Duration::seconds(super::ACTIVITY_WINDOW_SECONDS)
+        );
+    }
+
+    #[test]
+    fn derive_activity_state_gives_tool_busy_a_longer_grace_window() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::ToolBusy,
+            confidence: StatusConfidence::Exact,
+            reason: "tool busy".to_string(),
+        };
+        let hint = RolloutHint {
+            pending_call_ids: HashSet::from([String::from("call_1")]),
+            ..RolloutHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            Some(&hint),
+            now - chrono::Duration::seconds(60),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(
+            activity_recent_window(&status, Some(&hint)),
+            chrono::Duration::seconds(super::TOOL_BUSY_ACTIVITY_WINDOW_SECONDS)
+        );
     }
 }
