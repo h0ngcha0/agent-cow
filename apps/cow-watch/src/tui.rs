@@ -7,8 +7,9 @@ use crate::open;
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use cow_watch_core::{
-    ActivityEvent, ActivityKind, MonitorService, SessionActivityState, SessionDetail, SessionList,
-    SessionQuery, SessionStatusKind, SessionSummary, TokenUsage, UsageOverview,
+    ActivityEvent, ActivityKind, MonitorService, ProviderQuota, SessionActivityState,
+    SessionDetail, SessionList, SessionQuery, SessionStatusKind, SessionSummary, TokenUsage,
+    UsageOverview,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -670,7 +671,6 @@ impl TuiApp {
 }
 
 fn draw(frame: &mut Frame, app: &mut TuiApp) {
-    let wide_header = frame.area().width >= 150;
     let footer_height = app.footer_height();
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -681,22 +681,7 @@ fn draw(frame: &mut Frame, app: &mut TuiApp) {
         ])
         .split(frame.area());
 
-    if wide_header {
-        render_header_canvas(frame, layout[0], app);
-    } else {
-        let header = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(22),
-                Constraint::Percentage(60),
-                Constraint::Percentage(18),
-            ])
-            .split(layout[0]);
-
-        frame.render_widget(render_header_meta(app), header[0]);
-        render_header_actions(frame, header[1], app);
-        frame.render_widget(render_brand_cluster(header[2].width), header[2]);
-    }
+    render_header_canvas(frame, layout[0], app);
 
     if app.detail_mode {
         render_detail_view(frame, layout[1], app);
@@ -801,6 +786,7 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let action_rows = header_action_rows(app);
     let action_width = keymap_grid_width(&action_rows);
     let action_gap = u16::from(action_width > 0) * 5;
+    let center_gap = u16::from(action_width > 0) * 4;
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -808,17 +794,303 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
             Constraint::Length(18),
             Constraint::Length(action_gap),
             Constraint::Length(action_width),
+            Constraint::Length(center_gap),
             Constraint::Min(22),
         ])
         .split(body);
 
     frame.render_widget(render_header_meta(app), columns[0]);
     frame.render_widget(render_action_grid(&action_rows), columns[2]);
-    frame.render_widget(render_brand_cluster(columns[3].width), columns[3]);
+    render_header_center(frame, columns[4], app);
 }
 
 fn render_brand_cluster(width: u16) -> Paragraph<'static> {
     Paragraph::new(Text::from(cow_watch_brand_cluster_lines(width))).alignment(Alignment::Left)
+}
+
+const HEADER_BRAND_MIN_WIDTH: u16 = 18;
+const HEADER_BRAND_GAP: u16 = 3;
+const HEADER_SUBSCRIPTION_MIN_WIDTH: u16 = 30;
+const HEADER_SUBSCRIPTION_PREFERRED_WIDTH: u16 = 48;
+const HEADER_SUBSCRIPTION_MAX_WIDTH: u16 = 58;
+
+fn render_header_center(frame: &mut Frame, area: Rect, app: &TuiApp) {
+    if app.overview.quotas.is_empty() {
+        if area.width >= HEADER_BRAND_MIN_WIDTH {
+            frame.render_widget(render_brand_cluster(area.width), area);
+        }
+        return;
+    }
+
+    let quota_min = header_subscription_min_width(&app.overview.quotas);
+    let quota_pref = header_subscription_preferred_width(&app.overview.quotas);
+    let can_show_brand = area.width >= quota_min + HEADER_BRAND_GAP + HEADER_BRAND_MIN_WIDTH;
+
+    if !can_show_brand {
+        frame.render_widget(render_subscription_strip(&app.overview.quotas, area), area);
+        return;
+    }
+
+    let quota_width = area
+        .width
+        .saturating_sub(HEADER_BRAND_MIN_WIDTH + HEADER_BRAND_GAP)
+        .min(quota_pref)
+        .max(quota_min);
+    let brand_width = area
+        .width
+        .saturating_sub(quota_width)
+        .saturating_sub(HEADER_BRAND_GAP);
+    let split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(quota_width),
+            Constraint::Length(HEADER_BRAND_GAP),
+            Constraint::Length(brand_width),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        render_subscription_strip(&app.overview.quotas, split[0]),
+        split[0],
+    );
+    if brand_width >= HEADER_BRAND_MIN_WIDTH {
+        frame.render_widget(render_brand_cluster(split[2].width), split[2]);
+    }
+}
+
+fn header_subscription_min_width(quotas: &[ProviderQuota]) -> u16 {
+    let longest_title = quotas
+        .iter()
+        .map(|quota| subscription_title(quota, false).chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+
+    HEADER_SUBSCRIPTION_MIN_WIDTH.max(longest_title.saturating_add(18))
+}
+
+fn header_subscription_preferred_width(quotas: &[ProviderQuota]) -> u16 {
+    let longest_title = quotas
+        .iter()
+        .map(|quota| subscription_title(quota, true).chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+
+    HEADER_SUBSCRIPTION_PREFERRED_WIDTH
+        .max(longest_title.saturating_add(24))
+        .min(HEADER_SUBSCRIPTION_MAX_WIDTH)
+}
+
+fn render_subscription_strip(quotas: &[ProviderQuota], area: Rect) -> Paragraph<'static> {
+    Paragraph::new(Text::from(subscription_strip_lines(
+        quotas,
+        area.width as usize,
+        area.height as usize,
+    )))
+    .alignment(Alignment::Left)
+}
+
+fn subscription_strip_lines(
+    quotas: &[ProviderQuota],
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 || height == 0 || quotas.is_empty() {
+        return Vec::new();
+    }
+
+    let compact = width < 38;
+    let bar_segments = if width >= 54 {
+        10
+    } else if width >= 46 {
+        8
+    } else if width >= 38 {
+        6
+    } else {
+        0
+    };
+    let lines_per_quota = 2usize;
+    let max_cards = (height / lines_per_quota).max(1);
+    let visible_count = quotas.len().min(max_cards);
+    let mut lines = Vec::with_capacity(height);
+
+    for quota in quotas.iter().take(visible_count) {
+        lines.push(subscription_title_line(quota, width, compact));
+        lines.push(subscription_windows_line(
+            quota,
+            width,
+            bar_segments,
+            compact,
+        ));
+    }
+
+    if quotas.len() > visible_count {
+        let remaining = quotas.len() - visible_count;
+        let mut overflow = Line::from(vec![Span::styled(
+            format!("+{remaining} more"),
+            Style::default()
+                .fg(text_muted_color())
+                .add_modifier(Modifier::ITALIC),
+        )]);
+        pad_line_to_width(&mut overflow, width);
+        if lines.len() < height {
+            lines.push(overflow);
+        } else if let Some(last) = lines.last_mut() {
+            *last = overflow;
+        }
+    }
+
+    while lines.len() < height {
+        lines.push(blank_padded_line(width));
+    }
+
+    lines.truncate(height);
+    lines
+}
+
+fn subscription_title_line(quota: &ProviderQuota, width: usize, compact: bool) -> Line<'static> {
+    let show_plan = !compact && width >= 34;
+    let mut spans = vec![Span::styled(
+        subscription_title(quota, show_plan),
+        Style::default()
+            .fg(accent_green())
+            .add_modifier(Modifier::BOLD),
+    )];
+
+    if quota.limit_reached {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            "LIMIT",
+            Style::default()
+                .fg(accent_red())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let mut line = Line::from(spans);
+    pad_line_to_width(&mut line, width);
+    line
+}
+
+fn subscription_windows_line(
+    quota: &ProviderQuota,
+    width: usize,
+    bar_segments: usize,
+    compact: bool,
+) -> Line<'static> {
+    if quota.windows.is_empty() {
+        let mut line = Line::from(vec![Span::styled(
+            "quota unavailable",
+            Style::default()
+                .fg(text_muted_color())
+                .add_modifier(Modifier::ITALIC),
+        )]);
+        pad_line_to_width(&mut line, width);
+        return line;
+    }
+
+    let mut spans = Vec::new();
+    let max_windows = if compact { 2 } else { 3 };
+    for (index, window) in quota.windows.iter().take(max_windows).enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.extend(subscription_window_spans(window, bar_segments));
+    }
+
+    let mut line = Line::from(spans);
+    pad_line_to_width(&mut line, width);
+    line
+}
+
+fn subscription_window_spans(
+    window: &cow_watch_core::QuotaWindow,
+    bar_segments: usize,
+) -> Vec<Span<'static>> {
+    let style = quota_remaining_style(window.remaining_percent);
+    let mut spans = vec![
+        Span::styled(
+            format!("{:<2}", truncate_chars(&window.label, 2)),
+            Style::default()
+                .fg(accent_gold())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:>3}%", window.remaining_percent),
+            style.add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if bar_segments > 0 {
+        spans.push(Span::raw(" "));
+        let filled = ((window.remaining_percent as usize * bar_segments) + 99).saturating_div(100);
+        for index in 0..bar_segments {
+            spans.push(Span::styled(
+                if index < filled { "▰" } else { "▱" },
+                if index < filled {
+                    style
+                } else {
+                    Style::default().fg(Color::Rgb(74, 81, 96))
+                },
+            ));
+        }
+    }
+
+    spans
+}
+
+fn subscription_title(quota: &ProviderQuota, show_plan: bool) -> String {
+    let provider = title_case(&quota.provider.to_string());
+    if show_plan {
+        quota
+            .plan
+            .as_deref()
+            .map(short_plan_name)
+            .filter(|plan| !plan.is_empty())
+            .map(|plan| format!("{provider} {plan}"))
+            .unwrap_or(provider)
+    } else {
+        provider
+    }
+}
+
+fn short_plan_name(plan: &str) -> String {
+    let compact = plan.trim().replace('-', " ");
+    compact
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .map(title_case)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn quota_remaining_style(remaining_percent: u8) -> Style {
+    if remaining_percent >= 70 {
+        Style::default().fg(accent_green())
+    } else if remaining_percent >= 35 {
+        Style::default().fg(accent_gold())
+    } else {
+        Style::default().fg(accent_red())
+    }
+}
+
+fn pad_line_to_width(line: &mut Line<'static>, width: usize) {
+    let padding = width.saturating_sub(line.width());
+    if padding > 0 {
+        line.spans.push(Span::raw(" ".repeat(padding)));
+    }
+}
+
+fn blank_padded_line(width: usize) -> Line<'static> {
+    Line::from(Span::raw(" ".repeat(width)))
 }
 
 fn loading_dots() -> &'static str {
@@ -916,11 +1188,6 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
             ),
         ]
     }
-}
-
-fn render_header_actions(frame: &mut Frame, area: Rect, app: &TuiApp) {
-    let rows = header_action_rows(app);
-    frame.render_widget(render_action_grid(&rows), area);
 }
 
 fn render_action_grid(rows: &HeaderActionRows) -> Paragraph<'static> {
