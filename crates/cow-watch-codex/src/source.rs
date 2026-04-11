@@ -3,7 +3,10 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,9 +31,11 @@ const RECENT_EVENT_LIMIT: usize = 48;
 const RUNNING_TTL_SECONDS: i64 = 90;
 const STALE_AFTER_MINUTES: i64 = 20;
 const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
+const CODEX_AUTOCOMPACT_THRESHOLD: f64 = 0.835;
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const LITELLM_PRICING_CACHE_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const THREAD_DISCOVERY_CACHE_TTL: StdDuration = StdDuration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct CodexSource {
@@ -40,7 +45,11 @@ pub struct CodexSource {
     machine_label: String,
     pricing_client: Client,
     pricing_cache: Arc<Mutex<Option<LitellmPricingCache>>>,
+    pricing_refresh_in_flight: Arc<AtomicBool>,
     static_cache: Arc<Mutex<HashMap<PathBuf, TranscriptStatic>>>,
+    summary_cache: Arc<Mutex<HashMap<PathBuf, SummaryHintCacheEntry>>>,
+    summary_cache_dirty: Arc<AtomicBool>,
+    threads_cache: Arc<Mutex<Option<ThreadsCache>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -70,14 +79,14 @@ struct TranscriptStatic {
     model: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct RolloutHint {
     active_turns: usize,
     pending_call_ids: HashSet<String>,
     pending_call_names: HashMap<String, String>,
     run_started_at: Option<DateTime<Utc>>,
     run_active: bool,
-    last_token_usage: Option<TokenUsage>,
+    cumulative_token_usage: Option<TokenUsage>,
     context_window: Option<ContextWindowUsage>,
     quota: Option<ProviderQuota>,
     last_user_message: Option<(DateTime<Utc>, String)>,
@@ -117,6 +126,30 @@ struct LitellmPricingEntry {
     max_tokens: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SummaryHintCacheEntry {
+    modified_at_epoch_ms: i64,
+    file_len: u64,
+    hint: RolloutHint,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SummaryHintCacheFile {
+    entries: Vec<SummaryHintCacheRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SummaryHintCacheRecord {
+    path: String,
+    entry: SummaryHintCacheEntry,
+}
+
+#[derive(Clone, Debug)]
+struct ThreadsCache {
+    fetched_at_epoch_ms: i64,
+    rows: Vec<ThreadRow>,
+}
+
 impl CodexSource {
     pub fn new(codex_home: impl Into<PathBuf>) -> Self {
         let machine_label = std::env::var("HOSTNAME")
@@ -124,6 +157,7 @@ impl CodexSource {
             .unwrap_or_else(|_| "local".to_string());
         let configured_path = expand_known_path_vars(codex_home.into());
         let codex_home = normalize_codex_home(configured_path.clone());
+        let summary_cache = load_summary_cache_from_disk().unwrap_or_default();
 
         Self {
             configured_path,
@@ -135,7 +169,11 @@ impl CodexSource {
                 .build()
                 .expect("reqwest client should build"),
             pricing_cache: Arc::new(Mutex::new(None)),
+            pricing_refresh_in_flight: Arc::new(AtomicBool::new(false)),
             static_cache: Arc::new(Mutex::new(HashMap::new())),
+            summary_cache: Arc::new(Mutex::new(summary_cache)),
+            summary_cache_dirty: Arc::new(AtomicBool::new(false)),
+            threads_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -221,6 +259,13 @@ impl CodexSource {
     }
 
     fn load_threads(&self) -> Result<Vec<ThreadRow>> {
+        if let Ok(cache) = self.threads_cache.lock()
+            && let Some(cache) = cache.as_ref()
+            && is_threads_cache_fresh(cache.fetched_at_epoch_ms)
+        {
+            return Ok(cache.rows.clone());
+        }
+
         let mut rows = self.discover_threads_from_rollouts()?;
         let mut sqlite_rows_by_id = self
             .load_threads_from_db()
@@ -248,6 +293,13 @@ impl CodexSource {
                 .cmp(&left.updated_at)
                 .then_with(|| left.id.cmp(&right.id))
         });
+
+        if let Ok(mut cache) = self.threads_cache.lock() {
+            *cache = Some(ThreadsCache {
+                fetched_at_epoch_ms: now_epoch_millis(),
+                rows: rows.clone(),
+            });
+        }
 
         Ok(rows)
     }
@@ -359,6 +411,50 @@ impl CodexSource {
         Ok(paths)
     }
 
+    fn summary_hint(&self, path: &Path) -> Option<RolloutHint> {
+        let (modified_at_epoch_ms, file_len) = rollout_cache_signature(path).ok()?;
+
+        if let Ok(cache) = self.summary_cache.lock()
+            && let Some(entry) = cache.get(path)
+            && entry.modified_at_epoch_ms == modified_at_epoch_ms
+            && entry.file_len == file_len
+        {
+            return Some(entry.hint.clone());
+        }
+
+        let hint = analyze_rollout(path, ReadMode::Summary).ok()?;
+
+        if let Ok(mut cache) = self.summary_cache.lock() {
+            cache.insert(
+                path.to_path_buf(),
+                SummaryHintCacheEntry {
+                    modified_at_epoch_ms,
+                    file_len,
+                    hint: hint.clone(),
+                },
+            );
+        }
+        self.summary_cache_dirty.store(true, Ordering::SeqCst);
+
+        Some(hint)
+    }
+
+    fn persist_summary_cache_if_dirty(&self) {
+        if !self.summary_cache_dirty.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let snapshot = if let Ok(cache) = self.summary_cache.lock() {
+            cache.clone()
+        } else {
+            return;
+        };
+
+        if store_summary_cache_to_disk(&snapshot).is_ok() {
+            self.summary_cache_dirty.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn candidate_inputs(&self) -> Vec<PathBuf> {
         let mut inputs = Vec::new();
         let mut seen = HashSet::new();
@@ -390,18 +486,19 @@ impl CodexSource {
         let disk_cache = self.load_pricing_cache_from_disk();
         if let Some(cache) = &disk_cache {
             self.replace_pricing_cache(cache.clone());
-            if is_pricing_cache_fresh(cache.fetched_at_epoch_ms) {
-                return Some(cache.entries.clone());
+            if !is_pricing_cache_fresh(cache.fetched_at_epoch_ms) {
+                self.refresh_pricing_cache_in_background();
             }
+            return Some(cache.entries.clone());
         }
 
-        if let Some(cache) = self.fetch_pricing_cache().await {
-            self.replace_pricing_cache(cache.clone());
-            self.store_pricing_cache_to_disk(&cache);
-            return Some(cache.entries);
+        if let Some(entries) = self.cached_pricing_entries(false) {
+            self.refresh_pricing_cache_in_background();
+            return Some(entries);
         }
 
-        disk_cache.map(|cache| cache.entries)
+        self.refresh_pricing_cache_in_background();
+        None
     }
 
     fn cached_pricing_entries(&self, require_fresh: bool) -> Option<Arc<LitellmPricingMap>> {
@@ -417,6 +514,27 @@ impl CodexSource {
         if let Ok(mut guard) = self.pricing_cache.lock() {
             *guard = Some(cache);
         }
+    }
+
+    fn refresh_pricing_cache_in_background(&self) {
+        if self
+            .pricing_refresh_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let source = self.clone();
+        tokio::spawn(async move {
+            if let Some(cache) = source.fetch_pricing_cache().await {
+                source.replace_pricing_cache(cache.clone());
+                source.store_pricing_cache_to_disk(&cache);
+            }
+            source
+                .pricing_refresh_in_flight
+                .store(false, Ordering::SeqCst);
+        });
     }
 
     async fn fetch_pricing_cache(&self) -> Option<LitellmPricingCache> {
@@ -482,7 +600,7 @@ impl SessionSource for CodexSource {
             let hint = if row.archived {
                 None
             } else {
-                analyze_rollout(&PathBuf::from(&row.rollout_path), ReadMode::Summary).ok()
+                self.summary_hint(Path::new(&row.rollout_path))
             };
 
             let summary = build_summary(
@@ -511,6 +629,8 @@ impl SessionSource for CodexSource {
                 break;
             }
         }
+
+        self.persist_summary_cache_if_dirty();
 
         Ok(SessionList {
             generated_at: now,
@@ -568,7 +688,7 @@ fn build_summary(
     now: DateTime<Utc>,
 ) -> SessionSummary {
     let mut tokens = hint
-        .and_then(|hint| hint.last_token_usage.clone())
+        .and_then(|hint| hint.cumulative_token_usage.clone())
         .unwrap_or_default();
     tokens.total_tokens = tokens.total_tokens.max(row.tokens_used);
 
@@ -590,7 +710,7 @@ fn build_summary(
         cwd: row.cwd.clone(),
         created_at: row.created_at,
         updated_at: row.updated_at,
-        run_started_at: hint.and_then(|hint| hint.run_started_at.clone()),
+        run_started_at: hint.and_then(|hint| hint.run_started_at),
         run_active: hint.is_some_and(|hint| hint.run_active),
         archived: row.archived,
         model: row.model.clone(),
@@ -875,7 +995,10 @@ fn enrich_thread_from_db(row: &mut ThreadRow, sqlite_row: ThreadRow) {
 
 fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
     let lines = read_rollout_lines(path, mode)?;
-    let mut hint = RolloutHint::default();
+    let mut hint = RolloutHint {
+        cumulative_token_usage: stream_cumulative_token_usage(path)?,
+        ..RolloutHint::default()
+    };
     let mut recent_events = VecDeque::with_capacity(RECENT_EVENT_LIMIT);
     let mut open_turns = HashMap::<String, DateTime<Utc>>::new();
     let mut unnamed_open_turns = Vec::<DateTime<Utc>>::new();
@@ -962,16 +1085,10 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         }
                     }
                     "token_count" => {
-                        if let Some(info) = payload.get("info") {
-                            if let Some(token_usage) =
-                                info.get("total_token_usage").and_then(parse_token_usage)
-                            {
-                                hint.last_token_usage = Some(token_usage);
-                            }
-
-                            if let Some(context_window) = parse_context_window_usage(info) {
-                                hint.context_window = Some(context_window);
-                            }
+                        if let Some(info) = payload.get("info")
+                            && let Some(context_window) = parse_context_window_usage(info)
+                        {
+                            hint.context_window = Some(context_window);
                         }
 
                         if let Some(quota) = payload.get("rate_limits").and_then(parse_codex_quota)
@@ -1101,21 +1218,21 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
         }
     }
 
-    let open_turn_started_at = open_turns
+    let latest_open_turn_started_at = open_turns
         .values()
         .copied()
         .chain(unnamed_open_turns.iter().copied())
-        .min();
-    hint.run_active = open_turn_started_at.is_some() || !hint.pending_call_ids.is_empty();
-
-    hint.run_started_at = open_turn_started_at
-        .or_else(|| {
-            (!hint.pending_call_ids.is_empty())
-                .then_some(latest_tool_call_at)
-                .flatten()
-        })
-        .or(latest_turn_first_seen_at)
-        .or(hint.run_started_at);
+        .max();
+    hint.run_active = latest_open_turn_started_at.is_some() || !hint.pending_call_ids.is_empty();
+    if hint.run_started_at.is_none() {
+        hint.run_started_at = latest_turn_first_seen_at
+            .or(latest_open_turn_started_at)
+            .or_else(|| {
+                (!hint.pending_call_ids.is_empty())
+                    .then_some(latest_tool_call_at)
+                    .flatten()
+            });
+    }
 
     hint.recent_events = recent_events.into_iter().collect();
     Ok(hint)
@@ -1310,25 +1427,101 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
     })
 }
 
+fn accumulate_token_usage(total: &mut TokenUsage, delta: &TokenUsage) {
+    total.total_tokens = total.total_tokens.saturating_add(delta.total_tokens);
+    total.input_tokens = Some(
+        total
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(delta.input_tokens.unwrap_or(0)),
+    );
+    total.cached_input_tokens = Some(
+        total
+            .cached_input_tokens
+            .unwrap_or(0)
+            .saturating_add(delta.cached_input_tokens.unwrap_or(0)),
+    );
+    total.output_tokens = Some(
+        total
+            .output_tokens
+            .unwrap_or(0)
+            .saturating_add(delta.output_tokens.unwrap_or(0)),
+    );
+    total.reasoning_output_tokens = Some(
+        total
+            .reasoning_output_tokens
+            .unwrap_or(0)
+            .saturating_add(delta.reasoning_output_tokens.unwrap_or(0)),
+    );
+}
+
+fn stream_cumulative_token_usage(path: &Path) -> Result<Option<TokenUsage>> {
+    let reader = BufReader::new(
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
+    );
+    let mut cumulative = TokenUsage::default();
+    let mut saw_delta = false;
+    let mut latest_total = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        let payload = value.get("payload").unwrap_or(&Value::Null);
+        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+            continue;
+        }
+        let Some(info) = payload.get("info") else {
+            continue;
+        };
+
+        if let Some(delta) = info.get("last_token_usage").and_then(parse_token_usage) {
+            accumulate_token_usage(&mut cumulative, &delta);
+            saw_delta = true;
+        }
+
+        if let Some(total) = info.get("total_token_usage").and_then(parse_token_usage) {
+            latest_total = Some(total);
+        }
+    }
+
+    if saw_delta {
+        Ok(Some(cumulative))
+    } else {
+        Ok(latest_total)
+    }
+}
+
 fn parse_context_window_usage(info: &Value) -> Option<ContextWindowUsage> {
     let used_tokens = info
         .get("last_token_usage")
+        .or_else(|| info.get("total_token_usage"))
         .and_then(|value| value.get("input_tokens"))
         .and_then(Value::as_u64)?;
-    let limit_tokens = info
+    let raw_limit_tokens = info
         .get("model_context_window")
         .and_then(Value::as_u64)
         .unwrap_or(CODEX_DEFAULT_CONTEXT_WINDOW);
+    let limit_tokens = ((raw_limit_tokens as f64) * CODEX_AUTOCOMPACT_THRESHOLD).round() as u64;
     let remaining_tokens = limit_tokens.saturating_sub(used_tokens);
     let used_percent = if limit_tokens == 0 {
         0
     } else {
-        (((used_tokens as f64 / limit_tokens as f64) * 100.0).round() as u16).min(100) as u8
-    };
+        ((used_tokens as f64 / limit_tokens as f64) * 100.0).round() as u16
+    }
+    .min(u8::MAX as u16) as u8;
 
     Some(ContextWindowUsage {
         used_tokens,
-        limit_tokens,
+        limit_tokens: limit_tokens.max(1),
         remaining_tokens,
         used_percent,
     })
@@ -1470,9 +1663,70 @@ fn pricing_cache_path() -> Option<PathBuf> {
     )
 }
 
+fn summary_cache_path() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(
+        base_dirs
+            .cache_dir()
+            .join("cow-watch")
+            .join("summary_hints.json"),
+    )
+}
+
+fn load_summary_cache_from_disk() -> Result<HashMap<PathBuf, SummaryHintCacheEntry>> {
+    let Some(path) = summary_cache_path() else {
+        return Ok(HashMap::new());
+    };
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read summary cache {}", path.display()))?;
+    let parsed: SummaryHintCacheFile = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse summary cache {}", path.display()))?;
+
+    Ok(parsed
+        .entries
+        .into_iter()
+        .map(|record| (PathBuf::from(record.path), record.entry))
+        .collect())
+}
+
+fn store_summary_cache_to_disk(cache: &HashMap<PathBuf, SummaryHintCacheEntry>) -> Result<()> {
+    let Some(path) = summary_cache_path() else {
+        return Ok(());
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let payload = SummaryHintCacheFile {
+        entries: cache
+            .iter()
+            .map(|(path, entry)| SummaryHintCacheRecord {
+                path: path.to_string_lossy().into_owned(),
+                entry: entry.clone(),
+            })
+            .collect(),
+    };
+
+    let raw = serde_json::to_string(&payload)
+        .with_context(|| format!("failed to serialize summary cache {}", path.display()))?;
+    fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 fn is_pricing_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
     age_ms >= 0 && age_ms <= LITELLM_PRICING_CACHE_TTL.as_millis() as i64
+}
+
+fn is_threads_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+    let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
+    age_ms >= 0 && age_ms <= THREAD_DISCOVERY_CACHE_TTL.as_millis() as i64
 }
 
 fn now_epoch_millis() -> i64 {
@@ -1825,20 +2079,38 @@ fn unix_timestamp_to_utc(timestamp: i64) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::from_timestamp(timestamp, 0).ok_or(rusqlite::Error::IntegralValueOutOfRange(0, 0))
 }
 
+fn rollout_cache_signature(path: &Path) -> Result<(i64, u64)> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let modified_at_epoch_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+
+    Ok((modified_at_epoch_ms, metadata.len()))
+}
+
 fn read_rollout_lines(path: &Path, mode: ReadMode) -> Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
+    }
+
+    let line_limit = match mode {
+        ReadMode::Summary => SUMMARY_TAIL_LINES,
+        ReadMode::Detail => DETAIL_TAIL_LINES,
+    };
+
+    if matches!(mode, ReadMode::Summary) {
+        return tail_lines(path, line_limit);
     }
 
     let metadata = path
         .metadata()
         .with_context(|| format!("failed to stat {}", path.display()))?;
     let file_size = metadata.len();
-
-    let line_limit = match mode {
-        ReadMode::Summary => SUMMARY_TAIL_LINES,
-        ReadMode::Detail => DETAIL_TAIL_LINES,
-    };
 
     if file_size <= 2_000_000 {
         let mut text = String::new();
@@ -1943,8 +2215,8 @@ fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
 mod tests {
     use super::{
         ReadMode, analyze_rollout, looks_like_waiting_input, normalize_codex_home, normalize_title,
-        parse_state_db_version, parse_transcript_static, state_db_candidates_for_input,
-        user_title_candidate,
+        parse_context_window_usage, parse_state_db_version, parse_transcript_static,
+        state_db_candidates_for_input, user_title_candidate,
     };
     use chrono::Utc;
     use directories::BaseDirs;
@@ -2132,9 +2404,90 @@ mod tests {
         let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
         let run_started_at = hint.run_started_at.unwrap();
 
-        assert_eq!(run_started_at.to_rfc3339(), "2026-04-10T20:55:21+00:00");
+        assert_eq!(run_started_at.to_rfc3339(), "2026-04-10T20:55:21.500+00:00");
         assert!(hint.run_active);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_rollout_prefers_latest_signal_over_older_open_turns() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cow-watch-rollout-latest-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path =
+            root.join("rollout-2026-04-10T20-59-43-019d73f2-20fb-70f2-9ba5-13810d786a22.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-04-10T20:59:43.761Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"old-open\"}}\n",
+                "{\"timestamp\":\"2026-04-10T21:10:00.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call_old\",\"name\":\"exec_command\",\"turn_id\":\"old-open\"}}\n",
+                "{\"timestamp\":\"2026-04-11T04:36:21.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"7h, it should be at most a few minutes\",\"turn_id\":\"new-turn\"}}\n",
+                "{\"timestamp\":\"2026-04-11T04:36:47.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"call_new\",\"name\":\"exec_command\",\"turn_id\":\"new-turn\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+        let run_started_at = hint.run_started_at.unwrap();
+
+        assert_eq!(run_started_at.to_rfc3339(), "2026-04-11T04:36:21+00:00");
+        assert!(hint.run_active);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_rollout_accumulates_lifetime_tokens_from_last_usage() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cow-watch-rollout-tokens-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-2026-04-11T05-07-04-ctx.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-04-11T05:00:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":2,\"reasoning_output_tokens\":1,\"total_tokens\":12},\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":2,\"reasoning_output_tokens\":1,\"total_tokens\":12},\"model_context_window\":258400}}}\n",
+                "{\"timestamp\":\"2026-04-11T05:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":25,\"cached_input_tokens\":8,\"output_tokens\":5,\"reasoning_output_tokens\":1,\"total_tokens\":30},\"last_token_usage\":{\"input_tokens\":15,\"cached_input_tokens\":5,\"output_tokens\":3,\"reasoning_output_tokens\":0,\"total_tokens\":18},\"model_context_window\":258400}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+        let tokens = hint.cumulative_token_usage.unwrap();
+
+        assert_eq!(tokens.input_tokens, Some(25));
+        assert_eq!(tokens.cached_input_tokens, Some(8));
+        assert_eq!(tokens.output_tokens, Some(5));
+        assert_eq!(tokens.reasoning_output_tokens, Some(1));
+        assert_eq!(tokens.total_tokens, 30);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_context_window_usage_uses_autocompact_threshold() {
+        let info = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": 222_238,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 222_238
+            },
+            "model_context_window": 258_400
+        });
+
+        let context = parse_context_window_usage(&info).unwrap();
+
+        assert_eq!(context.limit_tokens, 215_764);
+        assert_eq!(context.used_tokens, 222_238);
+        assert_eq!(context.remaining_tokens, 0);
+        assert_eq!(context.used_percent, 103);
     }
 }

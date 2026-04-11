@@ -889,7 +889,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
       async function loadSessions() {
         try {
-          const response = await fetch("/api/sessions?limit=60");
+          const response = await fetch("/api/sessions");
           if (!response.ok) {
             throw new Error(`session list failed (${response.status})`);
           }

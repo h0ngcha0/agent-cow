@@ -29,8 +29,8 @@ enum Command {
         command: SessionsCommand,
     },
     Tui {
-        #[arg(long, default_value_t = 40)]
-        limit: usize,
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long, default_value_t = 5)]
         refresh_secs: u64,
     },

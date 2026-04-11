@@ -7,8 +7,8 @@ use crate::open;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use cow_watch_core::{
-    ActivityKind, MonitorService, NavigationKind, SessionDetail, SessionQuery, SessionStatusKind,
-    SessionSummary, TokenUsage, UsageOverview,
+    ActivityKind, MonitorService, NavigationKind, SessionDetail, SessionList, SessionQuery,
+    SessionStatusKind, SessionSummary, TokenUsage, UsageOverview,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -23,8 +23,9 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
+use tokio::task::JoinHandle;
 
-pub async fn run(service: MonitorService, limit: usize, refresh_secs: u64) -> Result<()> {
+pub async fn run(service: MonitorService, limit: Option<usize>, refresh_secs: u64) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -40,19 +41,98 @@ pub async fn run(service: MonitorService, limit: usize, refresh_secs: u64) -> Re
     result
 }
 
+fn spawn_list_refresh(
+    service: MonitorService,
+    limit: Option<usize>,
+) -> JoinHandle<Result<SessionList>> {
+    tokio::spawn(async move {
+        service
+            .list_sessions(SessionQuery {
+                include_archived: false,
+                limit,
+            })
+            .await
+    })
+}
+
+fn spawn_detail_refresh(
+    service: MonitorService,
+    session_id: String,
+) -> JoinHandle<Result<(String, SessionDetail)>> {
+    tokio::spawn(async move {
+        let detail = service.get_session(&session_id).await?;
+        Ok((session_id, detail))
+    })
+}
+
+fn queue_detail_refresh(
+    app: &TuiApp,
+    service: &MonitorService,
+    detail_refresh: &mut Option<JoinHandle<Result<(String, SessionDetail)>>>,
+) {
+    let Some(session_id) = app.selected_session_id().map(ToOwned::to_owned) else {
+        return;
+    };
+    if let Some(handle) = detail_refresh.take() {
+        handle.abort();
+    }
+    *detail_refresh = Some(spawn_detail_refresh(service.clone(), session_id));
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     service: MonitorService,
-    limit: usize,
+    limit: Option<usize>,
     refresh_secs: u64,
 ) -> Result<()> {
     let mut app = TuiApp::new(limit, Duration::from_secs(refresh_secs));
-    app.reload(&service).await?;
+    let initial_load = spawn_list_refresh(service.clone(), app.limit);
 
     loop {
+        terminal.draw(draw_loading)?;
+
+        if initial_load.is_finished() {
+            let response = initial_load.await??;
+            app.apply_session_list(response);
+            break;
+        }
+
+        if event::poll(Duration::from_millis(60))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        {
+            return Ok(());
+        }
+    }
+
+    let mut list_refresh: Option<JoinHandle<Result<SessionList>>> = None;
+    let mut detail_refresh: Option<JoinHandle<Result<(String, SessionDetail)>>> = None;
+
+    loop {
+        if let Some(handle) = list_refresh.as_ref()
+            && handle.is_finished()
+        {
+            let response = list_refresh.take().unwrap().await??;
+            app.apply_session_list(response);
+            if app.detail_mode {
+                queue_detail_refresh(&app, &service, &mut detail_refresh);
+            }
+        }
+
+        if let Some(handle) = detail_refresh.as_ref()
+            && handle.is_finished()
+        {
+            let (session_id, detail) = detail_refresh.take().unwrap().await??;
+            if app.detail_mode && app.selected_session_id() == Some(session_id.as_str()) {
+                app.detail = Some(detail);
+                app.error = None;
+            }
+        }
+
         terminal.draw(|frame| draw(frame, &mut app))?;
 
-        if event::poll(Duration::from_millis(200))?
+        if event::poll(Duration::from_millis(60))?
             && let Event::Key(key) = event::read()?
         {
             if key.kind != KeyEventKind::Press {
@@ -71,19 +151,49 @@ async fn run_loop(
                     _ => {}
                 }
             } else {
+                let terminal_size = terminal.size()?;
+                let detail_max_scroll = app.detail_max_scroll(Rect::new(
+                    0,
+                    0,
+                    terminal_size.width,
+                    terminal_size.height,
+                ));
                 match key.code {
                     KeyCode::Char('q') => break,
+                    KeyCode::Down | KeyCode::Char('j') if app.detail_mode => {
+                        app.detail_scroll_down(1, detail_max_scroll)
+                    }
                     KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+                    KeyCode::Up | KeyCode::Char('k') if app.detail_mode => app.detail_scroll_up(1),
                     KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
+                    KeyCode::PageDown if app.detail_mode => {
+                        app.detail_scroll_down(10, detail_max_scroll)
+                    }
                     KeyCode::PageDown => app.page_down(10),
+                    KeyCode::PageUp if app.detail_mode => app.detail_scroll_up(10),
                     KeyCode::PageUp => app.page_up(10),
+                    KeyCode::Home | KeyCode::Char('g') if app.detail_mode => {
+                        app.detail_scroll_top()
+                    }
                     KeyCode::Home | KeyCode::Char('g') => app.select_first(),
+                    KeyCode::End | KeyCode::Char('G') if app.detail_mode => {
+                        app.detail_scroll_bottom(detail_max_scroll)
+                    }
                     KeyCode::End | KeyCode::Char('G') => app.select_last(),
                     KeyCode::Char('/') if !app.detail_mode => app.begin_filter(),
                     KeyCode::Esc if app.detail_mode => app.close_detail_mode(),
                     KeyCode::Esc => app.clear_filter(),
-                    KeyCode::Char('r') => app.reload(&service).await?,
-                    KeyCode::Enter => app.toggle_detail_mode(),
+                    KeyCode::Char('r') => {
+                        if list_refresh.is_none() {
+                            list_refresh = Some(spawn_list_refresh(service.clone(), app.limit));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let entering_detail = app.toggle_detail_mode();
+                        if entering_detail {
+                            queue_detail_refresh(&app, &service, &mut detail_refresh);
+                        }
+                    }
                     KeyCode::Char('o') => app.open_selected_app(),
                     KeyCode::Char('f') => app.open_selected_working_directory(),
                     _ => {}
@@ -91,13 +201,15 @@ async fn run_loop(
             }
 
             if app.selection_changed {
-                app.refresh_detail(&service).await?;
+                if app.detail_mode {
+                    queue_detail_refresh(&app, &service, &mut detail_refresh);
+                }
                 app.selection_changed = false;
             }
         }
 
-        if app.last_refresh.elapsed() >= app.refresh_every {
-            app.reload(&service).await?;
+        if app.last_refresh.elapsed() >= app.refresh_every && list_refresh.is_none() {
+            list_refresh = Some(spawn_list_refresh(service.clone(), app.limit));
         }
     }
 
@@ -111,8 +223,9 @@ struct TuiApp {
     detail: Option<SessionDetail>,
     table_state: TableState,
     detail_mode: bool,
+    detail_scroll: u16,
     local_machine_id: String,
-    limit: usize,
+    limit: Option<usize>,
     refresh_every: Duration,
     last_refresh: Instant,
     error: Option<String>,
@@ -128,7 +241,7 @@ struct UiNotice {
 }
 
 impl TuiApp {
-    fn new(limit: usize, refresh_every: Duration) -> Self {
+    fn new(limit: Option<usize>, refresh_every: Duration) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
 
@@ -139,6 +252,7 @@ impl TuiApp {
             detail: None,
             table_state,
             detail_mode: false,
+            detail_scroll: 0,
             local_machine_id: open::local_machine_id(),
             limit,
             refresh_every,
@@ -151,50 +265,19 @@ impl TuiApp {
         }
     }
 
-    async fn reload(&mut self, service: &MonitorService) -> Result<()> {
+    fn apply_session_list(&mut self, response: SessionList) {
         let selected_id = self.selected_session_id().map(ToOwned::to_owned);
-        let response = service
-            .list_sessions(SessionQuery {
-                include_archived: false,
-                limit: Some(self.limit),
-            })
-            .await?;
-
         self.sessions = response.sessions;
         self.overview = response.overview;
         self.last_refresh = Instant::now();
         self.error = None;
-
         self.rebuild_filter(selected_id.as_deref());
 
         if self.filtered_indices.is_empty() {
             self.detail = None;
             self.detail_mode = false;
-        } else {
-            self.refresh_detail(service).await?;
+            self.detail_scroll = 0;
         }
-
-        Ok(())
-    }
-
-    async fn refresh_detail(&mut self, service: &MonitorService) -> Result<()> {
-        let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
-            self.detail = None;
-            return Ok(());
-        };
-
-        match service.get_session(&session_id).await {
-            Ok(detail) => {
-                self.detail = Some(detail);
-                self.error = None;
-            }
-            Err(error) => {
-                self.detail = None;
-                self.error = Some(error.to_string());
-            }
-        }
-
-        Ok(())
     }
 
     fn begin_filter(&mut self) {
@@ -256,6 +339,7 @@ impl TuiApp {
         if self.filtered_indices.is_empty() {
             self.table_state.select(None);
             self.detail_mode = false;
+            self.detail_scroll = 0;
             return;
         }
 
@@ -286,15 +370,11 @@ impl TuiApp {
     }
 
     fn selected_summary(&self) -> Option<&SessionSummary> {
-        self.detail
-            .as_ref()
-            .map(|detail| &detail.summary)
-            .or_else(|| {
-                self.table_state
-                    .selected()
-                    .and_then(|visible_index| self.filtered_indices.get(visible_index))
-                    .and_then(|session_index| self.sessions.get(*session_index))
-            })
+        self.table_state
+            .selected()
+            .and_then(|visible_index| self.filtered_indices.get(visible_index))
+            .and_then(|session_index| self.sessions.get(*session_index))
+            .or_else(|| self.detail.as_ref().map(|detail| &detail.summary))
     }
 
     fn visible_sessions(&self) -> impl Iterator<Item = &SessionSummary> {
@@ -418,21 +498,46 @@ impl TuiApp {
         );
     }
 
-    fn toggle_detail_mode(&mut self) {
+    fn toggle_detail_mode(&mut self) -> bool {
         if self.selected_summary().is_none() {
             self.notice = Some(UiNotice {
                 message: "No session selected.".to_string(),
                 is_error: true,
             });
-            return;
+            return false;
         }
 
-        self.detail_mode = !self.detail_mode;
+        let entering = !self.detail_mode;
+        self.detail_mode = entering;
+        if entering {
+            self.detail_scroll = 0;
+        } else {
+            self.detail = None;
+            self.detail_scroll = 0;
+        }
         self.notice = None;
+        entering
     }
 
     fn close_detail_mode(&mut self) {
         self.detail_mode = false;
+        self.detail_scroll = 0;
+    }
+
+    fn detail_scroll_up(&mut self, step: u16) {
+        self.detail_scroll = self.detail_scroll.saturating_sub(step);
+    }
+
+    fn detail_scroll_down(&mut self, step: u16, max_scroll: u16) {
+        self.detail_scroll = self.detail_scroll.saturating_add(step).min(max_scroll);
+    }
+
+    fn detail_scroll_top(&mut self) {
+        self.detail_scroll = 0;
+    }
+
+    fn detail_scroll_bottom(&mut self, max_scroll: u16) {
+        self.detail_scroll = max_scroll;
     }
 
     fn show_host_column(&self) -> bool {
@@ -456,6 +561,32 @@ impl TuiApp {
             "hosts",
         )
         .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn detail_max_scroll(&self, frame_area: Rect) -> u16 {
+        if !self.detail_mode {
+            return 0;
+        }
+        let content_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6),
+                Constraint::Min(0),
+                Constraint::Length(2),
+            ])
+            .split(frame_area)[1];
+        let Some(detail) = &self.detail else {
+            return 0;
+        };
+        let content_height = detail_content_height(content_area) as usize;
+        if content_height == 0 {
+            return 0;
+        }
+        let rendered_lines =
+            wrapped_line_count(&detail_lines(detail), detail_content_width(content_area));
+        rendered_lines
+            .saturating_sub(content_height)
+            .min(u16::MAX as usize) as u16
     }
 }
 
@@ -490,14 +621,84 @@ fn draw(frame: &mut Frame, app: &mut TuiApp) {
     if app.detail_mode {
         render_detail_view(frame, layout[1], app);
     } else {
+        let window = table_visible_window(app, layout[1]);
+        let mut render_state = TableState::default().with_selected(window.selected);
         frame.render_stateful_widget(
-            render_sessions_table(app, layout[1].width),
+            render_sessions_table(app, layout[1].width, window),
             layout[1],
-            &mut app.table_state,
+            &mut render_state,
         );
     }
 
     frame.render_widget(render_footer(app), layout[2]);
+}
+
+fn detail_content_height(area: Rect) -> u16 {
+    area.height.saturating_sub(2)
+}
+
+fn detail_content_width(area: Rect) -> u16 {
+    area.width.saturating_sub(2).max(1)
+}
+
+fn draw_loading(frame: &mut Frame) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(8),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(header_border_color())),
+        frame.area(),
+    );
+
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(layout[1]);
+
+    let brand_width = body[0].width.min(22);
+    let brand_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(brand_width),
+            Constraint::Min(0),
+        ])
+        .split(body[0]);
+
+    frame.render_widget(render_brand_cluster(brand_width), brand_row[1]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!("Loading sessions{}", loading_dots()),
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )]))
+        .alignment(Alignment::Center),
+        body[2],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "Restoring caches and scanning recent Codex rollouts",
+            Style::default().fg(text_muted_color()),
+        )]))
+        .alignment(Alignment::Center),
+        body[3],
+    );
 }
 
 fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
@@ -555,6 +756,15 @@ fn render_action_column(items: &[Option<KeymapItem>], key_width: usize) -> Parag
 
 fn render_brand_cluster(width: u16) -> Paragraph<'static> {
     Paragraph::new(Text::from(cow_watch_brand_cluster_lines(width))).alignment(Alignment::Left)
+}
+
+fn loading_dots() -> &'static str {
+    match (Utc::now().timestamp_millis() / 250).rem_euclid(4) {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    }
 }
 
 fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
@@ -738,7 +948,11 @@ fn keymap_column_width(items: &[Option<KeymapItem>], key_width: usize) -> u16 {
         .unwrap_or(key_width as u16)
 }
 
-fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
+fn render_sessions_table(
+    app: &TuiApp,
+    table_width: u16,
+    window: VisibleRowWindow,
+) -> Table<'static> {
     let title = format!("Sessions ({})", app.filtered_indices.len());
 
     let show_host = app.show_host_column();
@@ -788,8 +1002,9 @@ fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
             .add_modifier(Modifier::BOLD),
     );
 
-    let rows: Vec<Row<'static>> = app
-        .visible_sessions()
+    let rows: Vec<Row<'static>> = app.filtered_indices[window.start..window.end]
+        .iter()
+        .filter_map(|index| app.sessions.get(*index))
         .map(|session| {
             let mut cells = vec![
                 Cell::from(status_symbol(&session.status.kind))
@@ -885,6 +1100,45 @@ fn render_sessions_table(app: &TuiApp, table_width: u16) -> Table<'static> {
         .column_spacing(1)
         .row_highlight_style(Style::default().bg(Color::Rgb(68, 68, 72)))
         .highlight_symbol("")
+}
+
+#[derive(Clone, Copy)]
+struct VisibleRowWindow {
+    start: usize,
+    end: usize,
+    selected: Option<usize>,
+}
+
+fn table_visible_window(app: &mut TuiApp, area: Rect) -> VisibleRowWindow {
+    let total = app.filtered_indices.len();
+    if total == 0 {
+        *app.table_state.offset_mut() = 0;
+        return VisibleRowWindow {
+            start: 0,
+            end: 0,
+            selected: None,
+        };
+    }
+
+    let capacity = area.height.saturating_sub(3).max(1) as usize;
+    let selected = app.table_state.selected().unwrap_or(0).min(total - 1);
+    let mut start = app.table_state.offset().min(total.saturating_sub(1));
+
+    if selected < start {
+        start = selected;
+    } else if selected >= start + capacity {
+        start = selected + 1 - capacity;
+    }
+
+    start = start.min(total.saturating_sub(capacity));
+    *app.table_state.offset_mut() = start;
+
+    let end = (start + capacity).min(total);
+    VisibleRowWindow {
+        start,
+        end,
+        selected: Some(selected.saturating_sub(start)),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -993,7 +1247,7 @@ fn session_table_widths(
     widths
 }
 
-fn render_detail_view(frame: &mut Frame, area: Rect, app: &TuiApp) {
+fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     let Some(detail) = &app.detail else {
         frame.render_widget(
             Paragraph::new("No session selected.").block(
@@ -1007,8 +1261,14 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &TuiApp) {
         return;
     };
 
+    let lines = detail_lines(detail);
+    let max_scroll = wrapped_line_count(&lines, detail_content_width(area))
+        .saturating_sub(detail_content_height(area) as usize)
+        .min(u16::MAX as usize) as u16;
+    app.detail_scroll = app.detail_scroll.min(max_scroll);
+
     frame.render_widget(
-        Paragraph::new(Text::from(detail_lines(detail)))
+        Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -1027,6 +1287,7 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &TuiApp) {
                         ),
                     ])),
             )
+            .scroll((app.detail_scroll, 0))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -1055,11 +1316,11 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
                 Style::default().fg(accent_gold()),
             ),
         ])
-    } else if let Some(detail) = &app.detail {
+    } else if let Some(summary) = app.selected_summary() {
         Line::from(vec![
             Span::styled("State: ", Style::default().fg(text_muted_color())),
             Span::styled(
-                truncate_chars(&detail.summary.status.reason, 120),
+                truncate_chars(&summary.status.reason, 120),
                 Style::default().fg(text_primary_color()),
             ),
         ])
@@ -1068,7 +1329,7 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
     };
 
     let line2 = if app.detail_mode {
-        Line::from("enter/esc back  •  o open app  •  f folder  •  r refresh  •  q quit")
+        Line::from("j/k scroll  •  PgUp/PgDn page  •  g/G top/end  •  enter/esc back  •  q quit")
     } else {
         Line::from("j/k move  •  PgUp/PgDn jump  •  enter details  •  o open app  •  / filter")
     };
@@ -1109,6 +1370,9 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
                 format!("{} ago", relative_age(summary.updated_at)),
                 Style::default().fg(text_primary_color()),
             ),
+            subtle_bullet(),
+            info_label("Duration"),
+            Span::styled(session_duration(summary), duration_style(summary)),
         ]),
         Line::from(vec![
             info_label("Model"),
@@ -1139,40 +1403,6 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
             ),
         ]),
     ];
-
-    if let Some(run_started_at) = summary
-        .run_started_at
-        .filter(|run_started_at| *run_started_at > summary.created_at)
-    {
-        lines.insert(
-            5,
-            Line::from(vec![
-                info_label("Run"),
-                Span::raw(run_started_at.format("%Y-%m-%d %H:%M").to_string()),
-                subtle_bullet(),
-                info_label("Duration"),
-                Span::styled(session_duration(summary), duration_style(summary)),
-                subtle_bullet(),
-                info_label("Live"),
-                Span::styled(
-                    if summary.run_active { "yes" } else { "no" },
-                    if summary.run_active {
-                        Style::default().fg(accent_green())
-                    } else {
-                        Style::default().fg(text_muted_color())
-                    },
-                ),
-            ]),
-        );
-    } else {
-        lines.insert(
-            5,
-            Line::from(vec![
-                info_label("Duration"),
-                Span::styled(session_duration(summary), duration_style(summary)),
-            ]),
-        );
-    }
 
     if let Some(cost) = &summary.cost {
         lines.push(Line::from(vec![
@@ -1275,6 +1505,21 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn wrapped_line_count(lines: &[Line<'static>], width: u16) -> usize {
+    let width = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let line_width = line.width();
+            if line_width == 0 {
+                1
+            } else {
+                line_width.div_ceil(width)
+            }
+        })
+        .sum()
 }
 
 fn matches_text_filter(session: &SessionSummary, filter: &str) -> bool {
@@ -1451,9 +1696,17 @@ fn text_muted_color() -> Color {
     Color::Rgb(162, 170, 186)
 }
 
+fn session_is_live(session: &SessionSummary) -> bool {
+    session.run_active
+        && matches!(
+            session.status.kind,
+            SessionStatusKind::Running | SessionStatusKind::ToolBusy
+        )
+}
+
 fn session_elapsed(session: &SessionSummary) -> chrono::Duration {
-    let start = session.run_started_at.unwrap_or(session.created_at);
-    let end = if session.run_active {
+    let start = session.created_at;
+    let end = if session_is_live(session) {
         Utc::now()
     } else {
         session.updated_at
