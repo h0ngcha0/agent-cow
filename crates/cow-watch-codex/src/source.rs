@@ -36,6 +36,7 @@ const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
 const COMPACTION_ACTIVITY_WINDOW_SECONDS: i64 = 12;
 const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 const CODEX_AUTOCOMPACT_THRESHOLD: f64 = 0.835;
+const SUMMARY_CACHE_SCHEMA_VERSION: u32 = 2;
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const LITELLM_PRICING_CACHE_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -143,8 +144,10 @@ struct LitellmPricingEntry {
     max_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct SummaryHintCacheEntry {
+    schema_version: u32,
     modified_at_epoch_ms: i64,
     file_len: u64,
     hint: RolloutHint,
@@ -440,6 +443,7 @@ impl CodexSource {
 
         if let Ok(cache) = self.summary_cache.lock()
             && let Some(entry) = cache.get(path)
+            && entry.schema_version == SUMMARY_CACHE_SCHEMA_VERSION
             && entry.modified_at_epoch_ms == modified_at_epoch_ms
             && entry.file_len == file_len
         {
@@ -452,6 +456,7 @@ impl CodexSource {
             cache.insert(
                 path.to_path_buf(),
                 SummaryHintCacheEntry {
+                    schema_version: SUMMARY_CACHE_SCHEMA_VERSION,
                     modified_at_epoch_ms,
                     file_len,
                     hint: hint.clone(),
@@ -712,10 +717,12 @@ fn build_summary(
     litellm_pricing: Option<&LitellmPricingMap>,
     now: DateTime<Utc>,
 ) -> SessionSummary {
-    let mut tokens = hint
+    let tokens = hint
         .and_then(|hint| hint.cumulative_token_usage.clone())
-        .unwrap_or_default();
-    tokens.total_tokens = tokens.total_tokens.max(row.tokens_used);
+        .unwrap_or_else(|| TokenUsage {
+            total_tokens: row.tokens_used,
+            ..TokenUsage::default()
+        });
 
     let pricing = row
         .model
@@ -1675,17 +1682,18 @@ fn fallback_title(cwd: &str, id: &str) -> String {
 }
 
 fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
-    Some(TokenUsage {
+    let mut tokens = TokenUsage {
         total_tokens: value.get("total_tokens")?.as_u64()?,
         input_tokens: value.get("input_tokens").and_then(Value::as_u64),
         cached_input_tokens: value.get("cached_input_tokens").and_then(Value::as_u64),
         output_tokens: value.get("output_tokens").and_then(Value::as_u64),
         reasoning_output_tokens: value.get("reasoning_output_tokens").and_then(Value::as_u64),
-    })
+    };
+    normalize_codex_token_usage(&mut tokens);
+    Some(tokens)
 }
 
 fn accumulate_token_usage(total: &mut TokenUsage, delta: &TokenUsage) {
-    total.total_tokens = total.total_tokens.saturating_add(delta.total_tokens);
     total.input_tokens = Some(
         total
             .input_tokens
@@ -1710,6 +1718,16 @@ fn accumulate_token_usage(total: &mut TokenUsage, delta: &TokenUsage) {
             .unwrap_or(0)
             .saturating_add(delta.reasoning_output_tokens.unwrap_or(0)),
     );
+    normalize_codex_token_usage(total);
+}
+
+fn normalize_codex_token_usage(tokens: &mut TokenUsage) {
+    if tokens.input_tokens.is_some() || tokens.output_tokens.is_some() {
+        tokens.total_tokens = tokens
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(tokens.output_tokens.unwrap_or(0));
+    }
 }
 
 fn add_raw_cost_bucket(
@@ -2676,14 +2694,14 @@ fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
 mod tests {
     use super::{
         ReadMode, RolloutHint, SessionActivityState, SessionStatus, SessionStatusKind,
-        StatusConfidence, activity_recent_window, analyze_rollout, derive_activity_state,
-        derive_status, function_call_requires_approval, local_date_key, local_hour_key,
-        looks_like_waiting_input, normalize_codex_home, normalize_title,
+        StatusConfidence, ThreadRow, activity_recent_window, analyze_rollout, build_summary,
+        derive_activity_state, derive_status, function_call_requires_approval, local_date_key,
+        local_hour_key, looks_like_waiting_input, normalize_codex_home, normalize_title,
         parse_context_window_usage, parse_state_db_version, parse_transcript_static,
         state_db_candidates_for_input, stream_usage_index, user_title_candidate,
     };
     use chrono::Utc;
-    use cow_watch_core::{ActivityEvent, ActivityKind, ContextWindowUsage};
+    use cow_watch_core::{ActivityEvent, ActivityKind, ContextWindowUsage, TokenUsage};
     use directories::BaseDirs;
     use std::{
         collections::HashSet,
@@ -2945,6 +2963,35 @@ mod tests {
     }
 
     #[test]
+    fn analyze_rollout_derives_total_tokens_from_input_and_output() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cow-watch-rollout-derived-total-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-2026-04-11T05-09-00-derived-total.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-04-11T05:00:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":2,\"reasoning_output_tokens\":5,\"total_tokens\":17},\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":2,\"reasoning_output_tokens\":5,\"total_tokens\":17},\"model_context_window\":258400}}}\n",
+                "{\"timestamp\":\"2026-04-11T05:01:00.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":25,\"cached_input_tokens\":8,\"output_tokens\":5,\"reasoning_output_tokens\":7,\"total_tokens\":37},\"last_token_usage\":{\"input_tokens\":15,\"cached_input_tokens\":5,\"output_tokens\":3,\"reasoning_output_tokens\":2,\"total_tokens\":20},\"model_context_window\":258400}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+        let tokens = hint.cumulative_token_usage.unwrap();
+
+        assert_eq!(tokens.input_tokens, Some(25));
+        assert_eq!(tokens.output_tokens, Some(5));
+        assert_eq!(tokens.reasoning_output_tokens, Some(7));
+        assert_eq!(tokens.total_tokens, 30);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parse_context_window_usage_uses_autocompact_threshold() {
         let info = serde_json::json!({
             "last_token_usage": {
@@ -3004,6 +3051,40 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn build_summary_prefers_rollout_token_totals_over_state_db_totals() {
+        let row = ThreadRow {
+            id: "019d5833-e98b-7442-9bbe-f727fd3f7732".to_string(),
+            rollout_path: "/tmp/rollout.jsonl".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            cwd: "/tmp".to_string(),
+            title: "Test".to_string(),
+            tokens_used: 49_659_586,
+            archived: false,
+            git_branch: None,
+            git_origin_url: None,
+            agent_role: None,
+            model: Some("gpt-5.4".to_string()),
+        };
+        let hint = RolloutHint {
+            cumulative_token_usage: Some(TokenUsage {
+                total_tokens: 49_563_385,
+                input_tokens: Some(49_334_097),
+                cached_input_tokens: Some(47_762_048),
+                output_tokens: Some(229_288),
+                reasoning_output_tokens: Some(117_865),
+            }),
+            ..RolloutHint::default()
+        };
+
+        let summary = build_summary("local", "local", &row, Some(&hint), None, Utc::now());
+
+        assert_eq!(summary.tokens.total_tokens, 49_563_385);
+        assert_eq!(summary.tokens.input_tokens, Some(49_334_097));
+        assert_eq!(summary.tokens.output_tokens, Some(229_288));
     }
 
     #[test]

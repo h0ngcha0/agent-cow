@@ -764,7 +764,7 @@ fn draw_loading(frame: &mut Frame) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            "Restoring caches and scanning recent Codex rollouts",
+            "Restoring caches and scanning recent provider sessions",
             Style::default().fg(text_muted_color()),
         )]))
         .alignment(Alignment::Center),
