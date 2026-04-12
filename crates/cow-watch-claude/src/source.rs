@@ -1,18 +1,20 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use cow_watch_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
     PricingSource, ProviderKind, ProviderQuota, SessionActivityState, SessionCost, SessionDetail,
@@ -34,7 +36,195 @@ const ACTIVITY_WINDOW_SECONDS: i64 = 30;
 const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
 const COMPACTION_ACTIVITY_WINDOW_SECONDS: i64 = 12;
 const CLAUDE_DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+const CLAUDE_TIERED_THRESHOLD_TOKENS: u64 = 200_000;
 const SESSION_DISCOVERY_CACHE_TTL: StdDuration = StdDuration::from_secs(5);
+const CLAUDE_STATUS_CACHE_TTL: StdDuration = StdDuration::from_secs(60);
+const CLAUDE_STATUS_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const CLAUDE_STATUS_PYTHON_PROBE: &str = r#"
+import json, os, select, subprocess, time
+
+proc = subprocess.Popen(
+    ['script', '-q', '/dev/null', 'zsh', '-lc', 'claude'],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+fd = proc.stdout.fileno()
+os.set_blocking(fd, False)
+
+def read_for(seconds):
+    end = time.time() + seconds
+    chunks = []
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if fd in r:
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not data:
+                break
+            chunks.append(data)
+    return b''.join(chunks)
+
+def strip(data):
+    plain = []
+    i = 0
+    while i < len(data):
+        b = data[i]
+        if b == 0x1b:
+            i += 1
+            if i >= len(data):
+                break
+            if data[i] == ord('['):
+                params_start = i + 1
+                i += 1
+                cmd = None
+                while i < len(data):
+                    byte = data[i]
+                    i += 1
+                    if 0x40 <= byte <= 0x7e:
+                        cmd = byte
+                        break
+                if cmd == ord('C'):
+                    params = data[params_start:i-1].decode('utf-8', 'ignore')
+                    count = int((params.split(';')[0] or '1'))
+                    plain.extend(b' ' * count)
+            elif data[i] == ord(']'):
+                i += 1
+                while i < len(data):
+                    byte = data[i]
+                    i += 1
+                    if byte == 0x07:
+                        break
+                    if byte == 0x1b and i < len(data) and data[i] == ord('\\'):
+                        i += 1
+                        break
+            else:
+                i += 1
+        elif b == ord('\r'):
+            plain.append(ord('\n'))
+            i += 1
+        elif b == 0x08:
+            i += 1
+        elif b < 0x20 and b not in (ord('\n'), ord('\t')):
+            i += 1
+        else:
+            plain.append(b)
+            i += 1
+    return bytes(plain).decode('utf-8', 'ignore').replace('\xa0', ' ')
+
+def wait_for(needles, seconds):
+    end = time.time() + seconds
+    chunks = []
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if fd in r:
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            if not data:
+                break
+            chunks.append(data)
+            joined = b''.join(chunks)
+            text = strip(joined)
+            if all(needle in text for needle in needles):
+                break
+    return b''.join(chunks)
+
+def send(data):
+    proc.stdin.write(data)
+    proc.stdin.flush()
+
+out = b''
+out += read_for(2.0)
+send(b'\r'); out += read_for(0.7)
+send(b'/status\r'); out += read_for(1.5)
+send(b'\t'); out += read_for(1.0)
+send(b'\t'); out += wait_for(['Current week (all models)', '% used'], 8.0)
+send(b'\x1b'); out += read_for(0.2)
+send(b'/exit\r'); out += read_for(0.3)
+
+try:
+    proc.terminate()
+except Exception:
+    pass
+try:
+    proc.wait(timeout=1)
+except Exception:
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+lines = [' '.join(line.split()) for line in strip(out).splitlines() if line.strip()]
+
+def parse_used_percent(line):
+    if '% used' not in line:
+        return None
+    prefix = line.split('% used')[0]
+    digits = ''
+    for ch in reversed(prefix):
+        if ch.isdigit():
+            digits = ch + digits
+        elif digits:
+            break
+    return int(digits) if digits else None
+
+def parse_reset_text(line):
+    if line.startswith('Resets '):
+        return line[len('Resets '):].strip()
+    if 'Europe/Stockholm' in line:
+        return line.strip()
+    return None
+
+week_all_index = next((i for i in range(len(lines) - 1, -1, -1) if 'Current week (all models)' in lines[i]), None)
+sonnet_index = next((i for i in range(len(lines) - 1, -1, -1) if 'Current week (Sonnet only)' in lines[i]), None)
+
+def previous_block(before_index):
+    if before_index is None:
+        return None
+    used_index = next((i for i in range(before_index - 1, -1, -1) if parse_used_percent(lines[i]) is not None), None)
+    if used_index is None:
+        return None
+    reset = next((parse_reset_text(lines[i]) for i in range(used_index + 1, before_index) if parse_reset_text(lines[i]) is not None), None)
+    return {'used_percent': parse_used_percent(lines[used_index]), 'reset_text': reset}
+
+def next_block(title_index):
+    if title_index is None:
+        return None
+    used_index = next((i for i in range(title_index + 1, len(lines)) if parse_used_percent(lines[i]) is not None), None)
+    if used_index is None:
+        return None
+    reset = next((parse_reset_text(lines[i]) for i in range(used_index + 1, min(len(lines), used_index + 4)) if parse_reset_text(lines[i]) is not None), None)
+    return {'used_percent': parse_used_percent(lines[used_index]), 'reset_text': reset}
+
+login_method = next((line.split('Login method:', 1)[1].strip() for line in reversed(lines) if line.startswith('Login method:')), None)
+if login_method and login_method.endswith(' Account'):
+    login_method = login_method[:-8]
+if login_method and login_method.startswith('Claude '):
+    login_method = login_method[len('Claude '):]
+
+windows = []
+session = previous_block(week_all_index)
+if session:
+    session['label'] = 'CS'
+    session['window_minutes'] = None
+    windows.append(session)
+week_all = next_block(week_all_index)
+if week_all:
+    week_all['label'] = '7D'
+    week_all['window_minutes'] = 10080
+    windows.append(week_all)
+sonnet = next_block(sonnet_index)
+if sonnet:
+    sonnet['label'] = 'SO'
+    sonnet['window_minutes'] = 10080
+    windows.append(sonnet)
+
+print(json.dumps({'plan': login_method, 'windows': windows}))
+"#;
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const LITELLM_PRICING_CACHE_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -52,6 +242,7 @@ pub struct ClaudeSource {
     summary_cache: Arc<Mutex<HashMap<PathBuf, SummaryHintCacheEntry>>>,
     summary_cache_dirty: Arc<AtomicBool>,
     sessions_cache: Arc<Mutex<Option<SessionsCache>>>,
+    status_cache: Arc<Mutex<Option<ClaudeStatusCache>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +294,7 @@ struct TranscriptHint {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct RawCostBucket {
     input_tokens: u64,
+    cache_creation_input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
 }
@@ -110,8 +302,13 @@ struct RawCostBucket {
 #[derive(Clone, Debug)]
 struct ClaudePricing {
     input_per_million: f64,
+    input_per_million_above_200k: Option<f64>,
+    cache_creation_input_per_million: f64,
+    cache_creation_input_per_million_above_200k: Option<f64>,
     cached_input_per_million: f64,
+    cached_input_per_million_above_200k: Option<f64>,
     output_per_million: f64,
+    output_per_million_above_200k: Option<f64>,
     max_input_tokens: Option<u64>,
     source: PricingSource,
 }
@@ -133,8 +330,13 @@ struct LitellmPricingCacheFile {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LitellmPricingEntry {
     input_cost_per_token: Option<f64>,
+    input_cost_per_token_above_200k_tokens: Option<f64>,
+    cache_creation_input_token_cost: Option<f64>,
+    cache_creation_input_token_cost_above_200k_tokens: Option<f64>,
     cache_read_input_token_cost: Option<f64>,
+    cache_read_input_token_cost_above_200k_tokens: Option<f64>,
     output_cost_per_token: Option<f64>,
+    output_cost_per_token_above_200k_tokens: Option<f64>,
     max_input_tokens: Option<u64>,
     max_tokens: Option<u64>,
 }
@@ -163,6 +365,33 @@ struct SessionsCache {
     rows: Vec<SessionRow>,
 }
 
+#[derive(Clone, Debug)]
+struct ClaudeStatusCache {
+    fetched_at_epoch_ms: i64,
+    quota: ProviderQuota,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClaudeStatusCacheFile {
+    fetched_at_epoch_ms: i64,
+    quota: ProviderQuota,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStatusProbePayload {
+    plan: Option<String>,
+    #[serde(default)]
+    windows: Vec<ClaudeStatusProbeWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStatusProbeWindow {
+    label: String,
+    used_percent: u8,
+    reset_text: Option<String>,
+    window_minutes: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ClaudeAccountSnapshot {
     #[serde(rename = "hasAvailableSubscription")]
@@ -184,6 +413,12 @@ struct UsageIndex {
     cumulative_token_usage: Option<TokenUsage>,
     cost_by_day: HashMap<String, RawCostBucket>,
     cost_by_hour: HashMap<String, RawCostBucket>,
+}
+
+#[derive(Default)]
+struct ClaudeQuotaUsage {
+    five_hour_usd: f64,
+    seven_day_usd: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +464,7 @@ impl ClaudeSource {
         let claude_home = normalize_claude_home(expand_known_path_vars(claude_home.into()));
         let projects_dir = claude_projects_dir(&claude_home);
         let summary_cache = load_summary_cache_from_disk().unwrap_or_default();
+        let status_cache = load_status_cache_from_disk().unwrap_or(None);
 
         Self {
             claude_home,
@@ -245,6 +481,7 @@ impl ClaudeSource {
             summary_cache: Arc::new(Mutex::new(summary_cache)),
             summary_cache_dirty: Arc::new(AtomicBool::new(false)),
             sessions_cache: Arc::new(Mutex::new(None)),
+            status_cache: Arc::new(Mutex::new(status_cache)),
         }
     }
 
@@ -258,8 +495,49 @@ impl ClaudeSource {
         self.projects_dir.exists()
     }
 
-    fn subscription_quota(&self) -> Option<ProviderQuota> {
-        load_claude_subscription_quota(&self.claude_home)
+    async fn subscription_quota(&self) -> Option<ProviderQuota> {
+        let fallback = load_claude_subscription_quota(&self.claude_home);
+        if fallback.is_none() && !self.projects_exist() {
+            return None;
+        }
+        let cached = self.status_cache.lock().expect("lock poisoned").clone();
+
+        if let Some(cache) = cached.as_ref().filter(|cache| {
+            is_status_cache_fresh(cache.fetched_at_epoch_ms) && !cache.quota.windows.is_empty()
+        }) {
+            return merge_claude_quota(fallback, Some(cache.quota.clone()));
+        }
+
+        let claude_home = self.claude_home.clone();
+        let probed = match tokio::task::spawn_blocking(move || {
+            probe_claude_status_quota(&claude_home)
+        })
+        .await
+        {
+            Ok(Ok(quota)) => quota,
+            Ok(Err(error)) => {
+                tracing::debug!("failed to probe Claude /status usage: {error:#}");
+                None
+            }
+            Err(error) => {
+                tracing::debug!("Claude /status usage probe task failed: {error:#}");
+                None
+            }
+        };
+
+        if let Some(quota) = probed.clone() {
+            if !quota.windows.is_empty() {
+                let cache = ClaudeStatusCache {
+                    fetched_at_epoch_ms: now_epoch_millis(),
+                    quota: quota.clone(),
+                };
+                *self.status_cache.lock().expect("lock poisoned") = Some(cache.clone());
+                let _ = store_status_cache_to_disk(&cache);
+            }
+            return merge_claude_quota(fallback, Some(quota));
+        }
+
+        merge_claude_quota(fallback, cached.map(|cache| cache.quota))
     }
 
     fn load_sessions(&self) -> Result<Vec<SessionRow>> {
@@ -423,11 +701,18 @@ impl SessionSource for ClaudeSource {
     async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
         let now = Utc::now();
         let litellm_pricing = self.litellm_pricing().await;
-        let subscription = self.subscription_quota();
+        let mut subscription = self.subscription_quota().await;
+        let mut quota_usage = ClaudeQuotaUsage::default();
         let mut sessions = Vec::new();
 
         for row in self.load_sessions()? {
             let hint = self.summary_hint(&row.transcript_path)?;
+            quota_usage.observe(
+                &hint,
+                row.model.as_deref().or(hint.latest_model.as_deref()),
+                litellm_pricing.as_deref(),
+                now,
+            );
             let summary = build_summary(
                 &self.machine_id,
                 &self.machine_label,
@@ -442,6 +727,12 @@ impl SessionSource for ClaudeSource {
         sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         if let Some(limit) = query.limit {
             sessions.truncate(limit);
+        }
+
+        if let Some(quota) = subscription.as_mut()
+            && quota.windows.is_empty()
+        {
+            quota.summary = quota_usage.summary_text();
         }
 
         self.persist_summary_cache_if_dirty();
@@ -770,45 +1061,617 @@ fn load_claude_subscription_quota(claude_home: &Path) -> Option<ProviderQuota> {
                 .join(" "),
             None => "Subscription".to_string(),
         }),
+        summary: None,
         windows: Vec::new(),
         limit_reached: false,
     })
+}
+
+fn merge_claude_quota(
+    fallback: Option<ProviderQuota>,
+    exact: Option<ProviderQuota>,
+) -> Option<ProviderQuota> {
+    let mut quota = exact.or(fallback.clone())?;
+
+    if quota.plan.is_none() {
+        quota.plan = fallback.as_ref().and_then(|item| item.plan.clone());
+    }
+    if quota.summary.is_none() {
+        quota.summary = fallback.and_then(|item| item.summary);
+    }
+    quota.limit_reached |= quota
+        .windows
+        .iter()
+        .any(|window| window.remaining_percent == 0);
+    Some(quota)
+}
+
+fn probe_claude_status_quota(claude_home: &Path) -> Result<Option<ProviderQuota>> {
+    let fallback = load_claude_subscription_quota(claude_home);
+    if let Some(quota) = probe_claude_status_quota_with_python(fallback.as_ref(), Local::now())? {
+        return Ok(Some(quota));
+    }
+    let capture = capture_claude_status_usage()?;
+    Ok(parse_claude_status_quota(
+        &capture,
+        fallback.as_ref(),
+        Local::now(),
+    ))
+}
+
+fn probe_claude_status_quota_with_python(
+    fallback: Option<&ProviderQuota>,
+    now_local: DateTime<Local>,
+) -> Result<Option<ProviderQuota>> {
+    let mut command = Command::new("python3");
+    apply_sanitized_probe_env(&mut command);
+    command.args(["-c", CLAUDE_STATUS_PYTHON_PROBE]);
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to start Python Claude status probe"),
+    };
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let payload: ClaudeStatusProbePayload = match serde_json::from_slice(&output.stdout) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::debug!("failed to parse Python Claude status probe output: {error:#}");
+            return Ok(None);
+        }
+    };
+
+    if payload.windows.is_empty() {
+        return Ok(None);
+    }
+
+    let windows = payload
+        .windows
+        .into_iter()
+        .map(|window| cow_watch_core::QuotaWindow {
+            label: window.label,
+            used_percent: window.used_percent,
+            remaining_percent: 100_u8.saturating_sub(window.used_percent),
+            reset_at: window
+                .reset_text
+                .as_deref()
+                .and_then(|text| parse_claude_reset_at(text, now_local)),
+            window_minutes: window.window_minutes,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Some(ProviderQuota {
+        provider: ProviderKind::Claude,
+        plan: payload
+            .plan
+            .or_else(|| fallback.and_then(|quota| quota.plan.clone())),
+        summary: None,
+        limit_reached: windows.iter().any(|window| window.remaining_percent == 0),
+        windows,
+    }))
+}
+
+fn capture_claude_status_usage() -> Result<String> {
+    let mut command = Command::new("script");
+    apply_sanitized_probe_env(&mut command);
+    command.args(["-q", "/dev/null", "zsh", "-lc", "claude"]);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start Claude status probe")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("Claude status probe stdin missing")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("Claude status probe stdout missing")?;
+
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let reader_output = output.clone();
+    let reader = thread::spawn(move || -> Result<()> {
+        let mut chunk = [0_u8; 16 * 1024];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => reader_output
+                    .lock()
+                    .expect("lock poisoned")
+                    .extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(error).context("failed to read Claude status probe output");
+                }
+            }
+        }
+        Ok(())
+    });
+
+    thread::sleep(StdDuration::from_millis(1_000));
+    write_probe_keys(&mut stdin, b"\r", StdDuration::from_millis(400))?;
+    write_probe_keys(&mut stdin, b"/status\r", StdDuration::from_millis(600))?;
+    write_probe_keys(&mut stdin, b"\t", StdDuration::from_millis(400))?;
+    write_probe_keys(&mut stdin, b"\t", StdDuration::from_millis(250))?;
+
+    let deadline = Instant::now() + CLAUDE_STATUS_PROBE_TIMEOUT;
+    while Instant::now() < deadline {
+        thread::sleep(StdDuration::from_millis(100));
+        let snapshot = output.lock().expect("lock poisoned").clone();
+        let text = strip_terminal_sequences(&snapshot);
+        if text.contains("Current session")
+            && text.contains("Current week (all models)")
+            && text.contains("% used")
+        {
+            break;
+        }
+    }
+
+    let _ = write_probe_keys(&mut stdin, b"\x1b", StdDuration::from_millis(100));
+    let _ = write_probe_keys(&mut stdin, b"/exit\r", StdDuration::from_millis(150));
+    drop(stdin);
+
+    let wait_deadline = Instant::now() + StdDuration::from_millis(800);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < wait_deadline => {
+                thread::sleep(StdDuration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Err(error) => return Err(error).context("failed to wait for Claude status probe"),
+        }
+    }
+
+    reader
+        .join()
+        .map_err(|_| anyhow!("Claude status probe reader thread panicked"))??;
+
+    let captured = output.lock().expect("lock poisoned").clone();
+    Ok(String::from_utf8_lossy(&captured).into_owned())
+}
+
+fn write_probe_keys(stdin: &mut impl Write, bytes: &[u8], settle_for: StdDuration) -> Result<()> {
+    stdin.write_all(bytes)?;
+    stdin.flush()?;
+    thread::sleep(settle_for);
+    Ok(())
+}
+
+fn apply_sanitized_probe_env(command: &mut Command) {
+    command.env_clear();
+    for key in [
+        "HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    command.env("SHELL", shell);
+}
+
+fn parse_claude_status_quota(
+    capture: &str,
+    fallback: Option<&ProviderQuota>,
+    now_local: DateTime<Local>,
+) -> Option<ProviderQuota> {
+    let cleaned = strip_terminal_sequences(capture.as_bytes()).replace('\u{a0}', " ");
+    let lines: Vec<String> = cleaned
+        .lines()
+        .map(normalize_single_line_text)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    let week_all_index = lines
+        .iter()
+        .rposition(|line| line.contains("Current week (all models)"));
+    let sonnet_index = lines
+        .iter()
+        .rposition(|line| line.contains("Current week (Sonnet only)"));
+
+    let windows = [
+        week_all_index
+            .and_then(|index| parse_previous_usage_block(&lines, index, "5H", None, now_local)),
+        week_all_index.and_then(|index| {
+            parse_usage_block_after(&lines, index, "WK", Some(7 * 24 * 60), now_local)
+        }),
+        sonnet_index.and_then(|index| {
+            parse_usage_block_after(&lines, index, "SN", Some(7 * 24 * 60), now_local)
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    if windows.is_empty() {
+        return fallback.cloned();
+    }
+
+    Some(ProviderQuota {
+        provider: ProviderKind::Claude,
+        plan: parse_claude_plan_from_status(&lines)
+            .or_else(|| fallback.and_then(|quota| quota.plan.clone())),
+        summary: None,
+        limit_reached: windows.iter().any(|window| window.remaining_percent == 0),
+        windows,
+    })
+}
+
+fn parse_previous_usage_block(
+    lines: &[String],
+    before_index: usize,
+    label: &str,
+    window_minutes: Option<u64>,
+    now_local: DateTime<Local>,
+) -> Option<cow_watch_core::QuotaWindow> {
+    let used_index = (0..before_index)
+        .rev()
+        .find(|index| parse_used_percent(&lines[*index]).is_some())?;
+    build_quota_window(
+        label,
+        parse_used_percent(&lines[used_index])?,
+        lines
+            .iter()
+            .take(before_index)
+            .skip(used_index + 1)
+            .find_map(|line| parse_reset_text(line)),
+        window_minutes,
+        now_local,
+    )
+}
+
+fn parse_usage_block_after(
+    lines: &[String],
+    title_index: usize,
+    label: &str,
+    window_minutes: Option<u64>,
+    now_local: DateTime<Local>,
+) -> Option<cow_watch_core::QuotaWindow> {
+    let used_index = lines
+        .iter()
+        .enumerate()
+        .skip(title_index + 1)
+        .find(|(_, line)| parse_used_percent(line).is_some())
+        .map(|(index, _)| index)?;
+    build_quota_window(
+        label,
+        parse_used_percent(&lines[used_index])?,
+        lines
+            .iter()
+            .skip(used_index + 1)
+            .take(3)
+            .find_map(|line| parse_reset_text(line)),
+        window_minutes,
+        now_local,
+    )
+}
+
+fn build_quota_window(
+    label: &str,
+    used_percent: u8,
+    reset_text: Option<String>,
+    window_minutes: Option<u64>,
+    now_local: DateTime<Local>,
+) -> Option<cow_watch_core::QuotaWindow> {
+    Some(cow_watch_core::QuotaWindow {
+        label: label.to_string(),
+        used_percent,
+        remaining_percent: 100_u8.saturating_sub(used_percent),
+        reset_at: reset_text
+            .as_deref()
+            .and_then(|text| parse_claude_reset_at(text, now_local)),
+        window_minutes,
+    })
+}
+
+fn parse_reset_text(line: &str) -> Option<String> {
+    if let Some(text) = line.strip_prefix("Resets ") {
+        return Some(text.trim().to_string());
+    }
+    if line.to_ascii_lowercase().contains("europe/stockholm") {
+        return Some(line.trim().to_string());
+    }
+    None
+}
+
+fn parse_used_percent(line: &str) -> Option<u8> {
+    let end = line.find("% used")?;
+    let prefix = &line[..end];
+    let digits = prefix
+        .chars()
+        .rev()
+        .take_while(|char| char.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    digits.parse::<u8>().ok()
+}
+
+fn parse_claude_plan_from_status(lines: &[String]) -> Option<String> {
+    let login_method = lines
+        .iter()
+        .rev()
+        .find_map(|line| line.strip_prefix("Login method:"))
+        .map(str::trim)?;
+    let login_method = login_method
+        .strip_suffix(" Account")
+        .unwrap_or(login_method);
+    let login_method = login_method.strip_prefix("Claude ").unwrap_or(login_method);
+    (!login_method.is_empty()).then(|| login_method.to_string())
+}
+
+fn parse_claude_reset_at(text: &str, now_local: DateTime<Local>) -> Option<DateTime<Utc>> {
+    let cleaned = text
+        .split(" (")
+        .next()
+        .unwrap_or(text)
+        .trim()
+        .replace(" at ", ", ");
+
+    if let Some((month_day, clock)) = cleaned.split_once(',') {
+        let date = NaiveDate::parse_from_str(
+            &format!("{} {}", now_local.year(), month_day.trim()),
+            "%Y %b %d",
+        )
+        .ok()?;
+        let time = parse_claude_clock(clock)?;
+        let local = Local
+            .from_local_datetime(&date.and_time(time))
+            .single()
+            .or_else(|| Local.from_local_datetime(&date.and_time(time)).earliest())?;
+        return Some(local.with_timezone(&Utc));
+    }
+
+    let time = parse_claude_clock(&cleaned)?;
+    let today = now_local.date_naive();
+    let today_local = Local
+        .from_local_datetime(&today.and_time(time))
+        .single()
+        .or_else(|| Local.from_local_datetime(&today.and_time(time)).earliest())?;
+    let resolved = if today_local < now_local {
+        let tomorrow = today.succ_opt()?;
+        Local
+            .from_local_datetime(&tomorrow.and_time(time))
+            .single()
+            .or_else(|| {
+                Local
+                    .from_local_datetime(&tomorrow.and_time(time))
+                    .earliest()
+            })?
+    } else {
+        today_local
+    };
+    Some(resolved.with_timezone(&Utc))
+}
+
+fn parse_claude_clock(text: &str) -> Option<NaiveTime> {
+    let compact = text.trim().to_ascii_lowercase().replace(' ', "");
+    let meridiem = if compact.ends_with("am") {
+        "am"
+    } else if compact.ends_with("pm") {
+        "pm"
+    } else {
+        return None;
+    };
+    let body = compact.strip_suffix(meridiem)?;
+    let (hour, minute) = if let Some((hour, minute)) = body.split_once(':') {
+        (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?)
+    } else {
+        (body.parse::<u32>().ok()?, 0)
+    };
+    if !(1..=12).contains(&hour) || minute > 59 {
+        return None;
+    }
+    let hour24 = match (meridiem, hour) {
+        ("am", 12) => 0,
+        ("am", hour) => hour,
+        ("pm", 12) => 12,
+        ("pm", hour) => hour + 12,
+        _ => unreachable!(),
+    };
+    NaiveTime::from_hms_opt(hour24, minute, 0)
+}
+
+fn strip_terminal_sequences(input: &[u8]) -> String {
+    let mut plain = Vec::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < input.len() {
+        match input[index] {
+            0x1b => {
+                index += 1;
+                if index >= input.len() {
+                    break;
+                }
+                match input[index] {
+                    b'[' => {
+                        let params_start = index + 1;
+                        index += 1;
+                        let mut command = None;
+                        while index < input.len() {
+                            let byte = input[index];
+                            index += 1;
+                            if (0x40..=0x7e).contains(&byte) {
+                                command = Some(byte);
+                                break;
+                            }
+                        }
+                        if matches!(command, Some(b'C')) {
+                            let params = std::str::from_utf8(&input[params_start..index - 1])
+                                .ok()
+                                .unwrap_or_default();
+                            let count = params
+                                .split(';')
+                                .next()
+                                .and_then(|item| item.parse::<usize>().ok())
+                                .unwrap_or(1);
+                            plain.extend(std::iter::repeat_n(b' ', count));
+                        }
+                    }
+                    b']' => {
+                        index += 1;
+                        while index < input.len() {
+                            let byte = input[index];
+                            index += 1;
+                            if byte == 0x07 {
+                                break;
+                            }
+                            if byte == 0x1b && input.get(index) == Some(&b'\\') {
+                                index += 1;
+                                break;
+                            }
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            b'\r' => {
+                plain.push(b'\n');
+                index += 1;
+            }
+            0x08 => {
+                index += 1;
+            }
+            byte if byte < 0x20 && byte != b'\n' && byte != b'\t' => {
+                index += 1;
+            }
+            byte => {
+                plain.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&plain).into_owned()
+}
+
+impl ClaudeQuotaUsage {
+    fn observe(
+        &mut self,
+        hint: &TranscriptHint,
+        model: Option<&str>,
+        litellm_pricing: Option<&LitellmPricingMap>,
+        now: DateTime<Utc>,
+    ) {
+        let Some(model) = model else {
+            return;
+        };
+        let Some(pricing) = resolve_claude_pricing(model, litellm_pricing) else {
+            return;
+        };
+
+        for key in recent_hour_keys(now, 5) {
+            if let Some(bucket) = hint.cost_by_hour.get(&key) {
+                self.five_hour_usd += estimate_raw_cost_bucket(bucket, &pricing);
+            }
+        }
+
+        for key in recent_date_keys(now, 7) {
+            if let Some(bucket) = hint.cost_by_day.get(&key) {
+                self.seven_day_usd += estimate_raw_cost_bucket(bucket, &pricing);
+            }
+        }
+    }
+
+    fn summary_text(&self) -> Option<String> {
+        if self.five_hour_usd < 0.0005 && self.seven_day_usd < 0.0005 {
+            return None;
+        }
+
+        Some(format!(
+            "5h {} · 7d {}",
+            format_usd_compact(self.five_hour_usd),
+            format_usd_compact(self.seven_day_usd)
+        ))
+    }
 }
 
 fn resolve_claude_pricing(
     model: &str,
     litellm_pricing: Option<&LitellmPricingMap>,
 ) -> Option<ClaudePricing> {
+    if let Some(pricing) = builtin_claude_pricing(model) {
+        return Some(pricing);
+    }
+
     if let Some(entry) = litellm_pricing.and_then(|entries| find_litellm_entry(model, entries))
         && let Some(pricing) = litellm_to_claude_pricing(entry)
     {
         return Some(pricing);
     }
 
+    None
+}
+
+fn builtin_claude_pricing(model: &str) -> Option<ClaudePricing> {
     let lowered = model.to_ascii_lowercase();
+
+    if lowered.contains("opus-4-6") {
+        return Some(ClaudePricing {
+            input_per_million: 5.0,
+            input_per_million_above_200k: None,
+            cache_creation_input_per_million: 6.25,
+            cache_creation_input_per_million_above_200k: None,
+            cached_input_per_million: 0.5,
+            cached_input_per_million_above_200k: None,
+            output_per_million: 25.0,
+            output_per_million_above_200k: None,
+            max_input_tokens: Some(1_000_000),
+            source: PricingSource::BuiltIn,
+        });
+    }
+
     if lowered.contains("opus") {
         return Some(ClaudePricing {
             input_per_million: 15.0,
+            input_per_million_above_200k: None,
+            cache_creation_input_per_million: 18.75,
+            cache_creation_input_per_million_above_200k: None,
             cached_input_per_million: 1.5,
+            cached_input_per_million_above_200k: None,
             output_per_million: 75.0,
+            output_per_million_above_200k: None,
             max_input_tokens: Some(builtin_context_window(model)),
             source: PricingSource::BuiltIn,
         });
     }
+
     if lowered.contains("sonnet") {
         return Some(ClaudePricing {
             input_per_million: 3.0,
+            input_per_million_above_200k: None,
+            cache_creation_input_per_million: 3.75,
+            cache_creation_input_per_million_above_200k: None,
             cached_input_per_million: 0.3,
+            cached_input_per_million_above_200k: None,
             output_per_million: 15.0,
+            output_per_million_above_200k: None,
             max_input_tokens: Some(builtin_context_window(model)),
             source: PricingSource::BuiltIn,
         });
     }
+
     if lowered.contains("haiku") {
         return Some(ClaudePricing {
-            input_per_million: 0.8,
-            cached_input_per_million: 0.08,
-            output_per_million: 4.0,
+            input_per_million: 1.0,
+            input_per_million_above_200k: None,
+            cache_creation_input_per_million: 1.25,
+            cache_creation_input_per_million_above_200k: None,
+            cached_input_per_million: 0.1,
+            cached_input_per_million_above_200k: None,
+            output_per_million: 5.0,
+            output_per_million_above_200k: None,
             max_input_tokens: Some(builtin_context_window(model)),
             source: PricingSource::BuiltIn,
         });
@@ -819,7 +1682,7 @@ fn resolve_claude_pricing(
 
 fn builtin_context_window(model: &str) -> u64 {
     let lowered = model.to_ascii_lowercase();
-    if lowered.contains("1m") {
+    if lowered.contains("opus-4-6") || lowered.contains("1m") {
         1_000_000
     } else {
         CLAUDE_DEFAULT_CONTEXT_WINDOW
@@ -829,8 +1692,24 @@ fn builtin_context_window(model: &str) -> u64 {
 fn litellm_to_claude_pricing(entry: &LitellmPricingEntry) -> Option<ClaudePricing> {
     Some(ClaudePricing {
         input_per_million: entry.input_cost_per_token? * 1_000_000.0,
+        input_per_million_above_200k: entry
+            .input_cost_per_token_above_200k_tokens
+            .map(|value| value * 1_000_000.0),
+        cache_creation_input_per_million: entry
+            .cache_creation_input_token_cost
+            .unwrap_or(entry.input_cost_per_token?)
+            * 1_000_000.0,
+        cache_creation_input_per_million_above_200k: entry
+            .cache_creation_input_token_cost_above_200k_tokens
+            .map(|value| value * 1_000_000.0),
         cached_input_per_million: entry.cache_read_input_token_cost.unwrap_or(0.0) * 1_000_000.0,
+        cached_input_per_million_above_200k: entry
+            .cache_read_input_token_cost_above_200k_tokens
+            .map(|value| value * 1_000_000.0),
         output_per_million: entry.output_cost_per_token? * 1_000_000.0,
+        output_per_million_above_200k: entry
+            .output_cost_per_token_above_200k_tokens
+            .map(|value| value * 1_000_000.0),
         max_input_tokens: entry.max_input_tokens.or(entry.max_tokens),
         source: PricingSource::LiteLlm,
     })
@@ -889,19 +1768,37 @@ fn estimate_session_cost(
     day_usd: f64,
 ) -> Option<SessionCost> {
     let input_tokens = tokens.input_tokens?;
+    let cache_creation_input_tokens = tokens.cache_creation_input_tokens.unwrap_or(0);
     let cached_input_tokens = tokens.cached_input_tokens.unwrap_or(0);
     let output_tokens = tokens.output_tokens?;
-    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
 
-    let input_usd = token_cost(uncached_input_tokens, pricing.input_per_million);
-    let cached_input_usd = token_cost(cached_input_tokens, pricing.cached_input_per_million);
-    let output_usd = token_cost(output_tokens, pricing.output_per_million);
+    let input_usd = token_cost_tiered(
+        input_tokens,
+        pricing.input_per_million,
+        pricing.input_per_million_above_200k,
+    );
+    let cache_creation_input_usd = token_cost_tiered(
+        cache_creation_input_tokens,
+        pricing.cache_creation_input_per_million,
+        pricing.cache_creation_input_per_million_above_200k,
+    );
+    let cached_input_usd = token_cost_tiered(
+        cached_input_tokens,
+        pricing.cached_input_per_million,
+        pricing.cached_input_per_million_above_200k,
+    );
+    let output_usd = token_cost_tiered(
+        output_tokens,
+        pricing.output_per_million,
+        pricing.output_per_million_above_200k,
+    );
 
     Some(SessionCost {
         input_usd,
+        cache_creation_input_usd,
         cached_input_usd,
         output_usd,
-        total_usd: input_usd + cached_input_usd + output_usd,
+        total_usd: input_usd + cache_creation_input_usd + cached_input_usd + output_usd,
         hour_usd,
         day_usd,
         pricing_source: pricing.source.clone(),
@@ -909,12 +1806,23 @@ fn estimate_session_cost(
 }
 
 fn estimate_raw_cost_bucket(bucket: &RawCostBucket, pricing: &ClaudePricing) -> f64 {
-    let uncached_input_tokens = bucket
-        .input_tokens
-        .saturating_sub(bucket.cached_input_tokens);
-    token_cost(uncached_input_tokens, pricing.input_per_million)
-        + token_cost(bucket.cached_input_tokens, pricing.cached_input_per_million)
-        + token_cost(bucket.output_tokens, pricing.output_per_million)
+    token_cost_tiered(
+        bucket.input_tokens,
+        pricing.input_per_million,
+        pricing.input_per_million_above_200k,
+    ) + token_cost_tiered(
+        bucket.cache_creation_input_tokens,
+        pricing.cache_creation_input_per_million,
+        pricing.cache_creation_input_per_million_above_200k,
+    ) + token_cost_tiered(
+        bucket.cached_input_tokens,
+        pricing.cached_input_per_million,
+        pricing.cached_input_per_million_above_200k,
+    ) + token_cost_tiered(
+        bucket.output_tokens,
+        pricing.output_per_million,
+        pricing.output_per_million_above_200k,
+    )
 }
 
 fn current_hour_cost_usd(
@@ -944,6 +1852,23 @@ fn current_day_cost_usd(
 
 fn token_cost(tokens: u64, rate_per_million: f64) -> f64 {
     (tokens as f64 / 1_000_000.0) * rate_per_million
+}
+
+fn token_cost_tiered(tokens: u64, base_per_million: f64, tiered_per_million: Option<f64>) -> f64 {
+    if tokens == 0 {
+        return 0.0;
+    }
+
+    if let Some(tiered_per_million) = tiered_per_million
+        && tokens > CLAUDE_TIERED_THRESHOLD_TOKENS
+    {
+        let below_threshold = CLAUDE_TIERED_THRESHOLD_TOKENS;
+        let above_threshold = tokens.saturating_sub(CLAUDE_TIERED_THRESHOLD_TOKENS);
+        return token_cost(below_threshold, base_per_million)
+            + token_cost(above_threshold, tiered_per_million);
+    }
+
+    token_cost(tokens, base_per_million)
 }
 
 fn collect_sessions_from_projects(
@@ -1132,7 +2057,7 @@ fn analyze_transcript(path: &Path, mode: ReadMode) -> Result<TranscriptHint> {
                 }
 
                 if let Some(delta) = parse_claude_usage(message) {
-                    hint.latest_context_used_tokens = delta.input_tokens;
+                    hint.latest_context_used_tokens = Some(total_claude_input_tokens(&delta));
                 }
 
                 let mut text_chunks = Vec::new();
@@ -1282,7 +2207,8 @@ fn parse_claude_usage(message: &Value) -> Option<TokenUsage> {
 
     Some(TokenUsage {
         total_tokens,
-        input_tokens: Some(total_input_tokens),
+        input_tokens: Some(input_tokens),
+        cache_creation_input_tokens: Some(cache_creation_input_tokens),
         cached_input_tokens: Some(cache_read_input_tokens),
         output_tokens: Some(output_tokens),
         reasoning_output_tokens: None,
@@ -1337,12 +2263,17 @@ fn stream_usage_index(path: &Path) -> Result<UsageIndex> {
 }
 
 fn accumulate_token_usage(total: &mut TokenUsage, delta: &TokenUsage) {
-    total.total_tokens = total.total_tokens.saturating_add(delta.total_tokens);
     total.input_tokens = Some(
         total
             .input_tokens
             .unwrap_or(0)
             .saturating_add(delta.input_tokens.unwrap_or(0)),
+    );
+    total.cache_creation_input_tokens = Some(
+        total
+            .cache_creation_input_tokens
+            .unwrap_or(0)
+            .saturating_add(delta.cache_creation_input_tokens.unwrap_or(0)),
     );
     total.cached_input_tokens = Some(
         total
@@ -1356,6 +2287,12 @@ fn accumulate_token_usage(total: &mut TokenUsage, delta: &TokenUsage) {
             .unwrap_or(0)
             .saturating_add(delta.output_tokens.unwrap_or(0)),
     );
+    total.total_tokens = total
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(total.cache_creation_input_tokens.unwrap_or(0))
+        .saturating_add(total.cached_input_tokens.unwrap_or(0))
+        .saturating_add(total.output_tokens.unwrap_or(0));
 }
 
 fn add_raw_cost_bucket(
@@ -1367,12 +2304,23 @@ fn add_raw_cost_bucket(
     bucket.input_tokens = bucket
         .input_tokens
         .saturating_add(delta.input_tokens.unwrap_or(0));
+    bucket.cache_creation_input_tokens = bucket
+        .cache_creation_input_tokens
+        .saturating_add(delta.cache_creation_input_tokens.unwrap_or(0));
     bucket.cached_input_tokens = bucket
         .cached_input_tokens
         .saturating_add(delta.cached_input_tokens.unwrap_or(0));
     bucket.output_tokens = bucket
         .output_tokens
         .saturating_add(delta.output_tokens.unwrap_or(0));
+}
+
+fn total_claude_input_tokens(tokens: &TokenUsage) -> u64 {
+    tokens
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(tokens.cache_creation_input_tokens.unwrap_or(0))
+        .saturating_add(tokens.cached_input_tokens.unwrap_or(0))
 }
 
 fn parse_transcript_static(path: &Path) -> Result<TranscriptStatic> {
@@ -1730,6 +2678,32 @@ fn local_hour_key(timestamp: DateTime<Utc>) -> String {
         .with_timezone(&Local)
         .format("%Y-%m-%dT%H")
         .to_string()
+}
+
+fn recent_hour_keys(now: DateTime<Utc>, hours: usize) -> Vec<String> {
+    (0..hours)
+        .map(|offset| local_hour_key(now - Duration::hours(offset as i64)))
+        .collect()
+}
+
+fn recent_date_keys(now: DateTime<Utc>, days: usize) -> Vec<String> {
+    (0..days)
+        .map(|offset| local_date_key(now - Duration::days(offset as i64)))
+        .collect()
+}
+
+fn format_usd_compact(value: f64) -> String {
+    if value < 0.0005 {
+        "$0".to_string()
+    } else if value >= 100.0 {
+        format!("${value:.0}")
+    } else if value >= 10.0 {
+        format!("${value:.1}")
+    } else if value >= 1.0 {
+        format!("${value:.2}")
+    } else {
+        format!("${value:.3}")
+    }
 }
 
 fn user_title_candidate(message: &str) -> Option<String> {
@@ -2093,6 +3067,16 @@ fn pricing_cache_path() -> Option<PathBuf> {
     )
 }
 
+fn status_cache_path() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(
+        base_dirs
+            .cache_dir()
+            .join("cow-watch")
+            .join("claude_status.json"),
+    )
+}
+
 fn summary_cache_path() -> Option<PathBuf> {
     let base_dirs = BaseDirs::new()?;
     Some(
@@ -2131,6 +3115,43 @@ fn load_latest_claude_account_snapshot(claude_home: &Path) -> Option<ClaudeAccou
     serde_json::from_str(&raw).ok()
 }
 
+fn load_status_cache_from_disk() -> Result<Option<ClaudeStatusCache>> {
+    let Some(path) = status_cache_path() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read status cache {}", path.display()))?;
+    let parsed: ClaudeStatusCacheFile = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse status cache {}", path.display()))?;
+    Ok(Some(ClaudeStatusCache {
+        fetched_at_epoch_ms: parsed.fetched_at_epoch_ms,
+        quota: normalize_claude_quota_labels(parsed.quota),
+    }))
+}
+
+fn store_status_cache_to_disk(cache: &ClaudeStatusCache) -> Result<()> {
+    let Some(path) = status_cache_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let payload = ClaudeStatusCacheFile {
+        fetched_at_epoch_ms: cache.fetched_at_epoch_ms,
+        quota: normalize_claude_quota_labels(cache.quota.clone()),
+    };
+    let raw = serde_json::to_string(&payload)
+        .with_context(|| format!("failed to serialize status cache {}", path.display()))?;
+    fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 fn load_pricing_cache_from_disk() -> Result<Option<LitellmPricingCache>> {
     let Some(path) = pricing_cache_path() else {
         return Ok(None);
@@ -2147,6 +3168,23 @@ fn load_pricing_cache_from_disk() -> Result<Option<LitellmPricingCache>> {
         fetched_at_epoch_ms: parsed.fetched_at_epoch_ms,
         entries: Arc::new(parsed.entries),
     }))
+}
+
+fn normalize_claude_quota_labels(mut quota: ProviderQuota) -> ProviderQuota {
+    if quota.provider != ProviderKind::Claude {
+        return quota;
+    }
+
+    for window in &mut quota.windows {
+        window.label = match window.label.as_str() {
+            "CS" => "5H".to_string(),
+            "7D" => "WK".to_string(),
+            "SO" => "SN".to_string(),
+            other => other.to_string(),
+        };
+    }
+
+    quota
 }
 
 fn store_pricing_cache_to_disk(cache: &LitellmPricingCache) -> Result<()> {
@@ -2182,11 +3220,26 @@ fn parse_litellm_pricing_map(value: &Value) -> Option<LitellmPricingMap> {
                 input_cost_per_token: entry_object
                     .get("input_cost_per_token")
                     .and_then(Value::as_f64),
+                input_cost_per_token_above_200k_tokens: entry_object
+                    .get("input_cost_per_token_above_200k_tokens")
+                    .and_then(Value::as_f64),
+                cache_creation_input_token_cost: entry_object
+                    .get("cache_creation_input_token_cost")
+                    .and_then(Value::as_f64),
+                cache_creation_input_token_cost_above_200k_tokens: entry_object
+                    .get("cache_creation_input_token_cost_above_200k_tokens")
+                    .and_then(Value::as_f64),
                 cache_read_input_token_cost: entry_object
                     .get("cache_read_input_token_cost")
                     .and_then(Value::as_f64),
+                cache_read_input_token_cost_above_200k_tokens: entry_object
+                    .get("cache_read_input_token_cost_above_200k_tokens")
+                    .and_then(Value::as_f64),
                 output_cost_per_token: entry_object
                     .get("output_cost_per_token")
+                    .and_then(Value::as_f64),
+                output_cost_per_token_above_200k_tokens: entry_object
+                    .get("output_cost_per_token_above_200k_tokens")
                     .and_then(Value::as_f64),
                 max_input_tokens: entry_object.get("max_input_tokens").and_then(Value::as_u64),
                 max_tokens: entry_object.get("max_tokens").and_then(Value::as_u64),
@@ -2200,6 +3253,11 @@ fn parse_litellm_pricing_map(value: &Value) -> Option<LitellmPricingMap> {
 fn is_pricing_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
     age_ms >= 0 && age_ms <= LITELLM_PRICING_CACHE_TTL.as_millis() as i64
+}
+
+fn is_status_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+    let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
+    age_ms >= 0 && age_ms <= CLAUDE_STATUS_CACHE_TTL.as_millis() as i64
 }
 
 fn is_sessions_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
@@ -2217,13 +3275,14 @@ fn now_epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriptHint, analyze_transcript, derive_activity_state, looks_like_compaction_signal,
-        normalize_message_text, normalize_title,
+        ClaudePricing, TranscriptHint, analyze_transcript, builtin_claude_pricing,
+        derive_activity_state, estimate_session_cost, looks_like_compaction_signal,
+        normalize_message_text, normalize_title, parse_claude_status_quota, parse_claude_usage,
     };
-    use chrono::Utc;
+    use chrono::{Local, TimeZone, Utc};
     use cow_watch_core::{
-        ActivityEvent, ActivityKind, SessionActivityState, SessionStatus, SessionStatusKind,
-        StatusConfidence,
+        ActivityEvent, ActivityKind, PricingSource, ProviderKind, ProviderQuota,
+        SessionActivityState, SessionStatus, SessionStatusKind, StatusConfidence,
     };
     use std::{
         fs,
@@ -2372,5 +3431,136 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parse_claude_usage_tracks_cache_creation_separately() {
+        let message = serde_json::json!({
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 10324,
+                "cache_read_input_tokens": 11519,
+                "output_tokens": 31
+            }
+        });
+
+        let usage = parse_claude_usage(&message).unwrap();
+
+        assert_eq!(usage.total_tokens, 21877);
+        assert_eq!(usage.input_tokens, Some(3));
+        assert_eq!(usage.cache_creation_input_tokens, Some(10324));
+        assert_eq!(usage.cached_input_tokens, Some(11519));
+        assert_eq!(usage.output_tokens, Some(31));
+    }
+
+    #[test]
+    fn estimate_session_cost_counts_cache_creation_separately() {
+        let tokens = cow_watch_core::TokenUsage {
+            total_tokens: 10_000,
+            input_tokens: Some(4_000),
+            cache_creation_input_tokens: Some(2_000),
+            cached_input_tokens: Some(3_000),
+            output_tokens: Some(1_000),
+            reasoning_output_tokens: None,
+        };
+        let pricing = ClaudePricing {
+            input_per_million: 100.0,
+            input_per_million_above_200k: None,
+            cache_creation_input_per_million: 200.0,
+            cache_creation_input_per_million_above_200k: None,
+            cached_input_per_million: 50.0,
+            cached_input_per_million_above_200k: None,
+            output_per_million: 300.0,
+            output_per_million_above_200k: None,
+            max_input_tokens: Some(1_000_000),
+            source: PricingSource::BuiltIn,
+        };
+
+        let cost = estimate_session_cost(&tokens, &pricing, 0.0, 0.0).unwrap();
+
+        assert!((cost.input_usd - 0.4).abs() < 1e-9);
+        assert!((cost.cache_creation_input_usd - 0.4).abs() < 1e-9);
+        assert!((cost.cached_input_usd - 0.15).abs() < 1e-9);
+        assert!((cost.output_usd - 0.3).abs() < 1e-9);
+        assert!((cost.total_usd - 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_session_cost_matches_ccusage_for_claude_opus_4_6() {
+        let tokens = cow_watch_core::TokenUsage {
+            total_tokens: 349_061,
+            input_tokens: Some(22),
+            cache_creation_input_tokens: Some(66_623),
+            cached_input_tokens: Some(280_214),
+            output_tokens: Some(2_202),
+            reasoning_output_tokens: None,
+        };
+        let pricing = builtin_claude_pricing("claude-opus-4-6").unwrap();
+
+        let cost = estimate_session_cost(&tokens, &pricing, 0.0, 0.0).unwrap();
+
+        assert!((cost.total_usd - 0.61166075).abs() < 1e-9);
+        assert!((cost.cache_creation_input_usd - 0.41639375).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_claude_status_quota_extracts_exact_usage_windows() {
+        let capture = r#"
+            Login method: Claude Max Account
+
+            Current session
+            █                                                  2% used
+            Resets 11pm (Europe/Stockholm)
+
+            Current week (all models)
+            █▌                                                 3% used
+            Resets Apr 15, 7pm (Europe/Stockholm)
+
+            Current week (Sonnet only)
+                                                              0% used
+            Resets Apr 16, 9pm (Europe/Stockholm)
+        "#;
+        let fallback = ProviderQuota {
+            provider: ProviderKind::Claude,
+            plan: Some("Subscription".to_string()),
+            summary: None,
+            windows: Vec::new(),
+            limit_reached: false,
+        };
+        let now_local = Local.with_ymd_and_hms(2026, 4, 11, 12, 0, 0).unwrap();
+
+        let quota = parse_claude_status_quota(capture, Some(&fallback), now_local).unwrap();
+
+        assert_eq!(quota.plan.as_deref(), Some("Max"));
+        assert_eq!(quota.windows.len(), 3);
+        assert_eq!(quota.windows[0].label, "5H");
+        assert_eq!(quota.windows[0].used_percent, 2);
+        assert_eq!(quota.windows[0].remaining_percent, 98);
+        assert_eq!(quota.windows[1].label, "WK");
+        assert_eq!(quota.windows[1].remaining_percent, 97);
+        assert_eq!(quota.windows[2].label, "SN");
+        assert_eq!(quota.windows[2].remaining_percent, 100);
+    }
+
+    #[test]
+    fn parse_claude_status_quota_falls_back_when_usage_block_is_missing() {
+        let fallback = ProviderQuota {
+            provider: ProviderKind::Claude,
+            plan: Some("Subscription".to_string()),
+            summary: None,
+            windows: Vec::new(),
+            limit_reached: false,
+        };
+        let now_local = Local.with_ymd_and_hms(2026, 4, 11, 12, 0, 0).unwrap();
+
+        let quota = parse_claude_status_quota(
+            "Login method: Claude Max Account",
+            Some(&fallback),
+            now_local,
+        )
+        .unwrap();
+
+        assert_eq!(quota.plan.as_deref(), Some("Subscription"));
+        assert!(quota.windows.is_empty());
     }
 }

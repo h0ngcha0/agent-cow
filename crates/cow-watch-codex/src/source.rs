@@ -1029,6 +1029,7 @@ fn estimate_session_cost(
 
     Some(SessionCost {
         input_usd,
+        cache_creation_input_usd: 0.0,
         cached_input_usd,
         output_usd,
         total_usd: input_usd + cached_input_usd + output_usd,
@@ -1685,6 +1686,7 @@ fn parse_token_usage(value: &Value) -> Option<TokenUsage> {
     let mut tokens = TokenUsage {
         total_tokens: value.get("total_tokens")?.as_u64()?,
         input_tokens: value.get("input_tokens").and_then(Value::as_u64),
+        cache_creation_input_tokens: None,
         cached_input_tokens: value.get("cached_input_tokens").and_then(Value::as_u64),
         output_tokens: value.get("output_tokens").and_then(Value::as_u64),
         reasoning_output_tokens: value.get("reasoning_output_tokens").and_then(Value::as_u64),
@@ -1882,6 +1884,7 @@ fn parse_codex_quota(value: &Value) -> Option<ProviderQuota> {
             .get("plan_type")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        summary: None,
         windows,
         limit_reached: value
             .get("limit_reached")
@@ -3073,6 +3076,7 @@ mod tests {
             cumulative_token_usage: Some(TokenUsage {
                 total_tokens: 49_563_385,
                 input_tokens: Some(49_334_097),
+                cache_creation_input_tokens: None,
                 cached_input_tokens: Some(47_762_048),
                 output_tokens: Some(229_288),
                 reasoning_output_tokens: Some(117_865),

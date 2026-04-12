@@ -215,16 +215,18 @@ fn print_session_detail(detail: &SessionDetail) {
     );
     println!("Tokens: {}", summary.tokens.total_tokens);
     if let Some(cost) = &summary.cost {
-        println!(
-            "Cost: ${:.4} ($/1h ${:.4}, $/1d ${:.4}, input ${:.4}, cached ${:.4}, output ${:.4}, {})",
-            cost.total_usd,
-            cost.hour_usd,
-            cost.day_usd,
-            cost.input_usd,
-            cost.cached_input_usd,
-            cost.output_usd,
-            cost.pricing_source
-        );
+        let mut parts = vec![
+            format!("$/1h ${:.4}", cost.hour_usd),
+            format!("$/1d ${:.4}", cost.day_usd),
+            format!("input ${:.4}", cost.input_usd),
+        ];
+        if cost.cache_creation_input_usd > 0.0 {
+            parts.push(format!("cache+ ${:.4}", cost.cache_creation_input_usd));
+        }
+        parts.push(format!("cached ${:.4}", cost.cached_input_usd));
+        parts.push(format!("output ${:.4}", cost.output_usd));
+        parts.push(cost.pricing_source.to_string());
+        println!("Cost: ${:.4} ({})", cost.total_usd, parts.join(", "));
     }
     if let Some(context) = &summary.context_window {
         println!(

@@ -87,6 +87,7 @@ pub enum SessionActivityState {
 pub struct TokenUsage {
     pub total_tokens: u64,
     pub input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub reasoning_output_tokens: Option<u64>,
@@ -95,6 +96,7 @@ pub struct TokenUsage {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionCost {
     pub input_usd: f64,
+    pub cache_creation_input_usd: f64,
     pub cached_input_usd: f64,
     pub output_usd: f64,
     pub total_usd: f64,
@@ -143,6 +145,7 @@ pub struct QuotaWindow {
 pub struct ProviderQuota {
     pub provider: ProviderKind,
     pub plan: Option<String>,
+    pub summary: Option<String>,
     pub windows: Vec<QuotaWindow>,
     pub limit_reached: bool,
 }

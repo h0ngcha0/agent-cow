@@ -699,6 +699,8 @@ const INDEX_HTML: &str = r#"<!doctype html>
             for (const window of quota.windows) {
               parts.push(`${window.label} ${window.used_percent}%`);
             }
+          } else if (quota.summary) {
+            parts.push(quota.summary);
           } else if (quota.plan) {
             parts.push("active");
           }
@@ -881,7 +883,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
               <div><strong>Branch</strong>${escapeHtml(detail.summary.git_branch || "n/a")}</div>
             </div>
             <div class="summary-line">${escapeHtml(detail.summary.status.reason)}</div>
-            ${detail.summary.cost ? `<div class="summary-line">1h ${escapeHtml(formatUsdWindow(detail.summary.cost.hour_usd))} · 1d ${escapeHtml(formatUsdWindow(detail.summary.cost.day_usd))} · input ${escapeHtml(formatUsd(detail.summary.cost.input_usd))} · cached ${escapeHtml(formatUsd(detail.summary.cost.cached_input_usd))} · output ${escapeHtml(formatUsd(detail.summary.cost.output_usd))} · ${escapeHtml(detail.summary.cost.pricing_source)}</div>` : ""}
+            ${detail.summary.cost ? `<div class="summary-line">1h ${escapeHtml(formatUsdWindow(detail.summary.cost.hour_usd))} · 1d ${escapeHtml(formatUsdWindow(detail.summary.cost.day_usd))} · input ${escapeHtml(formatUsd(detail.summary.cost.input_usd))}${detail.summary.cost.cache_creation_input_usd > 0 ? ` · cache+ ${escapeHtml(formatUsd(detail.summary.cost.cache_creation_input_usd))}` : ""} · cached ${escapeHtml(formatUsd(detail.summary.cost.cached_input_usd))} · output ${escapeHtml(formatUsd(detail.summary.cost.output_usd))} · ${escapeHtml(detail.summary.cost.pricing_source)}</div>` : ""}
           </div>
 
           ${(appAction || actions) ? `

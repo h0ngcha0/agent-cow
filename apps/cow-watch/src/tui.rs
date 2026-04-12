@@ -764,7 +764,7 @@ fn draw_loading(frame: &mut Frame) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            "Restoring caches and scanning recent provider sessions",
+            "Restoring caches and scanning recent agent sessions",
             Style::default().fg(text_muted_color()),
         )]))
         .alignment(Alignment::Center),
@@ -982,6 +982,11 @@ fn subscription_windows_line(
     compact: bool,
 ) -> Line<'static> {
     if quota.windows.is_empty() {
+        if let Some(summary) = quota.summary.as_deref() {
+            let mut line = subscription_summary_line(summary, width);
+            pad_line_to_width(&mut line, width);
+            return line;
+        }
         let label = subscription_empty_state_label(quota, compact);
         let style =
             if label == "subscribed" || label == "subscription active" || label == "plan active" {
@@ -1012,20 +1017,54 @@ fn subscription_windows_line(
     line
 }
 
-fn subscription_empty_state_label(quota: &ProviderQuota, compact: bool) -> &'static str {
-    let plan = quota
-        .plan
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if plan.contains("subscription") {
-        if compact {
-            "subscribed"
-        } else {
-            "subscription active"
+fn subscription_summary_line(summary: &str, width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let parts: Vec<_> = summary.split('·').map(str::trim).collect();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                "  ·  ",
+                Style::default().fg(text_muted_color()),
+            ));
         }
-    } else if quota.plan.is_some() {
-        "plan active"
+        if let Some((label, value)) = part.split_once(' ') {
+            let lower = label.to_ascii_lowercase();
+            let label_style = if lower == "usage" {
+                Style::default()
+                    .fg(text_muted_color())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(accent_gold())
+                    .add_modifier(Modifier::BOLD)
+            };
+            spans.push(Span::styled(label.to_string(), label_style));
+            if !value.is_empty() {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    value.to_string(),
+                    Style::default()
+                        .fg(accent_cyan())
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        } else {
+            spans.push(Span::styled(
+                part.to_string(),
+                Style::default()
+                    .fg(accent_cyan())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    let mut line = Line::from(spans);
+    pad_line_to_width(&mut line, width);
+    line
+}
+
+fn subscription_empty_state_label(quota: &ProviderQuota, _compact: bool) -> &'static str {
+    if quota.plan.is_some() {
+        "active"
     } else {
         "quota unavailable"
     }
@@ -2132,19 +2171,25 @@ fn detail_lines(detail: &SessionDetail) -> Vec<Line<'static>> {
     ];
 
     if let Some(cost) = &summary.cost {
+        let mut parts = vec![
+            format!("1h {}", format_usd_short(cost.hour_usd)),
+            format!("1d {}", format_usd_short(cost.day_usd)),
+            format!("input {}", format_usd_short(cost.input_usd)),
+        ];
+        if cost.cache_creation_input_usd > 0.0 {
+            parts.push(format!(
+                "cache+ {}",
+                format_usd_short(cost.cache_creation_input_usd)
+            ));
+        }
+        parts.push(format!(
+            "cached {}",
+            format_usd_short(cost.cached_input_usd)
+        ));
+        parts.push(format!("output {}", format_usd_short(cost.output_usd)));
         lines.push(Line::from(vec![
             indent(),
-            Span::styled(
-                format!(
-                    "1h {}  •  1d {}  •  input {}  •  cached {}  •  output {}",
-                    format_usd_short(cost.hour_usd),
-                    format_usd_short(cost.day_usd),
-                    format_usd_short(cost.input_usd),
-                    format_usd_short(cost.cached_input_usd),
-                    format_usd_short(cost.output_usd)
-                ),
-                Style::default().fg(text_muted_color()),
-            ),
+            Span::styled(parts.join("  •  "), Style::default().fg(text_muted_color())),
         ]));
     }
 
@@ -3122,6 +3167,12 @@ fn token_breakdown(tokens: &TokenUsage) -> String {
 
     if let Some(input) = tokens.input_tokens {
         parts.push(format!("in {}", format_tokens_short(input)));
+    }
+
+    if let Some(cache_creation) = tokens.cache_creation_input_tokens
+        && cache_creation > 0
+    {
+        parts.push(format!("cache+ {}", format_tokens_short(cache_creation)));
     }
 
     if let Some(output) = tokens.output_tokens {
