@@ -1,8 +1,7 @@
-mod api;
 mod open;
 mod tui;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -37,10 +36,6 @@ enum Command {
         limit: Option<usize>,
         #[arg(long, default_value_t = 5)]
         refresh_secs: u64,
-    },
-    Serve {
-        #[arg(long, default_value = "127.0.0.1:7878")]
-        bind: SocketAddr,
     },
 }
 
@@ -140,9 +135,6 @@ async fn main() -> Result<()> {
             refresh_secs,
         } => {
             tui::run(service, limit, refresh_secs).await?;
-        }
-        Command::Serve { bind } => {
-            api::run(service, bind).await?;
         }
     }
 

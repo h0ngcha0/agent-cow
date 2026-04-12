@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true

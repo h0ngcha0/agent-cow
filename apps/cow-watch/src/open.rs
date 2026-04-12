@@ -9,6 +9,7 @@ use cow_watch_core::{NavigationKind, ProviderKind, SessionSummary};
 
 pub struct OpenAction {
     pub label: String,
+    #[allow(dead_code)]
     pub target: String,
 }
 
@@ -18,6 +19,7 @@ pub fn local_machine_id() -> String {
         .unwrap_or_else(|_| "local".to_string())
 }
 
+#[allow(dead_code)]
 pub fn open_session_navigation(
     summary: &SessionSummary,
     kind: NavigationKind,
@@ -149,6 +151,7 @@ fn claude_imported_session_exists_in_root(root: &Path, session_id: &str) -> bool
     false
 }
 
+#[allow(dead_code)]
 fn open_target(target: &str) -> Result<()> {
     let path = Path::new(target);
     let metadata = fs::metadata(path)
