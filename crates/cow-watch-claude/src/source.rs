@@ -1043,15 +1043,25 @@ fn looks_like_compaction_signal(text: &str) -> bool {
 }
 
 fn build_navigation(row: &SessionRow) -> Vec<NavigationTarget> {
-    if row.cwd.is_empty() {
-        Vec::new()
-    } else {
-        vec![NavigationTarget {
+    let mut navigation = Vec::new();
+
+    if !row.id.is_empty() {
+        navigation.push(NavigationTarget {
+            kind: NavigationKind::ThreadId,
+            label: "Conversation".to_string(),
+            target: row.id.clone(),
+        });
+    }
+
+    if !row.cwd.is_empty() {
+        navigation.push(NavigationTarget {
             kind: NavigationKind::WorkingDirectory,
             label: "Working Directory".to_string(),
             target: row.cwd.clone(),
-        }]
+        });
     }
+
+    navigation
 }
 
 fn build_overview(

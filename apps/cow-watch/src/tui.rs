@@ -1453,12 +1453,15 @@ fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .max(app.overview.total_sessions)
         .max(app.sessions.len());
     let scanned_sessions = app.loading_progress_loaded.max(app.sessions.len());
+    let visible_sessions = app.filtered_indices.len();
+    let sessions_value = if app.filter_input.is_empty() && visible_sessions == total_sessions {
+        total_sessions.to_string()
+    } else {
+        format!("{visible_sessions}/{total_sessions}")
+    };
     let mut lines = vec![
-        header_meta_line("Host", app.visible_host_label()),
-        header_meta_line(
-            "Sessions",
-            format!("{}/{}", app.filtered_indices.len(), total_sessions),
-        ),
+        header_meta_line("Machine", app.visible_host_label()),
+        header_meta_line("Sessions", sessions_value),
     ];
     if app.loading_more {
         lines.push(header_meta_line(
@@ -1485,7 +1488,7 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
             DetailPane::Describe => vec![
                 (
                     Some(action_item("enter/esc", "Back", true)),
-                    Some(action_item("f", "Latest", true)),
+                    Some(action_item("f", "Latest Conversation", true)),
                 ),
                 (
                     Some(action_item("j/k", "Scroll", true)),
@@ -1514,8 +1517,8 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
     } else if app.filter_input.is_empty() {
         vec![
             (
-                Some(action_item("enter", "Describe", true)),
-                Some(action_item("f", "Latest", true)),
+                Some(action_item("enter", "Details", true)),
+                Some(action_item("f", "Latest Conversation", true)),
             ),
             (
                 Some(action_item("j/k", "Move", true)),
@@ -1530,8 +1533,8 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
     } else {
         vec![
             (
-                Some(action_item("enter", "Describe", true)),
-                Some(action_item("f", "Latest", true)),
+                Some(action_item("enter", "Details", true)),
+                Some(action_item("f", "Latest Conversation", true)),
             ),
             (
                 Some(action_item("j/k", "Move", true)),
