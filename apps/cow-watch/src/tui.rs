@@ -25,6 +25,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
 
@@ -150,6 +151,25 @@ fn queue_detail_refresh(
     *detail_refresh = Some(spawn_detail_refresh(client.clone(), session_id));
 }
 
+async fn start_live_updates(
+    app: &TuiApp,
+    client: &Arc<dyn MonitorClient>,
+) -> Result<Option<UnboundedReceiver<SessionList>>> {
+    if app.loading_more || !app.full_load_complete {
+        return Ok(None);
+    }
+
+    client
+        .subscribe_sessions(
+            SessionQuery {
+                include_archived: false,
+                limit: app.requested_limit,
+            },
+            app.refresh_every,
+        )
+        .await
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     client: Arc<dyn MonitorClient>,
@@ -189,12 +209,32 @@ async fn run_loop(
     let mut fast_refresh: Option<ListRefreshTask> = None;
     let mut full_refresh: Option<ListRefreshTask> = None;
     let mut detail_refresh: Option<JoinHandle<Result<(String, SessionDetail)>>> = None;
+    let mut live_updates = start_live_updates(&app, &client).await?;
 
     if app.should_load_more() {
         queue_progressive_refresh(&mut app, &client, &mut full_refresh);
+        live_updates = None;
     }
 
     loop {
+        if let Some(receiver) = live_updates.as_mut() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(list) => {
+                        app.apply_live_update(list);
+                        if app.detail_mode {
+                            queue_detail_refresh(&mut app, &client, &mut detail_refresh);
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        live_updates = None;
+                        break;
+                    }
+                }
+            }
+        }
+
         if let Some(task) = fast_refresh.as_mut() {
             while let Ok(progress) = task.progress_rx.try_recv() {
                 app.apply_load_progress(progress);
@@ -222,6 +262,9 @@ async fn run_loop(
             app.apply_list_refresh(kind, response);
             if kind == ListRefreshKind::Progressive && app.should_load_more() {
                 queue_progressive_refresh(&mut app, &client, &mut full_refresh);
+                live_updates = None;
+            } else if live_updates.is_none() {
+                live_updates = start_live_updates(&app, &client).await?;
             }
             if app.detail_mode {
                 queue_detail_refresh(&mut app, &client, &mut detail_refresh);
@@ -369,7 +412,8 @@ async fn run_loop(
             }
         }
 
-        if app.last_refresh.elapsed() >= app.refresh_every
+        if live_updates.is_none()
+            && app.last_refresh.elapsed() >= app.refresh_every
             && fast_refresh.is_none()
             && full_refresh.is_none()
         {
@@ -530,6 +574,13 @@ impl TuiApp {
     fn apply_load_progress(&mut self, progress: SessionLoadProgress) {
         self.loading_progress_loaded = self.loading_progress_loaded.max(progress.loaded_sessions);
         self.loading_progress_total = self.loading_progress_total.max(progress.total_sessions);
+    }
+
+    fn apply_live_update(&mut self, response: SessionList) {
+        self.replace_session_list(response);
+        self.loading_progress_loaded = self.loading_progress_loaded.max(self.sessions.len());
+        self.loading_progress_total = self.overview.total_sessions.max(self.sessions.len());
+        self.last_full_refresh = Instant::now();
     }
 
     fn replace_session_list(&mut self, response: SessionList) {

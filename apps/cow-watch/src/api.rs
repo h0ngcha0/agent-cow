@@ -1,17 +1,25 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, Query, State},
+    extract::{
+        Path as AxumPath, Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use cow_watch_core::{MonitorService, NavigationKind, SessionQuery};
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use tokio::time::MissedTickBehavior;
 
 use crate::{client::OpenActionResponse, open};
+
+const STREAM_REFRESH_MIN: Duration = Duration::from_secs(1);
+const STREAM_REFRESH_MAX: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 struct ApiState {
@@ -23,6 +31,7 @@ struct ApiState {
 struct ListParams {
     include_archived: Option<bool>,
     limit: Option<usize>,
+    interval_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +48,7 @@ pub async fn run(service: MonitorService, bind: SocketAddr) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/sessions", get(list_sessions))
+        .route("/api/stream", get(stream_sessions))
         .route("/api/sessions/{id}", get(get_session))
         .route("/api/sessions/{id}/open", post(open_session_target))
         .route("/api/sessions/{id}/open-app", post(open_session_app))
@@ -67,6 +77,24 @@ async fn list_sessions(
         .await?;
 
     Ok(Json(sessions))
+}
+
+async fn stream_sessions(
+    ws: WebSocketUpgrade,
+    State(state): State<ApiState>,
+    Query(params): Query<ListParams>,
+) -> Response {
+    let query = SessionQuery {
+        include_archived: params.include_archived.unwrap_or(false),
+        limit: params.limit,
+    };
+    let interval = params
+        .interval_ms
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(5))
+        .clamp(STREAM_REFRESH_MIN, STREAM_REFRESH_MAX);
+
+    ws.on_upgrade(move |socket| stream_sessions_socket(socket, state, query, interval))
 }
 
 async fn get_session(
@@ -133,4 +161,68 @@ impl IntoResponse for ApiError {
         });
         (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
     }
+}
+
+async fn stream_sessions_socket(
+    socket: WebSocket,
+    state: ApiState,
+    query: SessionQuery,
+    interval: Duration,
+) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_signature: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let list = match state.service.list_sessions(query.clone()).await {
+                    Ok(list) => list,
+                    Err(error) => {
+                        tracing::warn!(?error, "session stream refresh failed");
+                        continue;
+                    }
+                };
+
+                let signature = match session_list_signature(&list) {
+                    Ok(signature) => signature,
+                    Err(error) => {
+                        tracing::warn!(?error, "session stream signature failed");
+                        continue;
+                    }
+                };
+
+                if last_signature.as_deref() == Some(signature.as_str()) {
+                    continue;
+                }
+
+                let payload = match serde_json::to_string(&list) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        tracing::warn!(?error, "session stream serialization failed");
+                        continue;
+                    }
+                };
+
+                if sender.send(Message::Text(payload.into())).await.is_err() {
+                    break;
+                }
+
+                last_signature = Some(signature);
+            }
+            message = receiver.next() => match message {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(error)) => {
+                    tracing::debug!(?error, "session stream receive failed");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn session_list_signature(list: &cow_watch_core::SessionList) -> Result<String> {
+    Ok(serde_json::to_string(&(&list.overview, &list.sessions))?)
 }
