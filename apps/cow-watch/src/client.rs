@@ -46,6 +46,7 @@ pub trait MonitorClient: Send + Sync {
             let _ = progress.send(SessionLoadProgress {
                 loaded_sessions: list.sessions.len(),
                 total_sessions: list.overview.total_sessions,
+                sources: Vec::new(),
             });
         }
         Ok(list)
@@ -197,7 +198,7 @@ impl RemoteMonitorClient {
     }
 
     fn session_endpoint(&self, id: &str, suffix: Option<&str>) -> Result<reqwest::Url> {
-        let mut url = self.base_url.join("api/sessions/")?;
+        let mut url = self.base_url.join("api/sessions")?;
         {
             let mut segments = url
                 .path_segments_mut()
@@ -409,7 +410,7 @@ impl MonitorClient for MultiMonitorClient {
         let mut quotas = Vec::new();
         let mut total_sessions = 0usize;
         let mut join_set = JoinSet::new();
-        let progress_state = Arc::new(Mutex::new(HashMap::<String, SessionLoadProgress>::new()));
+        let progress_state = Arc::new(Mutex::new(HashMap::<String, (usize, usize)>::new()));
 
         for client in &self.clients {
             let client = client.clone();
@@ -417,22 +418,30 @@ impl MonitorClient for MultiMonitorClient {
             let progress_tx = progress.clone();
             let progress_state = progress_state.clone();
             let namespace = client.namespace.clone();
-            let (client_progress_tx, mut client_progress_rx) = unbounded_channel();
+            let (client_progress_tx, mut client_progress_rx) =
+                unbounded_channel::<SessionLoadProgress>();
             if let Some(progress_tx) = progress_tx {
                 tokio::spawn(async move {
                     while let Some(update) = client_progress_rx.recv().await {
                         let aggregate = {
                             let mut state = progress_state.lock().expect("lock poisoned");
-                            state.insert(namespace.clone(), update);
+                            state.insert(
+                                namespace.clone(),
+                                (update.loaded_sessions, update.total_sessions),
+                            );
                             SessionLoadProgress {
-                                loaded_sessions: state
-                                    .values()
-                                    .map(|item| item.loaded_sessions)
-                                    .sum(),
-                                total_sessions: state
-                                    .values()
-                                    .map(|item| item.total_sessions)
-                                    .sum(),
+                                loaded_sessions: state.values().map(|(loaded, _)| *loaded).sum(),
+                                total_sessions: state.values().map(|(_, total)| *total).sum(),
+                                sources: state
+                                    .iter()
+                                    .map(|(source, (loaded_sessions, total_sessions))| {
+                                        cow_watch_core::SessionLoadSourceProgress {
+                                            source: source.clone(),
+                                            loaded_sessions: *loaded_sessions,
+                                            total_sessions: *total_sessions,
+                                        }
+                                    })
+                                    .collect(),
                             }
                         };
                         let _ = progress_tx.send(aggregate);
@@ -474,6 +483,7 @@ impl MonitorClient for MultiMonitorClient {
             let _ = progress.send(SessionLoadProgress {
                 loaded_sessions: list.sessions.len(),
                 total_sessions: list.overview.total_sessions,
+                sources: Vec::new(),
             });
         }
 

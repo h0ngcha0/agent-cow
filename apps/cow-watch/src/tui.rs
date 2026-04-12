@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, Stdout},
     sync::Arc,
     time::{Duration, Instant},
@@ -460,6 +461,7 @@ struct TuiApp {
     loading_more: bool,
     loading_progress_loaded: usize,
     loading_progress_total: usize,
+    loading_progress_sources: HashMap<String, (usize, usize)>,
     error: Option<String>,
     notice: Option<UiNotice>,
     filter_input: String,
@@ -506,6 +508,7 @@ impl TuiApp {
             loading_more: false,
             loading_progress_loaded: 0,
             loading_progress_total: 0,
+            loading_progress_sources: HashMap::new(),
             error: None,
             notice: None,
             filter_input: String::new(),
@@ -574,6 +577,18 @@ impl TuiApp {
     fn apply_load_progress(&mut self, progress: SessionLoadProgress) {
         self.loading_progress_loaded = self.loading_progress_loaded.max(progress.loaded_sessions);
         self.loading_progress_total = self.loading_progress_total.max(progress.total_sessions);
+        if !progress.sources.is_empty() {
+            self.loading_progress_sources = progress
+                .sources
+                .into_iter()
+                .map(|source| {
+                    (
+                        source.source,
+                        (source.loaded_sessions, source.total_sessions),
+                    )
+                })
+                .collect();
+        }
     }
 
     fn apply_live_update(&mut self, response: SessionList) {
@@ -766,6 +781,74 @@ impl TuiApp {
 
     fn scoped_session_count(&self) -> usize {
         self.scoped_sessions().count()
+    }
+
+    fn namespace_machine_labels(&self) -> HashMap<&str, &str> {
+        let mut labels = HashMap::new();
+        for session in &self.sessions {
+            if let Some((namespace, _)) = session.id.split_once('|') {
+                labels
+                    .entry(namespace)
+                    .or_insert(session.machine_label.as_str());
+            }
+        }
+        labels
+    }
+
+    fn scoped_loading_progress(&self) -> Option<(usize, usize)> {
+        let scope = self.machine_scope.as_deref()?;
+        let namespace_labels = self.namespace_machine_labels();
+        let mut loaded_sessions = 0usize;
+        let mut total_sessions = 0usize;
+        let mut found = false;
+
+        for (namespace, (loaded, total)) in &self.loading_progress_sources {
+            if namespace_labels.get(namespace.as_str()).copied() == Some(scope) {
+                loaded_sessions += *loaded;
+                total_sessions += *total;
+                found = true;
+            }
+        }
+
+        found.then(|| {
+            let current = self.scoped_session_count();
+            (loaded_sessions.max(current), total_sessions.max(current))
+        })
+    }
+
+    fn active_loading_progress(&self) -> Option<(usize, usize)> {
+        if !self.loading_more {
+            return None;
+        }
+
+        if let Some((loaded_sessions, total_sessions)) = self.scoped_loading_progress() {
+            return (loaded_sessions < total_sessions).then_some((loaded_sessions, total_sessions));
+        }
+
+        if self.machine_scope.is_some() {
+            return None;
+        }
+
+        let total_sessions = self
+            .loading_progress_total
+            .max(self.overview.total_sessions)
+            .max(self.sessions.len());
+        let loaded_sessions = self.loading_progress_loaded.max(self.sessions.len());
+        (loaded_sessions < total_sessions).then_some((loaded_sessions, total_sessions))
+    }
+
+    fn scoped_total_sessions_for_display(&self) -> usize {
+        if let Some((_, total_sessions)) = self.scoped_loading_progress() {
+            return total_sessions;
+        }
+
+        if self.machine_scope.is_some() {
+            return self.scoped_session_count();
+        }
+
+        self.loading_progress_total
+            .max(self.overview.total_sessions)
+            .max(self.sessions.len())
     }
 
     fn visible_total_tokens(&self) -> u64 {
@@ -1079,7 +1162,7 @@ fn detail_content_height(area: Rect) -> u16 {
 }
 
 fn detail_content_width(area: Rect) -> u16 {
-    area.width.saturating_sub(2).max(1)
+    area.width.saturating_sub(4).max(1)
 }
 
 fn draw_loading(frame: &mut Frame, progress: &SessionLoadProgress) {
@@ -1574,17 +1657,8 @@ fn loading_dots_field() -> String {
 }
 
 fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    let total_sessions = app
-        .loading_progress_total
-        .max(app.overview.total_sessions)
-        .max(app.sessions.len());
-    let scanned_sessions = app.loading_progress_loaded.max(app.sessions.len());
     let visible_sessions = app.filtered_indices.len();
-    let scoped_total_sessions = if app.machine_scope.is_some() {
-        app.scoped_session_count()
-    } else {
-        total_sessions
-    };
+    let scoped_total_sessions = app.scoped_total_sessions_for_display();
     let sessions_value = if app.filter_input.is_empty() && visible_sessions == scoped_total_sessions
     {
         scoped_total_sessions.to_string()
@@ -1595,10 +1669,10 @@ fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
         header_meta_line("Machine", app.visible_host_label()),
         header_meta_line("Sessions", sessions_value),
     ];
-    if app.loading_more && app.machine_scope.is_none() {
+    if let Some((loaded_sessions, total_sessions)) = app.active_loading_progress() {
         lines.push(header_meta_line(
             "Scanning",
-            format!("{}/{}", scanned_sessions, total_sessions),
+            format!("{}/{}", loaded_sessions, total_sessions),
         ));
     }
     lines.extend([
@@ -2366,19 +2440,25 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         });
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let padded_inner = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
 
     match app.detail_pane {
         DetailPane::Describe => {
             let lines = detail_lines(detail);
-            let max_scroll = wrapped_line_count(&lines, inner.width.max(1))
-                .saturating_sub(inner.height.max(1) as usize)
+            let max_scroll = wrapped_line_count(&lines, padded_inner.width.max(1))
+                .saturating_sub(padded_inner.height.max(1) as usize)
                 .min(u16::MAX as usize) as u16;
             app.detail_scroll = app.detail_scroll.min(max_scroll);
             frame.render_widget(
                 Paragraph::new(Text::from(lines))
                     .scroll((app.detail_scroll, 0))
                     .wrap(Wrap { trim: true }),
-                inner,
+                padded_inner,
             );
         }
         DetailPane::Follow => {
@@ -2387,9 +2467,10 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
             let sections = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(status_height)])
-                .split(inner);
-            let lines = follow_lines(detail, sections[0].width.max(1));
-            let max_scroll = wrapped_line_count(&lines, sections[0].width.max(1))
+                .split(padded_inner);
+            let content_width = sections[0].width.max(1);
+            let lines = follow_lines(detail, content_width);
+            let max_scroll = wrapped_line_count(&lines, content_width)
                 .saturating_sub(sections[0].height.max(1) as usize)
                 .min(u16::MAX as usize) as u16;
             if app.follow_stick_to_bottom {
@@ -2470,7 +2551,7 @@ fn render_detail_loading(frame: &mut Frame, area: Rect, pane: DetailPane) {
     frame.render_widget(render_brand_cluster(brand_width), brand_row[1]);
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            format!("{loading_label}{}", loading_dots()),
+            format!("{loading_label}{}", loading_dots_field()),
             Style::default()
                 .fg(accent_cyan())
                 .add_modifier(Modifier::BOLD),
@@ -2495,8 +2576,8 @@ fn detail_pane_title(pane: DetailPane) -> &'static str {
     }
 }
 
-fn render_footer(app: &TuiApp) -> Paragraph<'static> {
-    let line = if let Some(notice) = &app.notice {
+fn footer_line(app: &TuiApp) -> Line<'static> {
+    if let Some(notice) = &app.notice {
         Line::from(Span::styled(
             notice.message.clone(),
             Style::default().fg(if notice.is_error {
@@ -2518,12 +2599,7 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
                 Style::default().fg(accent_gold()),
             ),
         ])
-    } else if app.loading_more {
-        let total_sessions = app
-            .loading_progress_total
-            .max(app.overview.total_sessions)
-            .max(app.sessions.len());
-        let scanned_sessions = app.loading_progress_loaded.max(app.sessions.len());
+    } else if let Some((loaded_sessions, total_sessions)) = app.active_loading_progress() {
         Line::from(vec![
             Span::styled(
                 "Scanning sessions",
@@ -2535,7 +2611,7 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
             Span::styled(
                 format!(
                     " {} of {}  •  showing {}",
-                    scanned_sessions,
+                    loaded_sessions,
                     total_sessions,
                     app.filtered_indices.len()
                 ),
@@ -2552,8 +2628,11 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
         ])
     } else {
         Line::from("")
-    };
+    }
+}
 
+fn render_footer(app: &TuiApp) -> Paragraph<'static> {
+    let line = footer_line(app);
     Paragraph::new(Text::from(vec![line]))
 }
 
@@ -3761,18 +3840,54 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ListRefreshKind, TuiApp, animated_cow_lines, brand_cluster_lines, header_meta_lines,
+        ListRefreshKind, TuiApp, animated_cow_lines, brand_cluster_lines, footer_line,
+        header_meta_lines,
     };
     use chrono::{TimeZone, Utc};
-    use cow_watch_core::{SessionList, SessionLoadProgress, UsageOverview};
+    use cow_watch_core::{
+        ProviderKind, SessionActivityState, SessionList, SessionLoadProgress, SessionStatus,
+        SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, UsageOverview,
+    };
     use ratatui::text::Line;
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     fn flatten_line(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn fixture_session(id: &str, machine_label: &str) -> SessionSummary {
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 10, 0, 0).unwrap();
+        SessionSummary {
+            id: id.to_string(),
+            machine_id: machine_label.to_string(),
+            machine_label: machine_label.to_string(),
+            provider: ProviderKind::Codex,
+            title: "session".to_string(),
+            cwd: "/tmp".to_string(),
+            created_at: now,
+            updated_at: now,
+            run_started_at: None,
+            run_active: false,
+            archived: false,
+            model: Some("gpt-5.4".to_string()),
+            agent_role: None,
+            git_branch: None,
+            git_origin_url: None,
+            tokens: TokenUsage::default(),
+            cost: None,
+            context_window: None,
+            status: SessionStatus {
+                kind: SessionStatusKind::Stale,
+                reason: "stale".to_string(),
+                confidence: StatusConfidence::Inferred,
+            },
+            activity_state: SessionActivityState::Idle,
+            rollout_path: None,
+            navigation: Vec::new(),
+        }
     }
 
     #[test]
@@ -3834,12 +3949,14 @@ mod tests {
         app.apply_load_progress(SessionLoadProgress {
             loaded_sessions: 0,
             total_sessions: 377,
+            sources: Vec::new(),
         });
         assert_eq!(app.loading_progress_loaded, 64);
 
         app.apply_load_progress(SessionLoadProgress {
             loaded_sessions: 72,
             total_sessions: 377,
+            sources: Vec::new(),
         });
         assert_eq!(app.loading_progress_loaded, 72);
     }
@@ -3880,5 +3997,32 @@ mod tests {
         );
 
         assert_eq!(app.loading_progress_loaded, 145);
+    }
+
+    #[test]
+    fn machine_scope_uses_scoped_loading_progress_in_header_and_footer() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.sessions = vec![
+            fixture_session("local|codex:1", "local"),
+            fixture_session("remote1|codex:2", "host2"),
+        ];
+        app.machine_scope = Some("host2".to_string());
+        app.loading_more = true;
+        app.loading_progress_sources = HashMap::from([
+            ("local".to_string(), (296, 377)),
+            ("remote1".to_string(), (120, 377)),
+        ]);
+        app.rebuild_filter(None);
+
+        let header = header_meta_lines(&app)
+            .into_iter()
+            .map(|line| flatten_line(&line))
+            .collect::<Vec<_>>();
+        let footer_text = flatten_line(&footer_line(&app));
+
+        assert!(header.iter().any(|line| line.contains("1/377")));
+        assert!(header.iter().any(|line| line.contains("120/377")));
+        assert!(footer_text.contains("120 of 377"));
+        assert!(!footer_text.contains("754"));
     }
 }

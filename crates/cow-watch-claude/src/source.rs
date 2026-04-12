@@ -865,6 +865,7 @@ fn emit_session_progress(
         let _ = progress.send(SessionLoadProgress {
             loaded_sessions,
             total_sessions,
+            sources: Vec::new(),
         });
     }
 }

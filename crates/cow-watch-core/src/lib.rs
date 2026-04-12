@@ -8,5 +8,6 @@ pub use model::{
     TokenUsage, ToolCallStat, UsageOverview,
 };
 pub use service::{
-    CombinedSource, MonitorService, SessionLoadProgress, SessionQuery, SessionSource,
+    CombinedSource, MonitorService, SessionLoadProgress, SessionLoadSourceProgress, SessionQuery,
+    SessionSource,
 };
