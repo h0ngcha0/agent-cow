@@ -133,7 +133,7 @@ agent-cow tui
 Run a headless agent on each machine you want to observe:
 
 ```bash
-agent-cow agent --bind 0.0.0.0:8787
+HOSTNAME=remote-desktop agent-cow agent --bind 0.0.0.0:8787
 ```
 
 Then connect from your main TUI machine:

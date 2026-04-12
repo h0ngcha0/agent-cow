@@ -198,6 +198,14 @@ impl RemoteMonitorClient {
         })
     }
 
+    pub fn fallback_machine_label(&self) -> String {
+        self.base_url
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .unwrap_or("remote")
+            .to_string()
+    }
+
     fn endpoint(&self, path: &str) -> Result<reqwest::Url> {
         Ok(self.base_url.join(path)?)
     }
@@ -376,6 +384,7 @@ impl MonitorClient for RemoteMonitorClient {
 #[derive(Clone)]
 struct NamespacedClient {
     namespace: String,
+    fallback_machine_label: Option<String>,
     client: Arc<dyn MonitorClient>,
 }
 
@@ -391,9 +400,15 @@ impl MultiMonitorClient {
         }
     }
 
-    pub fn push_client(&mut self, namespace: impl Into<String>, client: Arc<dyn MonitorClient>) {
+    pub fn push_client(
+        &mut self,
+        namespace: impl Into<String>,
+        fallback_machine_label: Option<String>,
+        client: Arc<dyn MonitorClient>,
+    ) {
         self.clients.push(NamespacedClient {
             namespace: namespace.into(),
+            fallback_machine_label,
             client,
         });
     }
@@ -462,16 +477,16 @@ impl MonitorClient for MultiMonitorClient {
                     .client
                     .list_sessions_with_progress(query, Some(client_progress_tx))
                     .await?;
-                Ok::<_, anyhow::Error>((client.namespace, list))
+                Ok::<_, anyhow::Error>((client.namespace, client.fallback_machine_label, list))
             });
         }
 
         while let Some(result) = join_set.join_next().await {
-            let (namespace, mut list) = result??;
+            let (namespace, fallback_machine_label, mut list) = result??;
             total_sessions += list.overview.total_sessions;
             quotas.append(&mut list.overview.quotas);
             for mut session in list.sessions {
-                namespace_summary(&namespace, &mut session);
+                namespace_summary(&namespace, fallback_machine_label.as_deref(), &mut session);
                 sessions.push(session);
             }
         }
@@ -510,7 +525,11 @@ impl MonitorClient for MultiMonitorClient {
             .ok_or_else(|| anyhow!("no monitor client registered for namespace `{namespace}`"))?;
 
         let mut detail = client.client.get_session(raw_id).await?;
-        namespace_summary(namespace, &mut detail.summary);
+        namespace_summary(
+            namespace,
+            client.fallback_machine_label.as_deref(),
+            &mut detail.summary,
+        );
         Ok(detail)
     }
 
@@ -541,7 +560,11 @@ impl MonitorClient for MultiMonitorClient {
                 .subscribe_sessions(query.clone(), refresh_every)
                 .await?
             {
-                subscriptions.push((client.namespace.clone(), receiver));
+                subscriptions.push((
+                    client.namespace.clone(),
+                    client.fallback_machine_label.clone(),
+                    receiver,
+                ));
             }
         }
 
@@ -553,11 +576,14 @@ impl MonitorClient for MultiMonitorClient {
         let (tx, rx) = unbounded_channel();
         let (update_tx, mut update_rx) = unbounded_channel();
 
-        for (namespace, mut receiver) in subscriptions {
+        for (namespace, fallback_machine_label, mut receiver) in subscriptions {
             let update_tx = update_tx.clone();
             tokio::spawn(async move {
                 while let Some(list) = receiver.recv().await {
-                    if update_tx.send((namespace.clone(), list)).is_err() {
+                    if update_tx
+                        .send((namespace.clone(), fallback_machine_label.clone(), list))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -566,10 +592,10 @@ impl MonitorClient for MultiMonitorClient {
         drop(update_tx);
 
         tokio::spawn(async move {
-            let mut latest_lists = HashMap::<String, SessionList>::new();
+            let mut latest_lists = HashMap::<String, (Option<String>, SessionList)>::new();
 
-            while let Some((namespace, list)) = update_rx.recv().await {
-                latest_lists.insert(namespace, list);
+            while let Some((namespace, fallback_machine_label, list)) = update_rx.recv().await {
+                latest_lists.insert(namespace, (fallback_machine_label, list));
                 if latest_lists.len() < expected_clients {
                     continue;
                 }
@@ -577,7 +603,9 @@ impl MonitorClient for MultiMonitorClient {
                 let combined = build_combined_session_list(
                     latest_lists
                         .iter()
-                        .map(|(namespace, list)| (namespace.as_str(), list)),
+                        .map(|(namespace, (fallback_machine_label, list))| {
+                            (namespace.as_str(), fallback_machine_label.as_deref(), list)
+                        }),
                     query.limit,
                 );
 
@@ -591,9 +619,27 @@ impl MonitorClient for MultiMonitorClient {
     }
 }
 
-fn namespace_summary(namespace: &str, summary: &mut SessionSummary) {
+fn namespace_summary(
+    namespace: &str,
+    fallback_machine_label: Option<&str>,
+    summary: &mut SessionSummary,
+) {
     if !summary.id.contains('|') {
         summary.id = format!("{namespace}|{}", summary.id);
+    }
+
+    if let Some(label) = fallback_machine_label {
+        let replace_label = summary.machine_label.trim().is_empty()
+            || summary.machine_label.eq_ignore_ascii_case("local");
+        if replace_label {
+            summary.machine_label = label.to_string();
+        }
+
+        let replace_id =
+            summary.machine_id.trim().is_empty() || summary.machine_id.eq_ignore_ascii_case("local");
+        if replace_id {
+            summary.machine_id = label.to_string();
+        }
     }
 }
 
@@ -625,18 +671,18 @@ fn build_combined_overview(
 }
 
 fn build_combined_session_list<'a>(
-    lists: impl Iterator<Item = (&'a str, &'a SessionList)>,
+    lists: impl Iterator<Item = (&'a str, Option<&'a str>, &'a SessionList)>,
     limit: Option<usize>,
 ) -> SessionList {
     let mut sessions = Vec::new();
     let mut quotas = Vec::new();
     let mut total_sessions = 0usize;
 
-    for (namespace, list) in lists {
+    for (namespace, fallback_machine_label, list) in lists {
         total_sessions += list.overview.total_sessions;
         quotas.extend(list.overview.quotas.clone());
         for mut session in list.sessions.clone() {
-            namespace_summary(namespace, &mut session);
+            namespace_summary(namespace, fallback_machine_label, &mut session);
             sessions.push(session);
         }
     }
@@ -655,4 +701,64 @@ fn build_combined_session_list<'a>(
 
 fn session_list_signature(list: &SessionList) -> Result<String> {
     Ok(serde_json::to_string(&(&list.overview, &list.sessions))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_cow_core::{
+        SessionActivityState, SessionCost, SessionStatus, SessionStatusKind, StatusConfidence,
+        TokenUsage,
+    };
+
+    fn fixture_summary(machine_id: &str, machine_label: &str) -> SessionSummary {
+        SessionSummary {
+            id: "codex:abc".to_string(),
+            provider: agent_cow_core::ProviderKind::Codex,
+            machine_id: machine_id.to_string(),
+            machine_label: machine_label.to_string(),
+            title: "test".to_string(),
+            cwd: "/tmp".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            run_started_at: None,
+            run_active: false,
+            status: SessionStatus {
+                kind: SessionStatusKind::Running,
+                confidence: StatusConfidence::Exact,
+                reason: String::new(),
+            },
+            activity_state: SessionActivityState::Thinking,
+            archived: false,
+            model: Some("gpt-5.4".to_string()),
+            agent_role: None,
+            git_branch: None,
+            git_origin_url: None,
+            tokens: TokenUsage {
+                total_tokens: 1,
+                ..TokenUsage::default()
+            },
+            cost: Some(SessionCost::default()),
+            context_window: None,
+            rollout_path: None,
+            navigation: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn remote_local_label_falls_back_to_machine_host() {
+        let mut summary = fixture_summary("local", "local");
+        namespace_summary("remote1", Some("192.168.1.10"), &mut summary);
+        assert_eq!(summary.machine_label, "192.168.1.10");
+        assert_eq!(summary.machine_id, "192.168.1.10");
+        assert_eq!(summary.id, "remote1|codex:abc");
+    }
+
+    #[test]
+    fn explicit_remote_machine_label_is_preserved() {
+        let mut summary = fixture_summary("buildbox", "buildbox");
+        namespace_summary("remote1", Some("192.168.1.10"), &mut summary);
+        assert_eq!(summary.machine_label, "buildbox");
+        assert_eq!(summary.machine_id, "buildbox");
+    }
 }

@@ -185,13 +185,16 @@ fn build_monitor_client(
     if !options.no_local
         && let Some(local_service) = local_service
     {
-        client.push_client("local", Arc::new(LocalMonitorClient::new(local_service)));
+        client.push_client("local", None, Arc::new(LocalMonitorClient::new(local_service)));
     }
 
     for (index, machine) in options.machines.iter().enumerate() {
+        let remote = RemoteMonitorClient::new(machine)?;
+        let fallback_machine_label = Some(remote.fallback_machine_label());
         client.push_client(
             format!("remote{}", index + 1),
-            Arc::new(RemoteMonitorClient::new(machine)?),
+            fallback_machine_label,
+            Arc::new(remote),
         );
     }
 
