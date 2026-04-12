@@ -165,6 +165,9 @@ fn open_uri(target: &str) -> Result<()> {
 }
 
 fn activate_provider_app(provider: ProviderKind) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = provider;
+
     #[cfg(target_os = "macos")]
     {
         let app_name = match provider {
@@ -187,6 +190,9 @@ fn activate_provider_app(provider: ProviderKind) -> Result<()> {
 }
 
 fn open_with_system(target: &str, reveal_file: bool) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = reveal_file;
+
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("open");
