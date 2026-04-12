@@ -3,9 +3,10 @@
 > **Agent Cow: the philosophical watcher of your agents.**
 
 ```text
- ______________________
-< Agent 3 is stuck... >
- ----------------------
+ ________________________________________________
+< Agent Cow: the philosophical watcher of your >
+< agents.                                       >
+ ------------------------------------------------
         \   ^__^
          \  (oo)\_______
             (__)\       )\/\
@@ -65,7 +66,41 @@ Release assets are published for:
 - Linux x86_64
 - Windows x86_64
 
-Then unpack the archive for your platform and run:
+### Install with one command
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/h0ngcha0/agent-cow/main/install.sh | sh
+```
+
+or:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/h0ngcha0/agent-cow/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/h0ngcha0/agent-cow/main/install.ps1 | iex
+```
+
+The installer:
+
+- detects your platform and architecture
+- downloads the matching release asset
+- installs `agent-cow` into `~/.local/bin` on macOS/Linux by default
+- installs `agent-cow.exe` into `%LOCALAPPDATA%\\Programs\\agent-cow\\bin` on Windows by default
+
+You can override the version or install directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/h0ngcha0/agent-cow/main/install.sh | \
+  AGENT_COW_VERSION=v0.0.1 AGENT_COW_INSTALL_DIR="$HOME/bin" sh
+```
+
+If you prefer to do it manually, unpack the archive for your platform and run:
 
 ```bash
 agent-cow tui
@@ -85,18 +120,11 @@ If you want to build it yourself:
 cargo build --release --manifest-path apps/agent-cow/Cargo.toml
 ```
 
-The binary will be at:
+Then run the built binary at:
 
 ```text
 target/release/agent-cow
 ```
-
-## Current Shape
-
-- **TUI mode**: local all-in-one experience
-- **Agent mode**: headless remote node for another TUI to connect to
-- **Adapters today**: Codex and Claude
-- **Adapters later**: whatever else is worth watching
 
 ## Quick Start
 
@@ -105,8 +133,6 @@ Using the built or downloaded binary:
 ```bash
 agent-cow tui
 ```
-
-If you are running directly from the repo without building first, use `cargo run -- ...` instead.
 
 ### Run the TUI locally
 
@@ -158,44 +184,23 @@ agent-cow tui --no-local --machine http://100.x.y.z:8787
 
 Agent Cow works well over:
 
+- Localhost
 - Tailscale
 - internal LAN IPs
-- localhost for testing
 
-## Release Binaries
+## Keyboard Shortcuts
 
-GitHub Actions publishes release archives automatically when you push a version tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-That workflow first runs formatting, clippy, and tests, then builds and uploads platform binaries to the matching GitHub Release.
-
-If you are running straight from the repo instead of an installed binary, prepend `cargo run --` to the same commands.
-
-## TUI Basics
-
-Main keys:
-
-- `j/k`: move
-- `enter`: details
-- `f`: latest conversation
-- `o`: open session in the provider app
-- `m`: cycle machine scope
-- `/`: filter
-- `r`: refresh
-- `q`: quit
-
-The top header shows:
-
-- machine scope
-- session count
-- live scanning progress
-- total spend
-- total tokens
-- provider quota/subscription summaries
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Move through sessions |
+| `Enter` | Open details |
+| `Esc` | Go back |
+| `f` | Open latest conversation |
+| `o` | Open the session in the provider app |
+| `m` | Cycle machine scope |
+| `/` | Filter sessions |
+| `r` | Refresh |
+| `q` | Quit |
 
 ## Why Agent Cow Exists
 
@@ -210,39 +215,6 @@ You should be able to glance at a machine and know:
 - which one is quietly burning money
 
 That is the whole point.
-
-## Architecture
-
-```mermaid
-flowchart LR
-  subgraph "Machine A"
-    TUI["agent-cow tui"]
-    LOCAL["local monitor"]
-    TUI --> LOCAL
-  end
-
-  subgraph "Machine B"
-    AGENT1["agent-cow agent"]
-  end
-
-  subgraph "Machine C"
-    AGENT2["agent-cow agent"]
-  end
-
-  TUI -->|"HTTP + websocket"| AGENT1
-  TUI -->|"HTTP + websocket"| AGENT2
-```
-
-High level:
-
-- `agent-cow-core`: shared model + monitor service
-- `agent-cow-codex`: Codex adapter
-- `agent-cow-claude`: Claude adapter
-- `apps/agent-cow`: CLI, TUI, headless agent
-
-The TUI is a client. It is not the center of the system.
-
-That split is deliberate: adding another provider should mostly mean adding another adapter crate, not rewriting the app.
 
 ## Environment
 
@@ -266,14 +238,6 @@ Agent Cow is designed to stay cheap:
 - fast failure for slow remote machines
 
 If performance is bad, that is a bug.
-
-## Status
-
-Open-source, actively evolving, and intentionally biased toward:
-
-- fast terminal workflows
-- local ownership of your data
-- practical observability over pretty screenshots
 
 ## License
 
