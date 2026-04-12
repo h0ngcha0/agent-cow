@@ -128,32 +128,6 @@ Using the built or downloaded binary:
 agent-cow tui
 ```
 
-### Run the TUI locally
-
-```bash
-agent-cow tui
-```
-
-Or with a faster refresh:
-
-```bash
-agent-cow tui --refresh-secs 1
-```
-
-### Inspect sessions from the CLI
-
-```bash
-agent-cow sessions list --limit 20
-```
-
-```bash
-agent-cow sessions latest --json
-```
-
-```bash
-agent-cow sessions show <session-id> --json
-```
-
 ## Multi-Machine Setup
 
 Run a headless agent on each machine you want to observe:
@@ -228,7 +202,6 @@ Agent Cow is designed to stay cheap:
 - staged startup loading
 - persistent caches
 - websocket subscriptions for remote updates
-- local-first parsing instead of heavy centralized polling
 - fast failure for slow remote machines
 
 If performance is bad, that is a bug.
