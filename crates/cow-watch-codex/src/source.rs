@@ -841,64 +841,42 @@ fn derive_activity_state(
     }
 
     let recent_window = activity_recent_window(status, hint);
-    let status_is_active = matches!(
-        status.kind,
-        SessionStatusKind::Running | SessionStatusKind::ToolBusy
-    );
 
     let Some(hint) = hint else {
-        return if status_is_active && now - updated_at <= recent_window {
+        return if matches!(status.kind, SessionStatusKind::ToolBusy)
+            && now - updated_at <= recent_window
+        {
             SessionActivityState::Thinking
         } else {
             SessionActivityState::Idle
         };
     };
 
-    let has_live_signal = status_is_active
-        || hint.run_active
-        || hint.active_turns > 0
-        || !hint.pending_call_ids.is_empty();
+    let has_live_signal =
+        hint.run_active || hint.active_turns > 0 || !hint.pending_call_ids.is_empty();
     if !has_live_signal {
         return SessionActivityState::Idle;
     }
 
-    let has_recent_feedback = now - updated_at <= recent_window
-        || hint
-            .recent_events
-            .iter()
-            .rev()
-            .find(|event| !matches!(event.kind, ActivityKind::User))
-            .is_some_and(|event| now - event.timestamp <= recent_window);
+    let latest_feedback = latest_recent_non_user_event(&hint.recent_events, now, recent_window);
+    let Some(latest_feedback) = latest_feedback else {
+        return if now - updated_at <= recent_window {
+            SessionActivityState::Thinking
+        } else {
+            SessionActivityState::Idle
+        };
+    };
 
-    if !has_recent_feedback {
-        return SessionActivityState::Idle;
-    }
-
-    if hint
-        .context_window
-        .as_ref()
-        .is_some_and(|context| context.used_percent >= 100)
+    if is_compaction_event(latest_feedback)
         && hint.recent_compaction_at.is_some_and(|timestamp| {
             now - timestamp <= Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS)
         })
-        && hint
-            .recent_events
-            .iter()
-            .rev()
-            .find(|event| !matches!(event.kind, ActivityKind::User))
-            .is_some_and(is_compaction_event)
     {
         return SessionActivityState::Compacting;
     }
 
-    if hint
-        .recent_events
-        .iter()
-        .rev()
-        .find(|event| matches!(event.kind, ActivityKind::ToolCall))
-        .is_some_and(|event| {
-            now - event.timestamp <= recent_window && is_exploration_tool(&event.summary)
-        })
+    if matches!(latest_feedback.kind, ActivityKind::ToolCall)
+        && is_exploration_tool(&latest_feedback.summary)
     {
         return SessionActivityState::Exploring;
     }
@@ -918,6 +896,16 @@ fn activity_recent_window(status: &SessionStatus, hint: Option<&RolloutHint>) ->
 
 fn is_compaction_event(event: &ActivityEvent) -> bool {
     matches!(event.kind, ActivityKind::System) && event.summary == "Context compacted"
+}
+
+fn latest_recent_non_user_event(
+    events: &[ActivityEvent],
+    now: DateTime<Utc>,
+    recent_window: Duration,
+) -> Option<&ActivityEvent> {
+    events.iter().rev().find(|event| {
+        !matches!(event.kind, ActivityKind::User) && now - event.timestamp <= recent_window
+    })
 }
 
 fn is_exploration_tool(summary: &str) -> bool {
@@ -3170,7 +3158,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_activity_state_keeps_recent_running_sessions_thinking() {
+    fn derive_activity_state_requires_explicit_live_signal_for_running() {
         let now = Utc::now();
         let status = SessionStatus {
             kind: SessionStatusKind::Running,
@@ -3181,7 +3169,7 @@ mod tests {
         let activity =
             derive_activity_state(&status, None, now - chrono::Duration::seconds(20), now);
 
-        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(activity, SessionActivityState::Idle);
         assert_eq!(
             activity_recent_window(&status, None),
             chrono::Duration::seconds(super::ACTIVITY_WINDOW_SECONDS)
@@ -3213,6 +3201,33 @@ mod tests {
             activity_recent_window(&status, Some(&hint)),
             chrono::Duration::seconds(super::TOOL_BUSY_ACTIVITY_WINDOW_SECONDS)
         );
+    }
+
+    #[test]
+    fn derive_activity_state_does_not_think_from_running_ttl_alone() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running ttl".to_string(),
+        };
+        let hint = RolloutHint {
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(5),
+                kind: ActivityKind::Assistant,
+                summary: "Working on it".to_string(),
+            }],
+            ..RolloutHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            Some(&hint),
+            now - chrono::Duration::seconds(5),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Idle);
     }
 
     #[test]
@@ -3306,6 +3321,42 @@ mod tests {
             now,
         );
         assert_eq!(thinking, SessionActivityState::Thinking);
+    }
+
+    #[test]
+    fn derive_activity_state_stops_exploring_after_tool_result() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let hint = RolloutHint {
+            run_active: true,
+            active_turns: 1,
+            recent_events: vec![
+                ActivityEvent {
+                    timestamp: now - chrono::Duration::seconds(3),
+                    kind: ActivityKind::ToolCall,
+                    summary: "exec_command  rg -n foo src  in ~/repo".to_string(),
+                },
+                ActivityEvent {
+                    timestamp: now - chrono::Duration::seconds(1),
+                    kind: ActivityKind::ToolResult,
+                    summary: "Finished `exec_command`".to_string(),
+                },
+            ],
+            ..RolloutHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            Some(&hint),
+            now - chrono::Duration::seconds(1),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Thinking);
     }
 
     #[test]

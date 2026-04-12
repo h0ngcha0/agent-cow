@@ -40,7 +40,8 @@ const CLAUDE_DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 const CLAUDE_TIERED_THRESHOLD_TOKENS: u64 = 200_000;
 const SESSION_DISCOVERY_CACHE_TTL: StdDuration = StdDuration::from_secs(15);
 const SESSION_DISCOVERY_DISK_CACHE_TTL: StdDuration = StdDuration::from_secs(90);
-const CLAUDE_STATUS_CACHE_TTL: StdDuration = StdDuration::from_secs(5 * 60);
+const CLAUDE_STATUS_CACHE_TTL: StdDuration = StdDuration::from_secs(15 * 60);
+const CLAUDE_STATUS_FAILURE_BACKOFF: StdDuration = StdDuration::from_secs(30 * 60);
 const CLAUDE_STATUS_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const CLAUDE_STATUS_PYTHON_PROBE: &str = r#"
 import json, os, select, subprocess, time
@@ -371,12 +372,15 @@ struct SessionsCache {
 #[derive(Clone, Debug)]
 struct ClaudeStatusCache {
     fetched_at_epoch_ms: i64,
+    last_attempt_epoch_ms: i64,
     quota: ProviderQuota,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClaudeStatusCacheFile {
     fetched_at_epoch_ms: i64,
+    #[serde(default)]
+    last_attempt_epoch_ms: i64,
     quota: ProviderQuota,
 }
 
@@ -511,6 +515,13 @@ impl ClaudeSource {
             return merge_claude_quota(fallback, Some(cache.quota.clone()));
         }
 
+        if cached
+            .as_ref()
+            .is_some_and(|cache| is_status_probe_in_backoff(cache.last_attempt_epoch_ms))
+        {
+            return merge_claude_quota(fallback, cached.map(|cache| cache.quota));
+        }
+
         if self
             .status_refresh_in_flight
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -519,7 +530,10 @@ impl ClaudeSource {
             let claude_home = self.claude_home.clone();
             let status_cache = self.status_cache.clone();
             let refresh_flag = self.status_refresh_in_flight.clone();
+            let previous_cache = cached.clone();
+            let fallback_for_refresh = fallback.clone();
             thread::spawn(move || {
+                let attempted_at = now_epoch_millis();
                 let probed = match probe_claude_status_quota(&claude_home) {
                     Ok(quota) => quota,
                     Err(error) => {
@@ -527,13 +541,29 @@ impl ClaudeSource {
                         None
                     }
                 };
-                if let Some(quota) = probed
-                    && !quota.windows.is_empty()
-                {
-                    let cache = ClaudeStatusCache {
-                        fetched_at_epoch_ms: now_epoch_millis(),
+                let cache = if let Some(quota) = probed.filter(|quota| !quota.windows.is_empty()) {
+                    Some(ClaudeStatusCache {
+                        fetched_at_epoch_ms: attempted_at,
+                        last_attempt_epoch_ms: attempted_at,
                         quota: normalize_claude_quota_labels(quota),
-                    };
+                    })
+                } else {
+                    previous_cache
+                        .clone()
+                        .or_else(|| {
+                            fallback_for_refresh.clone().map(|quota| ClaudeStatusCache {
+                                fetched_at_epoch_ms: 0,
+                                last_attempt_epoch_ms: attempted_at,
+                                quota: normalize_claude_quota_labels(quota),
+                            })
+                        })
+                        .map(|mut cache| {
+                            cache.last_attempt_epoch_ms = attempted_at;
+                            cache
+                        })
+                };
+
+                if let Some(cache) = cache {
                     *status_cache.lock().expect("lock poisoned") = Some(cache.clone());
                     let _ = store_status_cache_to_disk(&cache);
                 }
@@ -965,7 +995,7 @@ fn derive_activity_state(
     status: &SessionStatus,
     hint: &TranscriptHint,
     _context_window: Option<&ContextWindowUsage>,
-    updated_at: DateTime<Utc>,
+    _updated_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> SessionActivityState {
     if matches!(status.kind, SessionStatusKind::WaitingInput) {
@@ -990,30 +1020,23 @@ fn derive_activity_state(
         || hint
             .latest_thinking_at
             .is_some_and(|timestamp| now - timestamp <= recent_window);
-    if !has_live_signal && now - updated_at > recent_window {
+    if !has_live_signal {
         return SessionActivityState::Idle;
     }
 
-    if hint.recent_compaction_at.is_some_and(|timestamp| {
-        now - timestamp <= Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS)
-    }) && hint
-        .recent_events
-        .iter()
-        .rev()
-        .find(|event| !matches!(event.kind, ActivityKind::User))
-        .is_some_and(is_compaction_event)
+    let latest_feedback = latest_recent_non_user_event(&hint.recent_events, now, recent_window);
+
+    if latest_feedback.is_some_and(is_compaction_event)
+        && hint.recent_compaction_at.is_some_and(|timestamp| {
+            now - timestamp <= Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS)
+        })
     {
         return SessionActivityState::Compacting;
     }
 
-    if hint
-        .recent_events
-        .iter()
-        .rev()
-        .find(|event| matches!(event.kind, ActivityKind::ToolCall))
-        .is_some_and(|event| {
-            now - event.timestamp <= recent_window && is_exploration_tool(&event.summary)
-        })
+    if latest_feedback
+        .filter(|event| matches!(event.kind, ActivityKind::ToolCall))
+        .is_some_and(|event| is_exploration_tool(&event.summary))
     {
         return SessionActivityState::Exploring;
     }
@@ -1030,6 +1053,16 @@ fn derive_activity_state(
 
 fn is_compaction_event(event: &ActivityEvent) -> bool {
     matches!(event.kind, ActivityKind::System) && looks_like_compaction_signal(&event.summary)
+}
+
+fn latest_recent_non_user_event(
+    events: &[ActivityEvent],
+    now: DateTime<Utc>,
+    recent_window: Duration,
+) -> Option<&ActivityEvent> {
+    events.iter().rev().find(|event| {
+        !matches!(event.kind, ActivityKind::User) && now - event.timestamp <= recent_window
+    })
 }
 
 fn looks_like_compaction_signal(text: &str) -> bool {
@@ -3217,6 +3250,11 @@ fn load_status_cache_from_disk() -> Result<Option<ClaudeStatusCache>> {
         .with_context(|| format!("failed to parse status cache {}", path.display()))?;
     Ok(Some(ClaudeStatusCache {
         fetched_at_epoch_ms: parsed.fetched_at_epoch_ms,
+        last_attempt_epoch_ms: if parsed.last_attempt_epoch_ms != 0 {
+            parsed.last_attempt_epoch_ms
+        } else {
+            parsed.fetched_at_epoch_ms
+        },
         quota: normalize_claude_quota_labels(parsed.quota),
     }))
 }
@@ -3262,6 +3300,7 @@ fn store_status_cache_to_disk(cache: &ClaudeStatusCache) -> Result<()> {
 
     let payload = ClaudeStatusCacheFile {
         fetched_at_epoch_ms: cache.fetched_at_epoch_ms,
+        last_attempt_epoch_ms: cache.last_attempt_epoch_ms,
         quota: normalize_claude_quota_labels(cache.quota.clone()),
     };
     let raw = serde_json::to_string(&payload)
@@ -3378,6 +3417,11 @@ fn is_status_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     age_ms >= 0 && age_ms <= CLAUDE_STATUS_CACHE_TTL.as_millis() as i64
 }
 
+fn is_status_probe_in_backoff(last_attempt_epoch_ms: i64) -> bool {
+    let age_ms = now_epoch_millis().saturating_sub(last_attempt_epoch_ms);
+    age_ms >= 0 && age_ms <= CLAUDE_STATUS_FAILURE_BACKOFF.as_millis() as i64
+}
+
 fn is_sessions_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
     age_ms >= 0 && age_ms <= SESSION_DISCOVERY_CACHE_TTL.as_millis() as i64
@@ -3467,6 +3511,34 @@ mod tests {
     }
 
     #[test]
+    fn derive_activity_state_does_not_think_from_running_ttl_alone() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running ttl".to_string(),
+        };
+        let hint = TranscriptHint {
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(4),
+                kind: ActivityKind::Assistant,
+                summary: "Done".to_string(),
+            }],
+            ..TranscriptHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            &hint,
+            None,
+            now - chrono::Duration::seconds(4),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Idle);
+    }
+
+    #[test]
     fn derive_activity_state_compacts_only_while_signal_is_latest() {
         let now = Utc::now();
         let status = SessionStatus {
@@ -3520,6 +3592,43 @@ mod tests {
             now,
         );
         assert_eq!(thinking, SessionActivityState::Thinking);
+    }
+
+    #[test]
+    fn derive_activity_state_stops_exploring_after_later_feedback() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let hint = TranscriptHint {
+            run_active: true,
+            latest_thinking_at: Some(now - chrono::Duration::seconds(1)),
+            recent_events: vec![
+                ActivityEvent {
+                    timestamp: now - chrono::Duration::seconds(3),
+                    kind: ActivityKind::ToolCall,
+                    summary: "exec_command  rg -n foo src  in ~/repo".to_string(),
+                },
+                ActivityEvent {
+                    timestamp: now - chrono::Duration::seconds(1),
+                    kind: ActivityKind::System,
+                    summary: "thinking".to_string(),
+                },
+            ],
+            ..TranscriptHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            &hint,
+            None,
+            now - chrono::Duration::seconds(1),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Thinking);
     }
 
     #[test]
