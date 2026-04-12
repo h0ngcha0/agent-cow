@@ -1,15 +1,16 @@
 use std::{
     io::{self, Stdout},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use crate::open;
+use crate::client::MonitorClient;
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use cow_watch_core::{
-    ActivityEvent, ActivityKind, MonitorService, ProviderQuota, SessionActivityState,
-    SessionDetail, SessionList, SessionLoadProgress, SessionQuery, SessionStatusKind,
-    SessionSummary, TokenUsage, UsageOverview,
+    ActivityEvent, ActivityKind, ProviderQuota, SessionActivityState, SessionDetail, SessionList,
+    SessionLoadProgress, SessionQuery, SessionStatusKind, SessionSummary, TokenUsage,
+    UsageOverview,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -32,14 +33,18 @@ const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const UI_POLL_INTERVAL_BUSY: Duration = Duration::from_millis(100);
 const UI_POLL_INTERVAL_IDLE: Duration = Duration::from_millis(250);
 
-pub async fn run(service: MonitorService, limit: Option<usize>, refresh_secs: u64) -> Result<()> {
+pub async fn run(
+    client: Arc<dyn MonitorClient>,
+    limit: Option<usize>,
+    refresh_secs: u64,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, service, limit, refresh_secs).await;
+    let result = run_loop(&mut terminal, client, limit, refresh_secs).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -56,13 +61,13 @@ enum ListRefreshKind {
 }
 
 fn spawn_list_refresh(
-    service: MonitorService,
+    client: Arc<dyn MonitorClient>,
     limit: Option<usize>,
     kind: ListRefreshKind,
 ) -> ListRefreshTask {
     let (progress_tx, progress_rx) = unbounded_channel();
     let handle = tokio::spawn(async move {
-        let list = service
+        let list = client
             .list_sessions_with_progress(
                 SessionQuery {
                     include_archived: false,
@@ -81,7 +86,7 @@ fn spawn_list_refresh(
 
 fn queue_progressive_refresh(
     app: &mut TuiApp,
-    service: &MonitorService,
+    client: &Arc<dyn MonitorClient>,
     refresh: &mut Option<ListRefreshTask>,
 ) {
     let next_limit = app.next_progress_limit();
@@ -97,7 +102,7 @@ fn queue_progressive_refresh(
         .max(app.overview.total_sessions)
         .max(app.sessions.len());
     *refresh = Some(spawn_list_refresh(
-        service.clone(),
+        client.clone(),
         Some(next_limit),
         ListRefreshKind::Progressive,
     ));
@@ -109,18 +114,18 @@ struct ListRefreshTask {
 }
 
 fn spawn_detail_refresh(
-    service: MonitorService,
+    client: Arc<dyn MonitorClient>,
     session_id: String,
 ) -> JoinHandle<Result<(String, SessionDetail)>> {
     tokio::spawn(async move {
-        let detail = service.get_session(&session_id).await?;
+        let detail = client.get_session(&session_id).await?;
         Ok((session_id, detail))
     })
 }
 
 fn queue_detail_refresh(
     app: &mut TuiApp,
-    service: &MonitorService,
+    client: &Arc<dyn MonitorClient>,
     detail_refresh: &mut Option<JoinHandle<Result<(String, SessionDetail)>>>,
 ) {
     let Some(session_id) = app.selected_session_id().map(ToOwned::to_owned) else {
@@ -142,18 +147,18 @@ fn queue_detail_refresh(
     }
     app.detail_loading = true;
     app.detail_loading_session_id = Some(session_id.clone());
-    *detail_refresh = Some(spawn_detail_refresh(service.clone(), session_id));
+    *detail_refresh = Some(spawn_detail_refresh(client.clone(), session_id));
 }
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    service: MonitorService,
+    client: Arc<dyn MonitorClient>,
     limit: Option<usize>,
     refresh_secs: u64,
 ) -> Result<()> {
     let mut app = TuiApp::new(limit, Duration::from_secs(refresh_secs));
     let mut initial_load = spawn_list_refresh(
-        service.clone(),
+        client.clone(),
         Some(app.fast_limit()),
         ListRefreshKind::Fast,
     );
@@ -186,7 +191,7 @@ async fn run_loop(
     let mut detail_refresh: Option<JoinHandle<Result<(String, SessionDetail)>>> = None;
 
     if app.should_load_more() {
-        queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+        queue_progressive_refresh(&mut app, &client, &mut full_refresh);
     }
 
     loop {
@@ -201,7 +206,7 @@ async fn run_loop(
             let (kind, response) = fast_refresh.take().unwrap().handle.await??;
             app.apply_list_refresh(kind, response);
             if app.detail_mode {
-                queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                queue_detail_refresh(&mut app, &client, &mut detail_refresh);
             }
         }
 
@@ -216,10 +221,10 @@ async fn run_loop(
             let (kind, response) = full_refresh.take().unwrap().handle.await??;
             app.apply_list_refresh(kind, response);
             if kind == ListRefreshKind::Progressive && app.should_load_more() {
-                queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+                queue_progressive_refresh(&mut app, &client, &mut full_refresh);
             }
             if app.detail_mode {
-                queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                queue_detail_refresh(&mut app, &client, &mut detail_refresh);
             }
         }
 
@@ -300,21 +305,22 @@ async fn run_loop(
                     }
                     KeyCode::End | KeyCode::Char('G') => app.select_last(),
                     KeyCode::Char('/') if !app.detail_mode => app.begin_filter(),
+                    KeyCode::Char('m') if !app.detail_mode => app.cycle_machine_scope(),
                     KeyCode::Esc if app.detail_mode => app.close_detail_mode(),
                     KeyCode::Esc => app.clear_filter(),
                     KeyCode::Char('r') => {
                         if fast_refresh.is_none() && full_refresh.is_none() {
                             if app.should_load_more() {
-                                queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+                                queue_progressive_refresh(&mut app, &client, &mut full_refresh);
                             } else if app.should_run_full_refresh() {
                                 full_refresh = Some(spawn_list_refresh(
-                                    service.clone(),
+                                    client.clone(),
                                     app.requested_limit,
                                     ListRefreshKind::Full,
                                 ));
                             } else {
                                 fast_refresh = Some(spawn_list_refresh(
-                                    service.clone(),
+                                    client.clone(),
                                     Some(app.fast_limit()),
                                     ListRefreshKind::Fast,
                                 ));
@@ -324,7 +330,7 @@ async fn run_loop(
                     KeyCode::Enter if !app.detail_mode => {
                         let needs_refresh = app.open_detail_pane(DetailPane::Describe);
                         if needs_refresh {
-                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                            queue_detail_refresh(&mut app, &client, &mut detail_refresh);
                         }
                     }
                     KeyCode::Char('f') if app.detail_mode => {
@@ -334,30 +340,30 @@ async fn run_loop(
                         };
                         let needs_refresh = app.open_detail_pane(target);
                         if needs_refresh {
-                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                            queue_detail_refresh(&mut app, &client, &mut detail_refresh);
                         }
                     }
                     KeyCode::Char('f') => {
                         let needs_refresh = app.open_detail_pane(DetailPane::Follow);
                         if needs_refresh {
-                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                            queue_detail_refresh(&mut app, &client, &mut detail_refresh);
                         }
                     }
                     KeyCode::Char('d') if app.detail_mode => {
                         let needs_refresh = app.open_detail_pane(DetailPane::Describe);
                         if needs_refresh {
-                            queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                            queue_detail_refresh(&mut app, &client, &mut detail_refresh);
                         }
                     }
                     KeyCode::Enter => app.close_detail_mode(),
-                    KeyCode::Char('o') => app.open_selected_app(),
+                    KeyCode::Char('o') => app.open_selected_app(&client).await,
                     _ => {}
                 }
             }
 
             if app.selection_changed {
                 if app.detail_mode {
-                    queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+                    queue_detail_refresh(&mut app, &client, &mut detail_refresh);
                 }
                 app.selection_changed = false;
             }
@@ -368,16 +374,16 @@ async fn run_loop(
             && full_refresh.is_none()
         {
             if app.should_load_more() {
-                queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+                queue_progressive_refresh(&mut app, &client, &mut full_refresh);
             } else if app.should_run_full_refresh() {
                 full_refresh = Some(spawn_list_refresh(
-                    service.clone(),
+                    client.clone(),
                     app.requested_limit,
                     ListRefreshKind::Full,
                 ));
             } else {
                 fast_refresh = Some(spawn_list_refresh(
-                    service.clone(),
+                    client.clone(),
                     Some(app.fast_limit()),
                     ListRefreshKind::Fast,
                 ));
@@ -392,6 +398,7 @@ struct TuiApp {
     sessions: Vec<SessionSummary>,
     overview: UsageOverview,
     filtered_indices: Vec<usize>,
+    machine_scope: Option<String>,
     detail: Option<SessionDetail>,
     detail_loading: bool,
     detail_loading_session_id: Option<String>,
@@ -400,7 +407,6 @@ struct TuiApp {
     detail_pane: DetailPane,
     detail_scroll: u16,
     follow_stick_to_bottom: bool,
-    local_machine_id: String,
     requested_limit: Option<usize>,
     refresh_every: Duration,
     last_refresh: Instant,
@@ -438,6 +444,7 @@ impl TuiApp {
             sessions: Vec::new(),
             overview: UsageOverview::default(),
             filtered_indices: Vec::new(),
+            machine_scope: None,
             detail: None,
             detail_loading: false,
             detail_loading_session_id: None,
@@ -446,7 +453,6 @@ impl TuiApp {
             detail_pane: DetailPane::Describe,
             detail_scroll: 0,
             follow_stick_to_bottom: false,
-            local_machine_id: open::local_machine_id(),
             requested_limit: limit,
             refresh_every,
             last_refresh: now,
@@ -644,7 +650,11 @@ impl TuiApp {
             .sessions
             .iter()
             .enumerate()
-            .filter_map(|(index, session)| matches_text_filter(session, &filter).then_some(index))
+            .filter_map(|(index, session)| {
+                (matches_machine_scope(session, self.machine_scope.as_deref())
+                    && matches_text_filter(session, &filter))
+                .then_some(index)
+            })
             .collect();
 
         if self.filtered_indices.is_empty() {
@@ -695,6 +705,39 @@ impl TuiApp {
         self.filtered_indices
             .iter()
             .filter_map(|index| self.sessions.get(*index))
+    }
+
+    fn scoped_sessions(&self) -> impl Iterator<Item = &SessionSummary> {
+        self.sessions
+            .iter()
+            .filter(|session| matches_machine_scope(session, self.machine_scope.as_deref()))
+    }
+
+    fn scoped_session_count(&self) -> usize {
+        self.scoped_sessions().count()
+    }
+
+    fn visible_total_tokens(&self) -> u64 {
+        self.visible_sessions()
+            .map(|session| session.tokens.total_tokens)
+            .sum()
+    }
+
+    fn visible_total_cost_usd(&self) -> f64 {
+        self.visible_sessions()
+            .filter_map(|session| session.cost.as_ref().map(|cost| cost.total_usd))
+            .sum()
+    }
+
+    fn machine_labels(&self) -> Vec<String> {
+        let mut labels = self
+            .sessions
+            .iter()
+            .map(|session| session.machine_label.clone())
+            .collect::<Vec<_>>();
+        labels.sort();
+        labels.dedup();
+        labels
     }
 
     fn select_next(&mut self) {
@@ -766,8 +809,38 @@ impl TuiApp {
         self.selection_changed = true;
     }
 
-    fn open_selected_app(&mut self) {
-        let Some(summary) = self.selected_summary().cloned() else {
+    fn cycle_machine_scope(&mut self) {
+        let labels = self.machine_labels();
+        if labels.len() <= 1 {
+            self.notice = Some(UiNotice {
+                message: "Only one machine is available.".to_string(),
+                is_error: false,
+            });
+            return;
+        }
+
+        let selected_id = self.selected_session_id().map(ToOwned::to_owned);
+        self.machine_scope = match self.machine_scope.as_deref() {
+            None => labels.first().cloned(),
+            Some(current) => labels
+                .iter()
+                .position(|label| label == current)
+                .and_then(|index| labels.get(index + 1).cloned()),
+        };
+
+        self.rebuild_filter(selected_id.as_deref());
+        self.selection_changed = true;
+        self.notice = Some(UiNotice {
+            message: match self.machine_scope.as_deref() {
+                Some(scope) => format!("Machine scope: {scope}"),
+                None => "Machine scope: all".to_string(),
+            },
+            is_error: false,
+        });
+    }
+
+    async fn open_selected_app(&mut self, client: &Arc<dyn MonitorClient>) {
+        let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
             self.notice = Some(UiNotice {
                 message: "No session selected.".to_string(),
                 is_error: true,
@@ -775,18 +848,16 @@ impl TuiApp {
             return;
         };
 
-        self.notice = Some(
-            match open::open_session_app(&summary, &self.local_machine_id) {
-                Ok(action) => UiNotice {
-                    message: format!("Opened {}.", action.label),
-                    is_error: false,
-                },
-                Err(error) => UiNotice {
-                    message: error.to_string(),
-                    is_error: true,
-                },
+        self.notice = Some(match client.open_session_app(&session_id).await {
+            Ok(action) => UiNotice {
+                message: format!("Opened {}.", action.label),
+                is_error: false,
             },
-        );
+            Err(error) => UiNotice {
+                message: error.to_string(),
+                is_error: true,
+            },
+        });
     }
 
     fn open_detail_pane(&mut self, pane: DetailPane) -> bool {
@@ -863,12 +934,16 @@ impl TuiApp {
     }
 
     fn visible_host_label(&self) -> String {
-        aggregate_label(
-            self.visible_sessions()
-                .map(|session| session.machine_label.clone()),
-            "hosts",
-        )
-        .unwrap_or_else(|| "none".to_string())
+        if let Some(scope) = &self.machine_scope {
+            return scope.clone();
+        }
+
+        let labels = self.machine_labels();
+        match labels.as_slice() {
+            [] => "none".to_string(),
+            [single] => single.clone(),
+            _ => "All".to_string(),
+        }
     }
 
     fn detail_max_scroll(&self, frame_area: Rect) -> u16 {
@@ -1454,24 +1529,30 @@ fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .max(app.sessions.len());
     let scanned_sessions = app.loading_progress_loaded.max(app.sessions.len());
     let visible_sessions = app.filtered_indices.len();
-    let sessions_value = if app.filter_input.is_empty() && visible_sessions == total_sessions {
-        total_sessions.to_string()
+    let scoped_total_sessions = if app.machine_scope.is_some() {
+        app.scoped_session_count()
     } else {
-        format!("{visible_sessions}/{total_sessions}")
+        total_sessions
+    };
+    let sessions_value = if app.filter_input.is_empty() && visible_sessions == scoped_total_sessions
+    {
+        scoped_total_sessions.to_string()
+    } else {
+        format!("{visible_sessions}/{scoped_total_sessions}")
     };
     let mut lines = vec![
         header_meta_line("Machine", app.visible_host_label()),
         header_meta_line("Sessions", sessions_value),
     ];
-    if app.loading_more {
+    if app.loading_more && app.machine_scope.is_none() {
         lines.push(header_meta_line(
             "Scanning",
             format!("{}/{}", scanned_sessions, total_sessions),
         ));
     }
     lines.extend([
-        header_meta_line("Spend", format_usd_short(app.overview.total_cost_usd)),
-        header_meta_line("Tokens", format_tokens_short(app.overview.total_tokens)),
+        header_meta_line("Spend", format_usd_short(app.visible_total_cost_usd())),
+        header_meta_line("Tokens", format_tokens_short(app.visible_total_tokens())),
     ]);
     lines
 }
@@ -1528,7 +1609,10 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                 Some(action_item("/", "Filter", true)),
                 Some(action_item("r", "Refresh", true)),
             ),
-            (Some(action_item("q", "Quit", true)), None),
+            (
+                Some(action_item("m", "Machine", true)),
+                Some(action_item("q", "Quit", true)),
+            ),
         ]
     } else {
         vec![
@@ -1545,9 +1629,10 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                 Some(action_item("r", "Refresh", true)),
             ),
             (
+                Some(action_item("m", "Machine", true)),
                 Some(action_item("esc", "Clear", true)),
-                Some(action_item("q", "Quit", true)),
             ),
+            (Some(action_item("q", "Quit", true)), None),
         ]
     }
 }
@@ -3034,6 +3119,13 @@ fn matches_text_filter(session: &SessionSummary, filter: &str) -> bool {
     haystack.contains(filter)
 }
 
+fn matches_machine_scope(session: &SessionSummary, scope: Option<&str>) -> bool {
+    match scope {
+        Some(scope) => session.machine_label == scope,
+        None => true,
+    }
+}
+
 fn meta_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
         info_label(label),
@@ -3525,28 +3617,6 @@ fn format_context_window(context: &cow_watch_core::ContextWindowUsage) -> String
         format_tokens_short(context.remaining_tokens),
         context.used_percent
     )
-}
-
-fn aggregate_label<I>(mut values: I, plural_label: &str) -> Option<String>
-where
-    I: Iterator<Item = String>,
-{
-    let first = values.next()?;
-    let mut count = 1usize;
-    let mut mixed = false;
-
-    for value in values {
-        count += 1;
-        if value != first {
-            mixed = true;
-        }
-    }
-
-    if mixed {
-        Some(format!("{count} {plural_label}"))
-    } else {
-        Some(first)
-    }
 }
 
 fn has_multiple_strings<I, S>(mut values: I) -> bool

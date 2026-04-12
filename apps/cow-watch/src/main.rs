@@ -1,11 +1,14 @@
+mod api;
+mod client;
 mod open;
 mod tui;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use client::{LocalMonitorClient, MonitorClient, MultiMonitorClient, RemoteMonitorClient};
 use cow_watch_claude::ClaudeSource;
 use cow_watch_codex::CodexSource;
 use cow_watch_core::{CombinedSource, MonitorService, SessionDetail, SessionQuery, SessionSummary};
@@ -28,15 +31,31 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Sessions {
+        #[command(flatten)]
+        client: ClientOptions,
         #[command(subcommand)]
         command: SessionsCommand,
     },
     Tui {
+        #[command(flatten)]
+        client: ClientOptions,
         #[arg(long)]
         limit: Option<usize>,
         #[arg(long, default_value_t = 5)]
         refresh_secs: u64,
     },
+    Agent {
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: SocketAddr,
+    },
+}
+
+#[derive(Args, Clone, Debug, Default)]
+struct ClientOptions {
+    #[arg(long = "machine", alias = "agent", value_name = "URL")]
+    machines: Vec<String>,
+    #[arg(long)]
+    no_local: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -72,6 +91,71 @@ async fn main() -> Result<()> {
         .claude_home
         .or_else(|| std::env::var_os("CLAUDE_HOME").map(PathBuf::from));
 
+    let local_service = build_local_service(codex_home, claude_home)?;
+
+    match cli.command {
+        Command::Sessions { client, command } => {
+            let client = build_monitor_client(local_service.clone(), &client)?;
+            match command {
+                SessionsCommand::List {
+                    limit,
+                    include_archived,
+                    json,
+                } => {
+                    let sessions = client
+                        .list_sessions(SessionQuery {
+                            include_archived,
+                            limit: Some(limit),
+                        })
+                        .await?;
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&sessions)?);
+                    } else {
+                        print_sessions(&sessions.sessions);
+                    }
+                }
+                SessionsCommand::Latest { json } => {
+                    let session = client.latest_session().await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&session)?);
+                    } else {
+                        print_session_detail(&session);
+                    }
+                }
+                SessionsCommand::Show { session_id, json } => {
+                    let session = client.get_session(&session_id).await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&session)?);
+                    } else {
+                        print_session_detail(&session);
+                    }
+                }
+            }
+        }
+        Command::Tui {
+            client,
+            limit,
+            refresh_secs,
+        } => {
+            let client = build_monitor_client(local_service, &client)?;
+            tui::run(client, limit, refresh_secs).await?;
+        }
+        Command::Agent { bind } => {
+            let service = local_service.ok_or_else(|| {
+                anyhow::anyhow!("no provider homes were found; looked for ~/.codex and ~/.claude")
+            })?;
+            api::run(service, bind).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_local_service(
+    codex_home: Option<PathBuf>,
+    claude_home: Option<PathBuf>,
+) -> Result<Option<MonitorService>> {
     let mut source = CombinedSource::new();
     if let Some(path) = codex_home {
         source.push_source("codex", Arc::new(CodexSource::new(path)));
@@ -86,59 +170,38 @@ async fn main() -> Result<()> {
     }
 
     if source.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(MonitorService::new(Arc::new(source))))
+}
+
+fn build_monitor_client(
+    local_service: Option<MonitorService>,
+    options: &ClientOptions,
+) -> Result<Arc<dyn MonitorClient>> {
+    let mut client = MultiMonitorClient::new();
+
+    if !options.no_local
+        && let Some(local_service) = local_service
+    {
+        client.push_client("local", Arc::new(LocalMonitorClient::new(local_service)));
+    }
+
+    for (index, machine) in options.machines.iter().enumerate() {
+        client.push_client(
+            format!("remote{}", index + 1),
+            Arc::new(RemoteMonitorClient::new(machine)?),
+        );
+    }
+
+    if client.is_empty() {
         return Err(anyhow::anyhow!(
-            "no provider homes were found; looked for ~/.codex and ~/.claude"
+            "no monitor sources are available; add --machine or ensure ~/.codex or ~/.claude exist"
         ));
     }
 
-    let service = MonitorService::new(Arc::new(source));
-
-    match cli.command {
-        Command::Sessions { command } => match command {
-            SessionsCommand::List {
-                limit,
-                include_archived,
-                json,
-            } => {
-                let sessions = service
-                    .list_sessions(SessionQuery {
-                        include_archived,
-                        limit: Some(limit),
-                    })
-                    .await?;
-
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&sessions)?);
-                } else {
-                    print_sessions(&sessions.sessions);
-                }
-            }
-            SessionsCommand::Latest { json } => {
-                let session = service.latest_session().await?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&session)?);
-                } else {
-                    print_session_detail(&session);
-                }
-            }
-            SessionsCommand::Show { session_id, json } => {
-                let session = service.get_session(&session_id).await?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&session)?);
-                } else {
-                    print_session_detail(&session);
-                }
-            }
-        },
-        Command::Tui {
-            limit,
-            refresh_secs,
-        } => {
-            tui::run(service, limit, refresh_secs).await?;
-        }
-    }
-
-    Ok(())
+    Ok(Arc::new(client))
 }
 
 fn init_tracing() {

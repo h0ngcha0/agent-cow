@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
@@ -13,6 +15,7 @@ cow-watch-claude = { path = "../../crates/cow-watch-claude" }
 cow-watch-codex = { path = "../../crates/cow-watch-codex" }
 cow-watch-core = { path = "../../crates/cow-watch-core" }
 ratatui.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
