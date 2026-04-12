@@ -13,7 +13,7 @@
                 ||     ||
 ```
 
-Agent Cow is a local-first observability tool for coding agents.
+Agent Cow is an observability tool for your coding agents across your machines.
 
 It watches your agent sessions, shows what they are doing, what they cost, how much context they have burned, and whether they are waiting for you. It runs as a fast terminal UI, or as a headless machine agent that another TUI can subscribe to.
 
@@ -52,40 +52,86 @@ Sometimes you do not need every event. You just need the latest conversation and
 - Uses **HTTP + websocket subscriptions** for low-friction remote monitoring
 - Is built to support **more providers and runtimes in the future**
 
+## Install
+
+### Download a binary
+
+If you just want to use Agent Cow, grab a prebuilt binary from [GitHub Releases](https://github.com/h0ngcha0/agent-cow/releases).
+
+Release assets are published for:
+
+- macOS Apple Silicon
+- macOS Intel
+- Linux x86_64
+- Windows x86_64
+
+Then unpack the archive for your platform and run:
+
+```bash
+agent-cow tui
+```
+
+Common first steps:
+
+- local TUI: `agent-cow tui`
+- headless node: `agent-cow agent --bind 0.0.0.0:8787`
+- inspect via CLI: `agent-cow sessions list --limit 20`
+
+### Build from source
+
+If you want to build it yourself:
+
+```bash
+cargo build --release --manifest-path apps/agent-cow/Cargo.toml
+```
+
+The binary will be at:
+
+```text
+target/release/agent-cow
+```
+
 ## Current Shape
 
 - **TUI mode**: local all-in-one experience
 - **Agent mode**: headless remote node for another TUI to connect to
 - **Adapters today**: Codex and Claude
 - **Adapters later**: whatever else is worth watching
-- **Web UI**: intentionally not shipped right now
 
 ## Quick Start
+
+Using the built or downloaded binary:
+
+```bash
+agent-cow tui
+```
+
+If you are running directly from the repo without building first, use `cargo run -- ...` instead.
 
 ### Run the TUI locally
 
 ```bash
-cargo run -- tui
+agent-cow tui
 ```
 
 Or with a faster refresh:
 
 ```bash
-cargo run -- tui --refresh-secs 1
+agent-cow tui --refresh-secs 1
 ```
 
 ### Inspect sessions from the CLI
 
 ```bash
-cargo run -- sessions list --limit 20
+agent-cow sessions list --limit 20
 ```
 
 ```bash
-cargo run -- sessions latest --json
+agent-cow sessions latest --json
 ```
 
 ```bash
-cargo run -- sessions show <session-id> --json
+agent-cow sessions show <session-id> --json
 ```
 
 ## Multi-Machine Setup
@@ -93,13 +139,13 @@ cargo run -- sessions show <session-id> --json
 Run a headless agent on each machine you want to observe:
 
 ```bash
-cargo run -- agent --bind 0.0.0.0:8787
+agent-cow agent --bind 0.0.0.0:8787
 ```
 
 Then connect from your main TUI machine:
 
 ```bash
-cargo run -- tui \
+agent-cow tui \
   --machine http://100.x.y.z:8787 \
   --machine http://100.x.y.w:8787
 ```
@@ -107,7 +153,7 @@ cargo run -- tui \
 If you want remote-only:
 
 ```bash
-cargo run -- tui --no-local --machine http://100.x.y.z:8787
+agent-cow tui --no-local --machine http://100.x.y.z:8787
 ```
 
 Agent Cow works well over:
@@ -115,6 +161,19 @@ Agent Cow works well over:
 - Tailscale
 - internal LAN IPs
 - localhost for testing
+
+## Release Binaries
+
+GitHub Actions publishes release archives automatically when you push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That workflow first runs formatting, clippy, and tests, then builds and uploads platform binaries to the matching GitHub Release.
+
+If you are running straight from the repo instead of an installed binary, prepend `cargo run --` to the same commands.
 
 ## TUI Basics
 
