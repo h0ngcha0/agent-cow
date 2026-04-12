@@ -1,6 +1,8 @@
 # Agent Cow
 
-> **Agent Cow: the philosophical watcher of your agents.**
+[![CI](https://github.com/h0ngcha0/agent-cow/actions/workflows/ci.yml/badge.svg)](https://github.com/h0ngcha0/agent-cow/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/h0ngcha0/agent-cow)](https://github.com/h0ngcha0/agent-cow/releases)
+[![License](https://img.shields.io/github/license/h0ngcha0/agent-cow)](https://github.com/h0ngcha0/agent-cow/blob/main/LICENSE)
 
 ```text
  ________________________________________________
@@ -14,7 +16,7 @@
                 ||     ||
 ```
 
-Agent Cow is an observability tool for your coding agents across your machines.
+Agent Cow is the philosophical watcher of your coding agents.
 
 It watches your agent sessions, shows what they are doing, what they cost, how much context they have burned, and whether they are waiting for you. It runs as a fast terminal UI, or as a headless machine agent that another TUI can subscribe to.
 
@@ -85,13 +87,6 @@ Windows PowerShell:
 ```powershell
 irm https://raw.githubusercontent.com/h0ngcha0/agent-cow/main/install.ps1 | iex
 ```
-
-The installer:
-
-- detects your platform and architecture
-- downloads the matching release asset
-- installs `agent-cow` into `~/.local/bin` on macOS/Linux by default
-- installs `agent-cow.exe` into `%LOCALAPPDATA%\\Programs\\agent-cow\\bin` on Windows by default
 
 You can override the version or install directory:
 
