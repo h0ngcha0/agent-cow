@@ -5,23 +5,23 @@ mod tui;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
+use agent_cow_claude::ClaudeSource;
+use agent_cow_codex::CodexSource;
+use agent_cow_core::{CombinedSource, MonitorService, SessionDetail, SessionQuery, SessionSummary};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use client::{LocalMonitorClient, MonitorClient, MultiMonitorClient, RemoteMonitorClient};
-use cow_watch_claude::ClaudeSource;
-use cow_watch_codex::CodexSource;
-use cow_watch_core::{CombinedSource, MonitorService, SessionDetail, SessionQuery, SessionSummary};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Parser, Debug)]
-#[command(name = "cow-watch")]
+#[command(name = "agent-cow")]
 #[command(about = "Local-first observability for coding-agent sessions")]
 struct Cli {
-    #[arg(long, env = "COW_WATCH_CODEX_HOME")]
+    #[arg(long, env = "AGENT_COW_CODEX_HOME")]
     codex_home: Option<PathBuf>,
 
-    #[arg(long, env = "COW_WATCH_CLAUDE_HOME")]
+    #[arg(long, env = "AGENT_COW_CLAUDE_HOME")]
     claude_home: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -206,7 +206,7 @@ fn build_monitor_client(
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("cow_watch=info,cow_watch_codex=info,cow_watch_claude=info")
+        EnvFilter::new("agent_cow=info,agent_cow_codex=info,agent_cow_claude=info")
     });
 
     fmt().with_env_filter(filter).without_time().init();

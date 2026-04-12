@@ -6,13 +6,13 @@ use std::{
 };
 
 use crate::client::MonitorClient;
-use anyhow::Result;
-use chrono::{DateTime, Local, Utc};
-use cow_watch_core::{
+use agent_cow_core::{
     ActivityEvent, ActivityKind, ProviderQuota, SessionActivityState, SessionDetail, SessionList,
     SessionLoadProgress, SessionQuery, SessionStatusKind, SessionSummary, TokenUsage,
     UsageOverview,
 };
+use anyhow::Result;
+use chrono::{DateTime, Local, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -1278,7 +1278,7 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
 }
 
 fn render_brand_cluster(width: u16) -> Paragraph<'static> {
-    Paragraph::new(Text::from(cow_watch_brand_cluster_lines(width))).alignment(Alignment::Left)
+    Paragraph::new(Text::from(agent_cow_brand_cluster_lines(width))).alignment(Alignment::Left)
 }
 
 const HEADER_BRAND_MIN_WIDTH: u16 = 18;
@@ -1488,12 +1488,12 @@ fn subscription_windows_line(
     line
 }
 
-fn visible_quota_windows(quota: &ProviderQuota) -> Vec<&cow_watch_core::QuotaWindow> {
+fn visible_quota_windows(quota: &ProviderQuota) -> Vec<&agent_cow_core::QuotaWindow> {
     quota
         .windows
         .iter()
         .filter(|window| {
-            !(matches!(quota.provider, cow_watch_core::ProviderKind::Claude)
+            !(matches!(quota.provider, agent_cow_core::ProviderKind::Claude)
                 && window.label.eq_ignore_ascii_case("SN"))
         })
         .collect()
@@ -1553,7 +1553,7 @@ fn subscription_empty_state_label(quota: &ProviderQuota, _compact: bool) -> &'st
 }
 
 fn subscription_window_spans(
-    window: &cow_watch_core::QuotaWindow,
+    window: &agent_cow_core::QuotaWindow,
     bar_segments: usize,
 ) -> Vec<Span<'static>> {
     let style = quota_remaining_style(window.remaining_percent);
@@ -1826,7 +1826,7 @@ fn keymap_cell_spans(
     }
 }
 
-fn cow_watch_brand_cluster_lines(width: u16) -> Vec<Line<'static>> {
+fn agent_cow_brand_cluster_lines(width: u16) -> Vec<Line<'static>> {
     let now = Utc::now();
     let frame = animated_cow_frame(now);
     let ascii_lines = animated_cow_lines(frame.eyes, frame.mouth, frame.tail);
@@ -3289,7 +3289,7 @@ fn indent() -> Span<'static> {
     Span::raw("          ")
 }
 
-fn context_bar_line(context: &cow_watch_core::ContextWindowUsage) -> Line<'static> {
+fn context_bar_line(context: &agent_cow_core::ContextWindowUsage) -> Line<'static> {
     let filled = ((context.used_percent as usize * 24) / 100).min(24);
     let mut spans = vec![indent()];
 
@@ -3508,7 +3508,7 @@ fn cost_style(total_cost: Option<f64>) -> Style {
     }
 }
 
-fn context_style(context: Option<&cow_watch_core::ContextWindowUsage>) -> Style {
+fn context_style(context: Option<&agent_cow_core::ContextWindowUsage>) -> Style {
     let used_percent = context.map(|context| context.used_percent).unwrap_or(0);
     if used_percent >= 85 {
         Style::default()
@@ -3726,7 +3726,7 @@ fn token_breakdown(tokens: &TokenUsage) -> String {
     parts.join("  ")
 }
 
-fn render_tool_summary(tools: &[cow_watch_core::ToolCallStat]) -> String {
+fn render_tool_summary(tools: &[agent_cow_core::ToolCallStat]) -> String {
     if tools.is_empty() {
         return "none".to_string();
     }
@@ -3739,7 +3739,7 @@ fn render_tool_summary(tools: &[cow_watch_core::ToolCallStat]) -> String {
         .join(", ")
 }
 
-fn format_context_window(context: &cow_watch_core::ContextWindowUsage) -> String {
+fn format_context_window(context: &agent_cow_core::ContextWindowUsage) -> String {
     format!(
         "{} / {} used  •  {} left  •  {}%",
         format_tokens_short(context.used_tokens),
@@ -3843,11 +3843,11 @@ mod tests {
         ListRefreshKind, TuiApp, animated_cow_lines, brand_cluster_lines, footer_line,
         header_meta_lines,
     };
-    use chrono::{TimeZone, Utc};
-    use cow_watch_core::{
+    use agent_cow_core::{
         ProviderKind, SessionActivityState, SessionList, SessionLoadProgress, SessionStatus,
         SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, UsageOverview,
     };
+    use chrono::{TimeZone, Utc};
     use ratatui::text::Line;
     use std::{collections::HashMap, time::Duration};
 

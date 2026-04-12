@@ -1,5 +1,5 @@
 [package]
-name = "cow-watch"
+name = "agent-cow"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,9 +11,9 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
-cow-watch-claude = { path = "../../crates/cow-watch-claude" }
-cow-watch-codex = { path = "../../crates/cow-watch-codex" }
-cow-watch-core = { path = "../../crates/cow-watch-core" }
+agent-cow-claude = { path = "../../crates/agent-cow-claude" }
+agent-cow-codex = { path = "../../crates/agent-cow-codex" }
+agent-cow-core = { path = "../../crates/agent-cow-core" }
 futures-util.workspace = true
 ratatui.workspace = true
 reqwest.workspace = true

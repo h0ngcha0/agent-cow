@@ -12,15 +12,15 @@ use std::{
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
-use cow_watch_core::{
+use agent_cow_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
     PricingSource, ProviderKind, ProviderQuota, SessionActivityState, SessionCost, SessionDetail,
     SessionList, SessionLoadProgress, SessionQuery, SessionSource, SessionStatus,
     SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
 };
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use directories::BaseDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -478,7 +478,7 @@ impl ClaudeSource {
             machine_id: machine_label.clone(),
             machine_label,
             pricing_client: Client::builder()
-                .user_agent("cow-watch/0.1")
+                .user_agent("agent-cow/0.1")
                 .build()
                 .expect("reqwest client should build"),
             pricing_cache: Arc::new(Mutex::new(None)),
@@ -1237,7 +1237,7 @@ fn probe_claude_status_quota_with_python(
     let windows = payload
         .windows
         .into_iter()
-        .map(|window| cow_watch_core::QuotaWindow {
+        .map(|window| agent_cow_core::QuotaWindow {
             label: window.label,
             used_percent: window.used_percent,
             remaining_percent: 100_u8.saturating_sub(window.used_percent),
@@ -1419,7 +1419,7 @@ fn parse_previous_usage_block(
     label: &str,
     window_minutes: Option<u64>,
     now_local: DateTime<Local>,
-) -> Option<cow_watch_core::QuotaWindow> {
+) -> Option<agent_cow_core::QuotaWindow> {
     let used_index = (0..before_index)
         .rev()
         .find(|index| parse_used_percent(&lines[*index]).is_some())?;
@@ -1442,7 +1442,7 @@ fn parse_usage_block_after(
     label: &str,
     window_minutes: Option<u64>,
     now_local: DateTime<Local>,
-) -> Option<cow_watch_core::QuotaWindow> {
+) -> Option<agent_cow_core::QuotaWindow> {
     let used_index = lines
         .iter()
         .enumerate()
@@ -1468,8 +1468,8 @@ fn build_quota_window(
     reset_text: Option<String>,
     window_minutes: Option<u64>,
     now_local: DateTime<Local>,
-) -> Option<cow_watch_core::QuotaWindow> {
-    Some(cow_watch_core::QuotaWindow {
+) -> Option<agent_cow_core::QuotaWindow> {
+    Some(agent_cow_core::QuotaWindow {
         label: label.to_string(),
         used_percent,
         remaining_percent: 100_u8.saturating_sub(used_percent),
@@ -3174,7 +3174,7 @@ fn pricing_cache_path() -> Option<PathBuf> {
     Some(
         base_dirs
             .cache_dir()
-            .join("cow-watch")
+            .join("agent-cow")
             .join("litellm_pricing.json"),
     )
 }
@@ -3184,7 +3184,7 @@ fn status_cache_path() -> Option<PathBuf> {
     Some(
         base_dirs
             .cache_dir()
-            .join("cow-watch")
+            .join("agent-cow")
             .join("claude_status.json"),
     )
 }
@@ -3194,7 +3194,7 @@ fn sessions_cache_path() -> Option<PathBuf> {
     Some(
         base_dirs
             .cache_dir()
-            .join("cow-watch")
+            .join("agent-cow")
             .join("claude_sessions.json"),
     )
 }
@@ -3204,7 +3204,7 @@ fn summary_cache_path() -> Option<PathBuf> {
     Some(
         base_dirs
             .cache_dir()
-            .join("cow-watch")
+            .join("agent-cow")
             .join("claude_summary_hints.json"),
     )
 }
@@ -3447,11 +3447,11 @@ mod tests {
         derive_activity_state, estimate_session_cost, looks_like_compaction_signal,
         normalize_message_text, normalize_title, parse_claude_status_quota, parse_claude_usage,
     };
-    use chrono::{Local, TimeZone, Utc};
-    use cow_watch_core::{
+    use agent_cow_core::{
         ActivityEvent, ActivityKind, PricingSource, ProviderKind, ProviderQuota,
         SessionActivityState, SessionStatus, SessionStatusKind, StatusConfidence,
     };
+    use chrono::{Local, TimeZone, Utc};
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -3638,7 +3638,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-claude-compaction-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-claude-compaction-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("session.jsonl");
         fs::write(
@@ -3688,7 +3688,7 @@ mod tests {
 
     #[test]
     fn estimate_session_cost_counts_cache_creation_separately() {
-        let tokens = cow_watch_core::TokenUsage {
+        let tokens = agent_cow_core::TokenUsage {
             total_tokens: 10_000,
             input_tokens: Some(4_000),
             cache_creation_input_tokens: Some(2_000),
@@ -3720,7 +3720,7 @@ mod tests {
 
     #[test]
     fn estimate_session_cost_matches_ccusage_for_claude_opus_4_6() {
-        let tokens = cow_watch_core::TokenUsage {
+        let tokens = agent_cow_core::TokenUsage {
             total_tokens: 349_061,
             input_tokens: Some(22),
             cache_creation_input_tokens: Some(66_623),

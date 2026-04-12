@@ -10,15 +10,15 @@ use std::{
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
-use chrono::{DateTime, Duration, Local, Utc};
-use cow_watch_core::{
+use agent_cow_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
     PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionActivityState, SessionCost,
     SessionDetail, SessionList, SessionLoadProgress, SessionQuery, SessionSource, SessionStatus,
     SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
 };
+use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, Local, Utc};
 use directories::BaseDirs;
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags};
@@ -193,7 +193,7 @@ impl CodexSource {
             machine_id: machine_label.clone(),
             machine_label,
             pricing_client: Client::builder()
-                .user_agent("cow-watch/0.1")
+                .user_agent("agent-cow/0.1")
                 .build()
                 .expect("reqwest client should build"),
             pricing_cache: Arc::new(Mutex::new(None)),
@@ -493,7 +493,7 @@ impl CodexSource {
         for input in [
             Some(self.configured_path.clone()),
             Some(self.codex_home.clone()),
-            std::env::var_os("COW_WATCH_CODEX_HOME").map(PathBuf::from),
+            std::env::var_os("AGENT_COW_CODEX_HOME").map(PathBuf::from),
             std::env::var_os("CODEX_HOME").map(PathBuf::from),
             BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")),
         ]
@@ -2003,7 +2003,7 @@ fn pricing_cache_path() -> Option<PathBuf> {
     Some(
         base_dirs
             .cache_dir()
-            .join("cow-watch")
+            .join("agent-cow")
             .join("litellm_pricing.json"),
     )
 }
@@ -2013,7 +2013,7 @@ fn summary_cache_path() -> Option<PathBuf> {
     Some(
         base_dirs
             .cache_dir()
-            .join("cow-watch")
+            .join("agent-cow")
             .join("summary_hints.json"),
     )
 }
@@ -2023,7 +2023,7 @@ fn threads_cache_path() -> Option<PathBuf> {
     Some(
         base_dirs
             .cache_dir()
-            .join("cow-watch")
+            .join("agent-cow")
             .join("codex_threads.json"),
     )
 }
@@ -2534,7 +2534,7 @@ fn snapshot_sqlite_database(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("invalid SQLite path {}", path.display()))?;
-    let snapshot_root = std::env::temp_dir().join("cow-watch-sqlite");
+    let snapshot_root = std::env::temp_dir().join("agent-cow-sqlite");
     fs::create_dir_all(&snapshot_root)
         .with_context(|| format!("failed to create {}", snapshot_root.display()))?;
 
@@ -2770,8 +2770,8 @@ mod tests {
         parse_context_window_usage, parse_state_db_version, parse_transcript_static,
         state_db_candidates_for_input, stream_usage_index, user_title_candidate,
     };
+    use agent_cow_core::{ActivityEvent, ActivityKind, ContextWindowUsage, TokenUsage};
     use chrono::Utc;
-    use cow_watch_core::{ActivityEvent, ActivityKind, ContextWindowUsage, TokenUsage};
     use directories::BaseDirs;
     use std::{
         collections::HashSet,
@@ -2860,7 +2860,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-test-file-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-test-file-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("state_9.sqlite");
         fs::write(&path, b"").unwrap();
@@ -2876,7 +2876,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-test-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-test-{unique}"));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("state_3.sqlite"), b"").unwrap();
         fs::write(root.join("state_5.sqlite"), b"").unwrap();
@@ -2911,7 +2911,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-transcript-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-transcript-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path =
             root.join("rollout-2026-04-10T16-00-35-019d77b1-d1ca-7c90-82fa-927613e48567.jsonl");
@@ -2946,7 +2946,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-rollout-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path =
             root.join("rollout-2026-04-10T20-55-21-019d73f2-20fb-70f2-9ba5-13810d786a22.jsonl");
@@ -2978,7 +2978,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-rollout-latest-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-latest-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path =
             root.join("rollout-2026-04-10T20-59-43-019d73f2-20fb-70f2-9ba5-13810d786a22.jsonl");
@@ -3008,7 +3008,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-rollout-tokens-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-tokens-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("rollout-2026-04-11T05-07-04-ctx.jsonl");
         fs::write(
@@ -3038,7 +3038,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-rollout-derived-total-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-derived-total-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("rollout-2026-04-11T05-09-00-derived-total.jsonl");
         fs::write(
@@ -3088,7 +3088,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-rollout-cost-buckets-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-cost-buckets-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("rollout-2026-04-11T05-07-04-costs.jsonl");
         fs::write(
@@ -3398,7 +3398,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-rollout-approval-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-approval-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("rollout-approval.jsonl");
         fs::write(
@@ -3421,7 +3421,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cow-watch-rollout-compaction-{unique}"));
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-compaction-{unique}"));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("rollout-compaction.jsonl");
         fs::write(

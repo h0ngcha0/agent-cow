@@ -4,8 +4,8 @@ use std::{
     process::Command,
 };
 
+use agent_cow_core::{NavigationKind, ProviderKind, SessionSummary};
 use anyhow::{Context, Result, anyhow};
-use cow_watch_core::{NavigationKind, ProviderKind, SessionSummary};
 
 pub struct OpenAction {
     pub label: String,
@@ -234,11 +234,11 @@ fn open_with_system(target: &str, reveal_file: bool) -> Result<()> {
 mod tests {
     use std::fs;
 
-    use chrono::Utc;
-    use cow_watch_core::{
+    use agent_cow_core::{
         NavigationTarget, ProviderKind, SessionActivityState, SessionStatus, SessionStatusKind,
         SessionSummary, StatusConfidence, TokenUsage,
     };
+    use chrono::Utc;
 
     use super::{claude_imported_session_exists_in_root, provider_app_target};
 
@@ -277,7 +277,7 @@ mod tests {
     fn claude_app_target_uses_conversation_deeplink() {
         let mut summary = sample_summary(ProviderKind::Claude);
         summary.navigation.push(NavigationTarget {
-            kind: cow_watch_core::NavigationKind::ThreadId,
+            kind: agent_cow_core::NavigationKind::ThreadId,
             label: "Conversation".to_string(),
             target: "00948ef4-2a8d-4375-95f3-a37ee3bb3ad2".to_string(),
         });
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn detects_imported_claude_session_from_store() {
-        let root = std::env::temp_dir().join(format!("cow-watch-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("agent-cow-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let nested = root.join("account").join("workspace");
         fs::create_dir_all(&nested).expect("create nested store");

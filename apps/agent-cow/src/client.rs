@@ -5,19 +5,19 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
-use async_trait::async_trait;
-use chrono::Utc;
-use cow_watch_core::{
+use agent_cow_core::{
     MonitorService, ProviderQuota, SessionDetail, SessionList, SessionLoadProgress, SessionQuery,
     SessionSummary, UsageOverview,
 };
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinSet,
-    time::{MissedTickBehavior, sleep},
+    time::{MissedTickBehavior, sleep, timeout},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -25,6 +25,8 @@ use crate::open;
 
 const REMOTE_STREAM_RECONNECT_MIN: Duration = Duration::from_secs(1);
 const REMOTE_STREAM_RECONNECT_MAX: Duration = Duration::from_secs(30);
+const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenActionResponse {
@@ -188,7 +190,10 @@ impl RemoteMonitorClient {
             base_url.set_path(&path);
         }
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+                .timeout(REMOTE_REQUEST_TIMEOUT)
+                .build()?,
             base_url,
         })
     }
@@ -322,8 +327,8 @@ impl MonitorClient for RemoteMonitorClient {
             let mut reconnect_delay = REMOTE_STREAM_RECONNECT_MIN;
 
             loop {
-                match connect_async(stream_url.as_str()).await {
-                    Ok((stream, _)) => {
+                match timeout(REMOTE_CONNECT_TIMEOUT, connect_async(stream_url.as_str())).await {
+                    Ok(Ok((stream, _))) => {
                         reconnect_delay = REMOTE_STREAM_RECONNECT_MIN;
                         let (_, mut read) = stream.split();
 
@@ -347,8 +352,11 @@ impl MonitorClient for RemoteMonitorClient {
                             }
                         }
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::debug!(%stream_url, ?error, "remote session stream connect failed");
+                    }
+                    Err(_) => {
+                        tracing::debug!(%stream_url, "remote session stream connect timed out");
                     }
                 }
 
@@ -435,7 +443,7 @@ impl MonitorClient for MultiMonitorClient {
                                 sources: state
                                     .iter()
                                     .map(|(source, (loaded_sessions, total_sessions))| {
-                                        cow_watch_core::SessionLoadSourceProgress {
+                                        agent_cow_core::SessionLoadSourceProgress {
                                             source: source.clone(),
                                             loaded_sessions: *loaded_sessions,
                                             total_sessions: *total_sessions,

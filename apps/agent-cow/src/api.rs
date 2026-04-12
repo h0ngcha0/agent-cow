@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use agent_cow_core::{MonitorService, NavigationKind, SessionQuery};
 use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
@@ -11,7 +12,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use cow_watch_core::{MonitorService, NavigationKind, SessionQuery};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::time::MissedTickBehavior;
@@ -67,7 +67,7 @@ async fn health() -> impl IntoResponse {
 async fn list_sessions(
     State(state): State<ApiState>,
     Query(params): Query<ListParams>,
-) -> Result<Json<cow_watch_core::SessionList>, ApiError> {
+) -> Result<Json<agent_cow_core::SessionList>, ApiError> {
     let sessions = state
         .service
         .list_sessions(SessionQuery {
@@ -100,7 +100,7 @@ async fn stream_sessions(
 async fn get_session(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<cow_watch_core::SessionDetail>, ApiError> {
+) -> Result<Json<agent_cow_core::SessionDetail>, ApiError> {
     Ok(Json(state.service.get_session(&id).await?))
 }
 
@@ -223,6 +223,6 @@ async fn stream_sessions_socket(
     }
 }
 
-fn session_list_signature(list: &cow_watch_core::SessionList) -> Result<String> {
+fn session_list_signature(list: &agent_cow_core::SessionList) -> Result<String> {
     Ok(serde_json::to_string(&(&list.overview, &list.sessions))?)
 }
