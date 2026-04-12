@@ -695,8 +695,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
           const provider = titleCase(quota.provider || "provider");
           const parts = [];
           if (quota.plan) parts.push(quota.plan);
-          if ((quota.windows || []).length) {
-            for (const window of quota.windows) {
+          const windows = (quota.windows || []).filter((window) => {
+            return !((quota.provider || "").toLowerCase() === "claude" && window.label === "SN");
+          });
+          if (windows.length) {
+            for (const window of windows) {
               parts.push(`${window.label} ${window.used_percent}%`);
             }
           } else if (quota.summary) {

@@ -152,6 +152,7 @@ pub struct ProviderQuota {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct UsageOverview {
+    pub total_sessions: usize,
     pub total_tokens: u64,
     pub total_cost_usd: f64,
     pub sessions_with_cost: usize,

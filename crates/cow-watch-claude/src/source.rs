@@ -18,13 +18,14 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveTime, TimeZone
 use cow_watch_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
     PricingSource, ProviderKind, ProviderQuota, SessionActivityState, SessionCost, SessionDetail,
-    SessionList, SessionQuery, SessionSource, SessionStatus, SessionStatusKind, SessionSummary,
-    StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
+    SessionList, SessionLoadProgress, SessionQuery, SessionSource, SessionStatus,
+    SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
 };
 use directories::BaseDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
 const SUMMARY_TAIL_LINES: usize = 384;
 const DETAIL_TAIL_LINES: usize = 512;
@@ -37,8 +38,9 @@ const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
 const COMPACTION_ACTIVITY_WINDOW_SECONDS: i64 = 12;
 const CLAUDE_DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 const CLAUDE_TIERED_THRESHOLD_TOKENS: u64 = 200_000;
-const SESSION_DISCOVERY_CACHE_TTL: StdDuration = StdDuration::from_secs(5);
-const CLAUDE_STATUS_CACHE_TTL: StdDuration = StdDuration::from_secs(60);
+const SESSION_DISCOVERY_CACHE_TTL: StdDuration = StdDuration::from_secs(15);
+const SESSION_DISCOVERY_DISK_CACHE_TTL: StdDuration = StdDuration::from_secs(90);
+const CLAUDE_STATUS_CACHE_TTL: StdDuration = StdDuration::from_secs(5 * 60);
 const CLAUDE_STATUS_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const CLAUDE_STATUS_PYTHON_PROBE: &str = r#"
 import json, os, select, subprocess, time
@@ -238,14 +240,15 @@ pub struct ClaudeSource {
     pricing_client: Client,
     pricing_cache: Arc<Mutex<Option<LitellmPricingCache>>>,
     pricing_refresh_in_flight: Arc<AtomicBool>,
+    status_refresh_in_flight: Arc<AtomicBool>,
     static_cache: Arc<Mutex<HashMap<PathBuf, TranscriptStatic>>>,
-    summary_cache: Arc<Mutex<HashMap<PathBuf, SummaryHintCacheEntry>>>,
+    summary_cache: Arc<Mutex<Option<HashMap<PathBuf, SummaryHintCacheEntry>>>>,
     summary_cache_dirty: Arc<AtomicBool>,
     sessions_cache: Arc<Mutex<Option<SessionsCache>>>,
     status_cache: Arc<Mutex<Option<ClaudeStatusCache>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionRow {
     id: String,
     transcript_path: PathBuf,
@@ -359,7 +362,7 @@ struct SummaryHintCacheRecord {
     entry: SummaryHintCacheEntry,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionsCache {
     fetched_at_epoch_ms: i64,
     rows: Vec<SessionRow>,
@@ -463,7 +466,6 @@ impl ClaudeSource {
             .unwrap_or_else(|_| "local".to_string());
         let claude_home = normalize_claude_home(expand_known_path_vars(claude_home.into()));
         let projects_dir = claude_projects_dir(&claude_home);
-        let summary_cache = load_summary_cache_from_disk().unwrap_or_default();
         let status_cache = load_status_cache_from_disk().unwrap_or(None);
 
         Self {
@@ -477,8 +479,9 @@ impl ClaudeSource {
                 .expect("reqwest client should build"),
             pricing_cache: Arc::new(Mutex::new(None)),
             pricing_refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            status_refresh_in_flight: Arc::new(AtomicBool::new(false)),
             static_cache: Arc::new(Mutex::new(HashMap::new())),
-            summary_cache: Arc::new(Mutex::new(summary_cache)),
+            summary_cache: Arc::new(Mutex::new(None)),
             summary_cache_dirty: Arc::new(AtomicBool::new(false)),
             sessions_cache: Arc::new(Mutex::new(None)),
             status_cache: Arc::new(Mutex::new(status_cache)),
@@ -508,33 +511,34 @@ impl ClaudeSource {
             return merge_claude_quota(fallback, Some(cache.quota.clone()));
         }
 
-        let claude_home = self.claude_home.clone();
-        let probed = match tokio::task::spawn_blocking(move || {
-            probe_claude_status_quota(&claude_home)
-        })
-        .await
+        if self
+            .status_refresh_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
         {
-            Ok(Ok(quota)) => quota,
-            Ok(Err(error)) => {
-                tracing::debug!("failed to probe Claude /status usage: {error:#}");
-                None
-            }
-            Err(error) => {
-                tracing::debug!("Claude /status usage probe task failed: {error:#}");
-                None
-            }
-        };
-
-        if let Some(quota) = probed.clone() {
-            if !quota.windows.is_empty() {
-                let cache = ClaudeStatusCache {
-                    fetched_at_epoch_ms: now_epoch_millis(),
-                    quota: quota.clone(),
+            let claude_home = self.claude_home.clone();
+            let status_cache = self.status_cache.clone();
+            let refresh_flag = self.status_refresh_in_flight.clone();
+            thread::spawn(move || {
+                let probed = match probe_claude_status_quota(&claude_home) {
+                    Ok(quota) => quota,
+                    Err(error) => {
+                        tracing::debug!("failed to probe Claude /status usage: {error:#}");
+                        None
+                    }
                 };
-                *self.status_cache.lock().expect("lock poisoned") = Some(cache.clone());
-                let _ = store_status_cache_to_disk(&cache);
-            }
-            return merge_claude_quota(fallback, Some(quota));
+                if let Some(quota) = probed
+                    && !quota.windows.is_empty()
+                {
+                    let cache = ClaudeStatusCache {
+                        fetched_at_epoch_ms: now_epoch_millis(),
+                        quota: normalize_claude_quota_labels(quota),
+                    };
+                    *status_cache.lock().expect("lock poisoned") = Some(cache.clone());
+                    let _ = store_status_cache_to_disk(&cache);
+                }
+                refresh_flag.store(false, Ordering::SeqCst);
+            });
         }
 
         merge_claude_quota(fallback, cached.map(|cache| cache.quota))
@@ -547,16 +551,25 @@ impl ClaudeSource {
             return Ok(cache.rows);
         }
 
+        if let Some(cache) = load_sessions_cache_from_disk()?
+            && is_sessions_disk_cache_fresh(cache.fetched_at_epoch_ms)
+        {
+            *self.sessions_cache.lock().expect("lock poisoned") = Some(cache.clone());
+            return Ok(cache.rows);
+        }
+
         let mut rows = Vec::new();
         if self.projects_exist() {
             collect_sessions_from_projects(&self.projects_dir, &mut rows, self)?;
         }
         rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
 
-        *self.sessions_cache.lock().expect("lock poisoned") = Some(SessionsCache {
+        let cache = SessionsCache {
             fetched_at_epoch_ms: now_epoch_millis(),
             rows: rows.clone(),
-        });
+        };
+        *self.sessions_cache.lock().expect("lock poisoned") = Some(cache.clone());
+        let _ = store_sessions_cache_to_disk(&cache);
         Ok(rows)
     }
 
@@ -588,27 +601,32 @@ impl ClaudeSource {
 
     fn summary_hint(&self, path: &Path) -> Result<TranscriptHint> {
         let signature = transcript_cache_signature(path)?;
-        if let Some(entry) = self
-            .summary_cache
-            .lock()
-            .expect("lock poisoned")
-            .get(path)
-            .cloned()
-            && entry.modified_at_epoch_ms == signature.0
-            && entry.file_len == signature.1
         {
-            return Ok(entry.hint);
+            let mut cache = self.summary_cache.lock().expect("lock poisoned");
+            if cache.is_none() {
+                *cache = Some(load_summary_cache_from_disk().unwrap_or_default());
+            }
+            if let Some(entry) = cache.as_ref().and_then(|cache| cache.get(path)).cloned()
+                && entry.modified_at_epoch_ms == signature.0
+                && entry.file_len == signature.1
+            {
+                return Ok(entry.hint);
+            }
         }
 
         let hint = analyze_transcript(path, ReadMode::Summary)?;
-        self.summary_cache.lock().expect("lock poisoned").insert(
-            path.to_path_buf(),
-            SummaryHintCacheEntry {
-                modified_at_epoch_ms: signature.0,
-                file_len: signature.1,
-                hint: hint.clone(),
-            },
-        );
+        self.summary_cache
+            .lock()
+            .expect("lock poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                path.to_path_buf(),
+                SummaryHintCacheEntry {
+                    modified_at_epoch_ms: signature.0,
+                    file_len: signature.1,
+                    hint: hint.clone(),
+                },
+            );
         self.summary_cache_dirty.store(true, Ordering::Relaxed);
         Ok(hint)
     }
@@ -619,7 +637,9 @@ impl ClaudeSource {
         }
 
         let cache = self.summary_cache.lock().expect("lock poisoned");
-        if let Err(error) = store_summary_cache_to_disk(&cache) {
+        let empty_cache = HashMap::new();
+        let cache_ref = cache.as_ref().unwrap_or(&empty_cache);
+        if let Err(error) = store_summary_cache_to_disk(cache_ref) {
             tracing::debug!("failed to persist Claude summary cache: {error:#}");
         }
     }
@@ -699,20 +719,33 @@ impl ClaudeSource {
 #[async_trait]
 impl SessionSource for ClaudeSource {
     async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
+        self.list_sessions_with_progress(query, None).await
+    }
+
+    async fn list_sessions_with_progress(
+        &self,
+        query: SessionQuery,
+        progress: Option<UnboundedSender<SessionLoadProgress>>,
+    ) -> Result<SessionList> {
         let now = Utc::now();
-        let litellm_pricing = self.litellm_pricing().await;
+        let mut litellm_pricing = None;
         let mut subscription = self.subscription_quota().await;
         let mut quota_usage = ClaudeQuotaUsage::default();
         let mut sessions = Vec::new();
+        let rows = self.load_sessions()?;
+        let total_sessions = rows.len();
+        emit_session_progress(progress.as_ref(), 0, total_sessions);
+        let mut loaded_sessions = 0usize;
 
-        for row in self.load_sessions()? {
+        for row in rows {
             let hint = self.summary_hint(&row.transcript_path)?;
-            quota_usage.observe(
-                &hint,
-                row.model.as_deref().or(hint.latest_model.as_deref()),
-                litellm_pricing.as_deref(),
-                now,
-            );
+            let pricing_model = row.model.as_deref().or(hint.latest_model.as_deref());
+            if litellm_pricing.is_none()
+                && pricing_model.is_some_and(|model| builtin_claude_pricing(model).is_none())
+            {
+                litellm_pricing = self.litellm_pricing().await;
+            }
+            quota_usage.observe(&hint, pricing_model, litellm_pricing.as_deref(), now);
             let summary = build_summary(
                 &self.machine_id,
                 &self.machine_label,
@@ -722,11 +755,16 @@ impl SessionSource for ClaudeSource {
                 now,
             );
             sessions.push(summary);
-        }
+            loaded_sessions += 1;
+            if loaded_sessions == total_sessions || loaded_sessions.is_multiple_of(8) {
+                emit_session_progress(progress.as_ref(), loaded_sessions, total_sessions);
+            }
 
-        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        if let Some(limit) = query.limit {
-            sessions.truncate(limit);
+            if let Some(limit) = query.limit
+                && sessions.len() >= limit
+            {
+                break;
+            }
         }
 
         if let Some(quota) = subscription.as_mut()
@@ -739,7 +777,7 @@ impl SessionSource for ClaudeSource {
 
         Ok(SessionList {
             generated_at: now,
-            overview: build_overview(&sessions, subscription),
+            overview: build_overview(&sessions, subscription, total_sessions),
             sessions,
         })
     }
@@ -748,7 +786,16 @@ impl SessionSource for ClaudeSource {
         let now = Utc::now();
         let row = self.session_by_id(id)?;
         let hint = analyze_transcript(&row.transcript_path, ReadMode::Detail)?;
-        let litellm_pricing = self.litellm_pricing().await;
+        let litellm_pricing = if row
+            .model
+            .as_deref()
+            .or(hint.latest_model.as_deref())
+            .is_some_and(|model| builtin_claude_pricing(model).is_none())
+        {
+            self.litellm_pricing().await
+        } else {
+            None
+        };
         let summary = build_summary(
             &self.machine_id,
             &self.machine_label,
@@ -776,6 +823,19 @@ impl SessionSource for ClaudeSource {
             active_turns: usize::from(hint.run_active),
             pending_tool_calls: hint.pending_tool_ids.len(),
         })
+    }
+}
+
+fn emit_session_progress(
+    progress: Option<&UnboundedSender<SessionLoadProgress>>,
+    loaded_sessions: usize,
+    total_sessions: usize,
+) {
+    if let Some(progress) = progress {
+        let _ = progress.send(SessionLoadProgress {
+            loaded_sessions,
+            total_sessions,
+        });
     }
 }
 
@@ -997,8 +1057,10 @@ fn build_navigation(row: &SessionRow) -> Vec<NavigationTarget> {
 fn build_overview(
     sessions: &[SessionSummary],
     subscription: Option<ProviderQuota>,
+    total_sessions: usize,
 ) -> UsageOverview {
     UsageOverview {
+        total_sessions,
         total_tokens: sessions
             .iter()
             .map(|session| session.tokens.total_tokens)
@@ -1283,7 +1345,7 @@ fn parse_claude_status_quota(
         week_all_index
             .and_then(|index| parse_previous_usage_block(&lines, index, "5H", None, now_local)),
         week_all_index.and_then(|index| {
-            parse_usage_block_after(&lines, index, "WK", Some(7 * 24 * 60), now_local)
+            parse_usage_block_after(&lines, index, "7d", Some(7 * 24 * 60), now_local)
         }),
         sonnet_index.and_then(|index| {
             parse_usage_block_after(&lines, index, "SN", Some(7 * 24 * 60), now_local)
@@ -1920,15 +1982,21 @@ fn collect_sessions_from_projects(
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         {
-            let static_data = source
-                .transcript_static(&transcript_path)
-                .unwrap_or_else(|_| TranscriptStatic::default());
-            let session_id = if static_data.id.is_empty() {
-                fallback_session_id(&transcript_path)
-            } else {
-                static_data.id.clone()
-            };
-            let index_entry = index_entries.get(&session_id);
+            let fallback_id = fallback_session_id(&transcript_path);
+            let mut static_data = TranscriptStatic::default();
+            let mut session_id = fallback_id.clone();
+            let mut index_entry = index_entries.get(&session_id);
+
+            if index_entry.is_none() {
+                static_data = source
+                    .transcript_static(&transcript_path)
+                    .unwrap_or_else(|_| TranscriptStatic::default());
+                if !static_data.id.is_empty() {
+                    session_id = static_data.id.clone();
+                    index_entry = index_entries.get(&session_id);
+                }
+            }
+
             let created_at = index_entry
                 .and_then(|entry| entry.created.as_deref())
                 .and_then(parse_rfc3339)
@@ -3077,6 +3145,16 @@ fn status_cache_path() -> Option<PathBuf> {
     )
 }
 
+fn sessions_cache_path() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(
+        base_dirs
+            .cache_dir()
+            .join("cow-watch")
+            .join("claude_sessions.json"),
+    )
+}
+
 fn summary_cache_path() -> Option<PathBuf> {
     let base_dirs = BaseDirs::new()?;
     Some(
@@ -3133,6 +3211,36 @@ fn load_status_cache_from_disk() -> Result<Option<ClaudeStatusCache>> {
     }))
 }
 
+fn load_sessions_cache_from_disk() -> Result<Option<SessionsCache>> {
+    let Some(path) = sessions_cache_path() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read sessions cache {}", path.display()))?;
+    let parsed = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse sessions cache {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn store_sessions_cache_to_disk(cache: &SessionsCache) -> Result<()> {
+    let Some(path) = sessions_cache_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let raw = serde_json::to_string(cache)
+        .with_context(|| format!("failed to serialize sessions cache {}", path.display()))?;
+    fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 fn store_status_cache_to_disk(cache: &ClaudeStatusCache) -> Result<()> {
     let Some(path) = status_cache_path() else {
         return Ok(());
@@ -3178,7 +3286,7 @@ fn normalize_claude_quota_labels(mut quota: ProviderQuota) -> ProviderQuota {
     for window in &mut quota.windows {
         window.label = match window.label.as_str() {
             "CS" => "5H".to_string(),
-            "7D" => "WK".to_string(),
+            "7D" | "WK" => "7d".to_string(),
             "SO" => "SN".to_string(),
             other => other.to_string(),
         };
@@ -3263,6 +3371,11 @@ fn is_status_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
 fn is_sessions_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
     age_ms >= 0 && age_ms <= SESSION_DISCOVERY_CACHE_TTL.as_millis() as i64
+}
+
+fn is_sessions_disk_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+    let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
+    age_ms >= 0 && age_ms <= SESSION_DISCOVERY_DISK_CACHE_TTL.as_millis() as i64
 }
 
 fn now_epoch_millis() -> i64 {
@@ -3536,7 +3649,7 @@ mod tests {
         assert_eq!(quota.windows[0].label, "5H");
         assert_eq!(quota.windows[0].used_percent, 2);
         assert_eq!(quota.windows[0].remaining_percent, 98);
-        assert_eq!(quota.windows[1].label, "WK");
+        assert_eq!(quota.windows[1].label, "7d");
         assert_eq!(quota.windows[1].remaining_percent, 97);
         assert_eq!(quota.windows[2].label, "SN");
         assert_eq!(quota.windows[2].remaining_percent, 100);

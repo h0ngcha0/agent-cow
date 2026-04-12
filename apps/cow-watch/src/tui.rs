@@ -8,8 +8,8 @@ use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use cow_watch_core::{
     ActivityEvent, ActivityKind, MonitorService, ProviderQuota, SessionActivityState,
-    SessionDetail, SessionList, SessionQuery, SessionStatusKind, SessionSummary, TokenUsage,
-    UsageOverview,
+    SessionDetail, SessionList, SessionLoadProgress, SessionQuery, SessionStatusKind,
+    SessionSummary, TokenUsage, UsageOverview,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -24,7 +24,13 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::task::JoinHandle;
+
+const FAST_LIST_LIMIT: usize = 64;
+const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const UI_POLL_INTERVAL_BUSY: Duration = Duration::from_millis(100);
+const UI_POLL_INTERVAL_IDLE: Duration = Duration::from_millis(250);
 
 pub async fn run(service: MonitorService, limit: Option<usize>, refresh_secs: u64) -> Result<()> {
     enable_raw_mode()?;
@@ -42,18 +48,64 @@ pub async fn run(service: MonitorService, limit: Option<usize>, refresh_secs: u6
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListRefreshKind {
+    Fast,
+    Progressive,
+    Full,
+}
+
 fn spawn_list_refresh(
     service: MonitorService,
     limit: Option<usize>,
-) -> JoinHandle<Result<SessionList>> {
-    tokio::spawn(async move {
-        service
-            .list_sessions(SessionQuery {
-                include_archived: false,
-                limit,
-            })
-            .await
-    })
+    kind: ListRefreshKind,
+) -> ListRefreshTask {
+    let (progress_tx, progress_rx) = unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let list = service
+            .list_sessions_with_progress(
+                SessionQuery {
+                    include_archived: false,
+                    limit,
+                },
+                Some(progress_tx),
+            )
+            .await?;
+        Ok((kind, list))
+    });
+    ListRefreshTask {
+        handle,
+        progress_rx,
+    }
+}
+
+fn queue_progressive_refresh(
+    app: &mut TuiApp,
+    service: &MonitorService,
+    refresh: &mut Option<ListRefreshTask>,
+) {
+    let next_limit = app.next_progress_limit();
+    if next_limit <= app.sessions.len() {
+        app.loading_more = false;
+        app.full_load_complete = true;
+        return;
+    }
+
+    app.loading_more = true;
+    app.loading_progress_total = app
+        .loading_progress_total
+        .max(app.overview.total_sessions)
+        .max(app.sessions.len());
+    *refresh = Some(spawn_list_refresh(
+        service.clone(),
+        Some(next_limit),
+        ListRefreshKind::Progressive,
+    ));
+}
+
+struct ListRefreshTask {
+    handle: JoinHandle<Result<(ListRefreshKind, SessionList)>>,
+    progress_rx: UnboundedReceiver<SessionLoadProgress>,
 }
 
 fn spawn_detail_refresh(
@@ -100,18 +152,27 @@ async fn run_loop(
     refresh_secs: u64,
 ) -> Result<()> {
     let mut app = TuiApp::new(limit, Duration::from_secs(refresh_secs));
-    let initial_load = spawn_list_refresh(service.clone(), app.limit);
+    let mut initial_load = spawn_list_refresh(
+        service.clone(),
+        Some(app.fast_limit()),
+        ListRefreshKind::Fast,
+    );
+    let mut initial_progress = SessionLoadProgress::default();
 
     loop {
-        terminal.draw(draw_loading)?;
+        while let Ok(progress) = initial_load.progress_rx.try_recv() {
+            initial_progress = progress;
+        }
 
-        if initial_load.is_finished() {
-            let response = initial_load.await??;
-            app.apply_session_list(response);
+        terminal.draw(|frame| draw_loading(frame, &initial_progress))?;
+
+        if initial_load.handle.is_finished() {
+            let (kind, response) = initial_load.handle.await??;
+            app.apply_list_refresh(kind, response);
             break;
         }
 
-        if event::poll(Duration::from_millis(60))?
+        if event::poll(UI_POLL_INTERVAL_BUSY)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -120,15 +181,43 @@ async fn run_loop(
         }
     }
 
-    let mut list_refresh: Option<JoinHandle<Result<SessionList>>> = None;
+    let mut fast_refresh: Option<ListRefreshTask> = None;
+    let mut full_refresh: Option<ListRefreshTask> = None;
     let mut detail_refresh: Option<JoinHandle<Result<(String, SessionDetail)>>> = None;
 
+    if app.should_load_more() {
+        queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+    }
+
     loop {
-        if let Some(handle) = list_refresh.as_ref()
+        if let Some(task) = fast_refresh.as_mut() {
+            while let Ok(progress) = task.progress_rx.try_recv() {
+                app.apply_load_progress(progress);
+            }
+        }
+        if let Some(handle) = fast_refresh.as_ref().map(|task| &task.handle)
             && handle.is_finished()
         {
-            let response = list_refresh.take().unwrap().await??;
-            app.apply_session_list(response);
+            let (kind, response) = fast_refresh.take().unwrap().handle.await??;
+            app.apply_list_refresh(kind, response);
+            if app.detail_mode {
+                queue_detail_refresh(&mut app, &service, &mut detail_refresh);
+            }
+        }
+
+        if let Some(task) = full_refresh.as_mut() {
+            while let Ok(progress) = task.progress_rx.try_recv() {
+                app.apply_load_progress(progress);
+            }
+        }
+        if let Some(handle) = full_refresh.as_ref().map(|task| &task.handle)
+            && handle.is_finished()
+        {
+            let (kind, response) = full_refresh.take().unwrap().handle.await??;
+            app.apply_list_refresh(kind, response);
+            if kind == ListRefreshKind::Progressive && app.should_load_more() {
+                queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+            }
             if app.detail_mode {
                 queue_detail_refresh(&mut app, &service, &mut detail_refresh);
             }
@@ -151,7 +240,18 @@ async fn run_loop(
 
         terminal.draw(|frame| draw(frame, &mut app))?;
 
-        if event::poll(Duration::from_millis(60))?
+        let poll_interval = if app.detail_loading
+            || app.loading_more
+            || fast_refresh.is_some()
+            || full_refresh.is_some()
+            || detail_refresh.is_some()
+        {
+            UI_POLL_INTERVAL_BUSY
+        } else {
+            UI_POLL_INTERVAL_IDLE
+        };
+
+        if event::poll(poll_interval)?
             && let Event::Key(key) = event::read()?
         {
             if key.kind != KeyEventKind::Press {
@@ -203,8 +303,22 @@ async fn run_loop(
                     KeyCode::Esc if app.detail_mode => app.close_detail_mode(),
                     KeyCode::Esc => app.clear_filter(),
                     KeyCode::Char('r') => {
-                        if list_refresh.is_none() {
-                            list_refresh = Some(spawn_list_refresh(service.clone(), app.limit));
+                        if fast_refresh.is_none() && full_refresh.is_none() {
+                            if app.should_load_more() {
+                                queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+                            } else if app.should_run_full_refresh() {
+                                full_refresh = Some(spawn_list_refresh(
+                                    service.clone(),
+                                    app.requested_limit,
+                                    ListRefreshKind::Full,
+                                ));
+                            } else {
+                                fast_refresh = Some(spawn_list_refresh(
+                                    service.clone(),
+                                    Some(app.fast_limit()),
+                                    ListRefreshKind::Fast,
+                                ));
+                            }
                         }
                     }
                     KeyCode::Enter if !app.detail_mode => {
@@ -249,8 +363,25 @@ async fn run_loop(
             }
         }
 
-        if app.last_refresh.elapsed() >= app.refresh_every && list_refresh.is_none() {
-            list_refresh = Some(spawn_list_refresh(service.clone(), app.limit));
+        if app.last_refresh.elapsed() >= app.refresh_every
+            && fast_refresh.is_none()
+            && full_refresh.is_none()
+        {
+            if app.should_load_more() {
+                queue_progressive_refresh(&mut app, &service, &mut full_refresh);
+            } else if app.should_run_full_refresh() {
+                full_refresh = Some(spawn_list_refresh(
+                    service.clone(),
+                    app.requested_limit,
+                    ListRefreshKind::Full,
+                ));
+            } else {
+                fast_refresh = Some(spawn_list_refresh(
+                    service.clone(),
+                    Some(app.fast_limit()),
+                    ListRefreshKind::Fast,
+                ));
+            }
         }
     }
 
@@ -270,9 +401,15 @@ struct TuiApp {
     detail_scroll: u16,
     follow_stick_to_bottom: bool,
     local_machine_id: String,
-    limit: Option<usize>,
+    requested_limit: Option<usize>,
     refresh_every: Duration,
     last_refresh: Instant,
+    last_full_refresh: Instant,
+    full_refresh_every: Duration,
+    full_load_complete: bool,
+    loading_more: bool,
+    loading_progress_loaded: usize,
+    loading_progress_total: usize,
     error: Option<String>,
     notice: Option<UiNotice>,
     filter_input: String,
@@ -295,6 +432,7 @@ impl TuiApp {
     fn new(limit: Option<usize>, refresh_every: Duration) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
+        let now = Instant::now();
 
         Self {
             sessions: Vec::new(),
@@ -309,9 +447,15 @@ impl TuiApp {
             detail_scroll: 0,
             follow_stick_to_bottom: false,
             local_machine_id: open::local_machine_id(),
-            limit,
+            requested_limit: limit,
             refresh_every,
-            last_refresh: Instant::now(),
+            last_refresh: now,
+            last_full_refresh: now,
+            full_refresh_every: FULL_REFRESH_INTERVAL,
+            full_load_complete: limit.is_some(),
+            loading_more: false,
+            loading_progress_loaded: 0,
+            loading_progress_total: 0,
             error: None,
             notice: None,
             filter_input: String::new(),
@@ -320,7 +464,69 @@ impl TuiApp {
         }
     }
 
-    fn apply_session_list(&mut self, response: SessionList) {
+    fn fast_limit(&self) -> usize {
+        self.requested_limit
+            .unwrap_or(FAST_LIST_LIMIT)
+            .clamp(1, FAST_LIST_LIMIT)
+    }
+
+    fn should_load_more(&self) -> bool {
+        !self.full_load_complete && self.sessions.len() < self.overview.total_sessions
+    }
+
+    fn should_run_full_refresh(&self) -> bool {
+        self.requested_limit.is_none()
+            && (!self.full_load_complete
+                || self.last_full_refresh.elapsed() >= self.full_refresh_every)
+    }
+
+    fn next_progress_limit(&self) -> usize {
+        let total = self.overview.total_sessions.max(self.sessions.len());
+        let current = self.sessions.len().max(self.fast_limit());
+        if total <= current {
+            return total;
+        }
+        (current.saturating_mul(2)).min(total)
+    }
+
+    fn apply_list_refresh(&mut self, kind: ListRefreshKind, response: SessionList) {
+        match kind {
+            ListRefreshKind::Fast => {
+                if self.full_load_complete {
+                    self.merge_session_list(response);
+                } else {
+                    self.replace_session_list(response);
+                    self.full_load_complete = self.sessions.len() >= self.overview.total_sessions;
+                    self.loading_more = self.should_load_more();
+                }
+            }
+            ListRefreshKind::Progressive => {
+                self.replace_session_list(response);
+                self.full_load_complete = self.requested_limit.is_some()
+                    || self.sessions.len() >= self.overview.total_sessions;
+                self.loading_more = self.should_load_more();
+                if self.full_load_complete {
+                    self.last_full_refresh = Instant::now();
+                }
+            }
+            ListRefreshKind::Full => {
+                self.replace_session_list(response);
+                self.full_load_complete = self.requested_limit.is_none()
+                    || self.sessions.len() >= self.overview.total_sessions;
+                self.loading_more = false;
+                self.last_full_refresh = Instant::now();
+            }
+        }
+        self.loading_progress_loaded = self.loading_progress_loaded.max(self.sessions.len());
+        self.loading_progress_total = self.overview.total_sessions.max(self.sessions.len());
+    }
+
+    fn apply_load_progress(&mut self, progress: SessionLoadProgress) {
+        self.loading_progress_loaded = self.loading_progress_loaded.max(progress.loaded_sessions);
+        self.loading_progress_total = self.loading_progress_total.max(progress.total_sessions);
+    }
+
+    fn replace_session_list(&mut self, response: SessionList) {
         let selected_id = self.selected_session_id().map(ToOwned::to_owned);
         self.sessions = response.sessions;
         self.overview = response.overview;
@@ -346,6 +552,42 @@ impl TuiApp {
             self.detail_mode = false;
             self.detail_scroll = 0;
             self.follow_stick_to_bottom = false;
+        }
+    }
+
+    fn merge_session_list(&mut self, response: SessionList) {
+        if self.sessions.is_empty() {
+            self.replace_session_list(response);
+            return;
+        }
+
+        let selected_id = self.selected_session_id().map(ToOwned::to_owned);
+        self.last_refresh = Instant::now();
+        self.error = None;
+        self.overview.total_sessions = response.overview.total_sessions;
+        self.overview.quotas = response.overview.quotas;
+
+        for session in response.sessions {
+            if let Some(existing) = self.sessions.iter_mut().find(|item| item.id == session.id) {
+                *existing = session;
+            } else {
+                self.sessions.push(session);
+            }
+        }
+
+        self.sessions
+            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        self.rebuild_filter(selected_id.as_deref());
+
+        if let Some(selected_id) = selected_id.as_deref()
+            && let Some(detail) = self.detail.as_mut()
+            && detail.summary.id == selected_id
+            && let Some(summary) = self
+                .sessions
+                .iter()
+                .find(|session| session.id == selected_id)
+        {
+            detail.summary = summary.clone();
         }
     }
 
@@ -670,7 +912,9 @@ impl TuiApp {
     }
 
     fn footer_height(&self) -> u16 {
-        u16::from(self.notice.is_some() || self.error.is_some() || self.filter_mode)
+        u16::from(
+            self.notice.is_some() || self.error.is_some() || self.filter_mode || self.loading_more,
+        )
     }
 }
 
@@ -712,7 +956,7 @@ fn detail_content_width(area: Rect) -> u16 {
     area.width.saturating_sub(2).max(1)
 }
 
-fn draw_loading(frame: &mut Frame) {
+fn draw_loading(frame: &mut Frame, progress: &SessionLoadProgress) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -752,22 +996,38 @@ fn draw_loading(frame: &mut Frame) {
     frame.render_widget(render_brand_cluster(brand_width), brand_row[1]);
 
     frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            format!("Loading sessions{}", loading_dots()),
-            Style::default()
-                .fg(accent_cyan())
-                .add_modifier(Modifier::BOLD),
-        )]))
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "Loading sessions",
+                Style::default()
+                    .fg(accent_cyan())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(loading_dots_field(), Style::default().fg(accent_cyan())),
+        ]))
         .alignment(Alignment::Center),
         body[2],
     );
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
+    let progress_total = progress.total_sessions;
+    let progress_line = if progress_total > 0 {
+        Line::from(vec![
+            Span::styled("Scanning ", Style::default().fg(text_muted_color())),
+            Span::styled(
+                format!("{} / {}", progress.loaded_sessions, progress_total),
+                Style::default()
+                    .fg(accent_gold())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
             "Restoring caches and scanning recent agent sessions",
             Style::default().fg(text_muted_color()),
-        )]))
-        .alignment(Alignment::Center),
+        ))
+    };
+    frame.render_widget(
+        Paragraph::new(progress_line).alignment(Alignment::Center),
         body[3],
     );
 }
@@ -981,7 +1241,9 @@ fn subscription_windows_line(
     bar_segments: usize,
     compact: bool,
 ) -> Line<'static> {
-    if quota.windows.is_empty() {
+    let windows = visible_quota_windows(quota);
+
+    if windows.is_empty() {
         if let Some(summary) = quota.summary.as_deref() {
             let mut line = subscription_summary_line(summary, width);
             pad_line_to_width(&mut line, width);
@@ -1005,7 +1267,7 @@ fn subscription_windows_line(
 
     let mut spans = Vec::new();
     let max_windows = if compact { 2 } else { 3 };
-    for (index, window) in quota.windows.iter().take(max_windows).enumerate() {
+    for (index, window) in windows.iter().take(max_windows).enumerate() {
         if index > 0 {
             spans.push(Span::raw("   "));
         }
@@ -1015,6 +1277,17 @@ fn subscription_windows_line(
     let mut line = Line::from(spans);
     pad_line_to_width(&mut line, width);
     line
+}
+
+fn visible_quota_windows(quota: &ProviderQuota) -> Vec<&cow_watch_core::QuotaWindow> {
+    quota
+        .windows
+        .iter()
+        .filter(|window| {
+            !(matches!(quota.provider, cow_watch_core::ProviderKind::Claude)
+                && window.label.eq_ignore_ascii_case("SN"))
+        })
+        .collect()
 }
 
 fn subscription_summary_line(summary: &str, width: usize) -> Line<'static> {
@@ -1170,16 +1443,34 @@ fn loading_dots() -> &'static str {
     }
 }
 
+fn loading_dots_field() -> String {
+    format!("{:<3}", loading_dots())
+}
+
 fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    vec![
+    let total_sessions = app
+        .loading_progress_total
+        .max(app.overview.total_sessions)
+        .max(app.sessions.len());
+    let scanned_sessions = app.loading_progress_loaded.max(app.sessions.len());
+    let mut lines = vec![
         header_meta_line("Host", app.visible_host_label()),
         header_meta_line(
             "Sessions",
-            format!("{}/{}", app.filtered_indices.len(), app.sessions.len()),
+            format!("{}/{}", app.filtered_indices.len(), total_sessions),
         ),
+    ];
+    if app.loading_more {
+        lines.push(header_meta_line(
+            "Scanning",
+            format!("{}/{}", scanned_sessions, total_sessions),
+        ));
+    }
+    lines.extend([
         header_meta_line("Spend", format_usd_short(app.overview.total_cost_usd)),
         header_meta_line("Tokens", format_tokens_short(app.overview.total_tokens)),
-    ]
+    ]);
+    lines
 }
 
 fn render_header_meta(app: &TuiApp) -> Paragraph<'static> {
@@ -2086,6 +2377,30 @@ fn render_footer(app: &TuiApp) -> Paragraph<'static> {
             Span::styled(
                 format!("/{}_", app.filter_input),
                 Style::default().fg(accent_gold()),
+            ),
+        ])
+    } else if app.loading_more {
+        let total_sessions = app
+            .loading_progress_total
+            .max(app.overview.total_sessions)
+            .max(app.sessions.len());
+        let scanned_sessions = app.loading_progress_loaded.max(app.sessions.len());
+        Line::from(vec![
+            Span::styled(
+                "Scanning sessions",
+                Style::default()
+                    .fg(accent_cyan())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(loading_dots_field(), Style::default().fg(accent_cyan())),
+            Span::styled(
+                format!(
+                    " {} of {}  •  showing {}",
+                    scanned_sessions,
+                    total_sessions,
+                    app.filtered_indices.len()
+                ),
+                Style::default().fg(text_muted_color()),
             ),
         ])
     } else if let Some(summary) = app.selected_summary() {
@@ -3321,9 +3636,13 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{animated_cow_lines, brand_cluster_lines};
+    use super::{
+        ListRefreshKind, TuiApp, animated_cow_lines, brand_cluster_lines, header_meta_lines,
+    };
     use chrono::{TimeZone, Utc};
+    use cow_watch_core::{SessionList, SessionLoadProgress, UsageOverview};
     use ratatui::text::Line;
+    use std::time::Duration;
 
     fn flatten_line(line: &Line<'_>) -> String {
         line.spans
@@ -3379,5 +3698,63 @@ mod tests {
         let talking = animated_cow_lines("oo", "~~", "|");
 
         assert_eq!(closed[2].chars().count(), talking[2].chars().count());
+    }
+
+    #[test]
+    fn apply_load_progress_stays_monotonic_across_staged_loads() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.loading_more = true;
+        app.loading_progress_loaded = 64;
+        app.loading_progress_total = 377;
+
+        app.apply_load_progress(SessionLoadProgress {
+            loaded_sessions: 0,
+            total_sessions: 377,
+        });
+        assert_eq!(app.loading_progress_loaded, 64);
+
+        app.apply_load_progress(SessionLoadProgress {
+            loaded_sessions: 72,
+            total_sessions: 377,
+        });
+        assert_eq!(app.loading_progress_loaded, 72);
+    }
+
+    #[test]
+    fn header_meta_lines_show_scanning_while_background_loading() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.loading_more = true;
+        app.loading_progress_loaded = 72;
+        app.loading_progress_total = 377;
+
+        let lines = header_meta_lines(&app)
+            .into_iter()
+            .map(|line| flatten_line(&line))
+            .collect::<Vec<_>>();
+
+        assert!(lines.iter().any(|line| line.contains("Scanning")));
+        assert!(lines.iter().any(|line| line.contains("72/377")));
+    }
+
+    #[test]
+    fn apply_list_refresh_does_not_move_scanning_progress_backwards() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.loading_more = true;
+        app.loading_progress_loaded = 145;
+        app.loading_progress_total = 377;
+
+        app.apply_list_refresh(
+            ListRefreshKind::Progressive,
+            SessionList {
+                generated_at: Utc.with_ymd_and_hms(2026, 4, 12, 10, 0, 0).unwrap(),
+                overview: UsageOverview {
+                    total_sessions: 377,
+                    ..UsageOverview::default()
+                },
+                sessions: Vec::new(),
+            },
+        );
+
+        assert_eq!(app.loading_progress_loaded, 145);
     }
 }

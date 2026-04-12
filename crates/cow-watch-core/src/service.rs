@@ -1,9 +1,15 @@
-use std::{cmp::Reverse, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::task::JoinSet;
 
 use crate::{SessionDetail, SessionList, SessionSummary, UsageOverview};
 
@@ -13,9 +19,29 @@ pub struct SessionQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SessionLoadProgress {
+    pub loaded_sessions: usize,
+    pub total_sessions: usize,
+}
+
 #[async_trait]
 pub trait SessionSource: Send + Sync {
     async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList>;
+    async fn list_sessions_with_progress(
+        &self,
+        query: SessionQuery,
+        progress: Option<UnboundedSender<SessionLoadProgress>>,
+    ) -> Result<SessionList> {
+        let list = self.list_sessions(query).await?;
+        if let Some(progress) = progress {
+            let _ = progress.send(SessionLoadProgress {
+                loaded_sessions: list.sessions.len(),
+                total_sessions: list.overview.total_sessions,
+            });
+        }
+        Ok(list)
+    }
     async fn get_session(&self, id: &str) -> Result<SessionDetail>;
 }
 
@@ -67,21 +93,70 @@ impl CombinedSource {
 #[async_trait]
 impl SessionSource for CombinedSource {
     async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
+        self.list_sessions_with_progress(query, None).await
+    }
+
+    async fn list_sessions_with_progress(
+        &self,
+        query: SessionQuery,
+        progress: Option<UnboundedSender<SessionLoadProgress>>,
+    ) -> Result<SessionList> {
         let mut sessions = Vec::new();
         let mut quotas = Vec::new();
+        let mut total_sessions = 0usize;
+        let mut join_set = JoinSet::new();
+        let progress_state = Arc::new(Mutex::new(HashMap::<String, SessionLoadProgress>::new()));
 
         for source in &self.sources {
-            let mut list = source
-                .source
-                .list_sessions(SessionQuery {
-                    include_archived: query.include_archived,
-                    limit: None,
-                })
-                .await?;
+            let source = source.clone();
+            let query = query.clone();
+            let progress_tx = progress.clone();
+            let progress_state = progress_state.clone();
+            let namespace = source.namespace.clone();
+            let (provider_progress_tx, mut provider_progress_rx) = unbounded_channel();
+            if let Some(progress_tx) = progress_tx {
+                tokio::spawn(async move {
+                    while let Some(update) = provider_progress_rx.recv().await {
+                        let aggregate = {
+                            let mut state = progress_state.lock().expect("lock poisoned");
+                            state.insert(namespace.clone(), update);
+                            SessionLoadProgress {
+                                loaded_sessions: state
+                                    .values()
+                                    .map(|item| item.loaded_sessions)
+                                    .sum(),
+                                total_sessions: state
+                                    .values()
+                                    .map(|item| item.total_sessions)
+                                    .sum(),
+                            }
+                        };
+                        let _ = progress_tx.send(aggregate);
+                    }
+                });
+            }
+            join_set.spawn(async move {
+                let list = source
+                    .source
+                    .list_sessions_with_progress(
+                        SessionQuery {
+                            include_archived: query.include_archived,
+                            limit: query.limit,
+                        },
+                        Some(provider_progress_tx),
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>((source.namespace, list))
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            let (namespace, mut list) = result??;
+            total_sessions += list.overview.total_sessions;
 
             quotas.append(&mut list.overview.quotas);
             for mut session in list.sessions {
-                namespace_summary(&source.namespace, &mut session);
+                namespace_summary(&namespace, &mut session);
                 sessions.push(session);
             }
         }
@@ -91,11 +166,18 @@ impl SessionSource for CombinedSource {
             sessions.truncate(limit);
         }
 
-        Ok(SessionList {
+        let list = SessionList {
             generated_at: Utc::now(),
-            overview: build_combined_overview(&sessions, quotas),
+            overview: build_combined_overview(&sessions, quotas, total_sessions),
             sessions,
-        })
+        };
+        if let Some(progress) = progress {
+            let _ = progress.send(SessionLoadProgress {
+                loaded_sessions: list.sessions.len(),
+                total_sessions: list.overview.total_sessions,
+            });
+        }
+        Ok(list)
     }
 
     async fn get_session(&self, id: &str) -> Result<SessionDetail> {
@@ -127,6 +209,16 @@ impl MonitorService {
 
     pub async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
         self.source.list_sessions(query).await
+    }
+
+    pub async fn list_sessions_with_progress(
+        &self,
+        query: SessionQuery,
+        progress: Option<UnboundedSender<SessionLoadProgress>>,
+    ) -> Result<SessionList> {
+        self.source
+            .list_sessions_with_progress(query, progress)
+            .await
     }
 
     pub async fn latest_session(&self) -> Result<SessionDetail> {
@@ -161,8 +253,10 @@ fn namespace_summary(namespace: &str, summary: &mut SessionSummary) {
 fn build_combined_overview(
     sessions: &[SessionSummary],
     quotas: Vec<crate::ProviderQuota>,
+    total_sessions: usize,
 ) -> UsageOverview {
     UsageOverview {
+        total_sessions,
         total_tokens: sessions
             .iter()
             .map(|session| session.tokens.total_tokens)

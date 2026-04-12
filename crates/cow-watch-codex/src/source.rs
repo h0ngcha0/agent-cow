@@ -16,14 +16,15 @@ use chrono::{DateTime, Duration, Local, Utc};
 use cow_watch_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
     PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionActivityState, SessionCost,
-    SessionDetail, SessionList, SessionQuery, SessionSource, SessionStatus, SessionStatusKind,
-    SessionSummary, StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
+    SessionDetail, SessionList, SessionLoadProgress, SessionQuery, SessionSource, SessionStatus,
+    SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
 };
 use directories::BaseDirs;
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
 const SUMMARY_TAIL_LINES: usize = 384;
 const DETAIL_TAIL_LINES: usize = 320;
@@ -40,7 +41,8 @@ const SUMMARY_CACHE_SCHEMA_VERSION: u32 = 2;
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const LITELLM_PRICING_CACHE_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
-const THREAD_DISCOVERY_CACHE_TTL: StdDuration = StdDuration::from_secs(5);
+const THREAD_DISCOVERY_CACHE_TTL: StdDuration = StdDuration::from_secs(15);
+const THREAD_DISCOVERY_DISK_CACHE_TTL: StdDuration = StdDuration::from_secs(90);
 
 #[derive(Clone, Debug)]
 pub struct CodexSource {
@@ -52,12 +54,12 @@ pub struct CodexSource {
     pricing_cache: Arc<Mutex<Option<LitellmPricingCache>>>,
     pricing_refresh_in_flight: Arc<AtomicBool>,
     static_cache: Arc<Mutex<HashMap<PathBuf, TranscriptStatic>>>,
-    summary_cache: Arc<Mutex<HashMap<PathBuf, SummaryHintCacheEntry>>>,
+    summary_cache: Arc<Mutex<Option<HashMap<PathBuf, SummaryHintCacheEntry>>>>,
     summary_cache_dirty: Arc<AtomicBool>,
     threads_cache: Arc<Mutex<Option<ThreadsCache>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ThreadRow {
     id: String,
     rollout_path: String,
@@ -171,7 +173,7 @@ struct UsageIndex {
     cost_by_hour: HashMap<String, RawCostBucket>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ThreadsCache {
     fetched_at_epoch_ms: i64,
     rows: Vec<ThreadRow>,
@@ -184,7 +186,6 @@ impl CodexSource {
             .unwrap_or_else(|_| "local".to_string());
         let configured_path = expand_known_path_vars(codex_home.into());
         let codex_home = normalize_codex_home(configured_path.clone());
-        let summary_cache = load_summary_cache_from_disk().unwrap_or_default();
 
         Self {
             configured_path,
@@ -198,7 +199,7 @@ impl CodexSource {
             pricing_cache: Arc::new(Mutex::new(None)),
             pricing_refresh_in_flight: Arc::new(AtomicBool::new(false)),
             static_cache: Arc::new(Mutex::new(HashMap::new())),
-            summary_cache: Arc::new(Mutex::new(summary_cache)),
+            summary_cache: Arc::new(Mutex::new(None)),
             summary_cache_dirty: Arc::new(AtomicBool::new(false)),
             threads_cache: Arc::new(Mutex::new(None)),
         }
@@ -293,27 +294,19 @@ impl CodexSource {
             return Ok(cache.rows.clone());
         }
 
-        let mut rows = self.discover_threads_from_rollouts()?;
-        let mut sqlite_rows_by_id = self
-            .load_threads_from_db()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| (row.id.clone(), row))
-            .collect::<HashMap<_, _>>();
-        let mut seen_ids = HashSet::new();
-
-        for row in &mut rows {
-            if let Some(sqlite_row) = sqlite_rows_by_id.remove(&row.id) {
-                enrich_thread_from_db(row, sqlite_row);
+        if let Some(cache) = load_threads_cache_from_disk()?
+            && is_threads_disk_cache_fresh(cache.fetched_at_epoch_ms)
+        {
+            if let Ok(mut memory_cache) = self.threads_cache.lock() {
+                *memory_cache = Some(cache.clone());
             }
-            seen_ids.insert(row.id.clone());
+            return Ok(cache.rows);
         }
 
-        rows.extend(
-            sqlite_rows_by_id
-                .into_values()
-                .filter(|row| seen_ids.insert(row.id.clone())),
-        );
+        let mut rows = self.load_threads_from_db().unwrap_or_default();
+        if rows.is_empty() {
+            rows = self.discover_threads_from_rollouts()?;
+        }
         rows.sort_by(|left, right| {
             right
                 .updated_at
@@ -327,6 +320,10 @@ impl CodexSource {
                 rows: rows.clone(),
             });
         }
+        let _ = store_threads_cache_to_disk(&ThreadsCache {
+            fetched_at_epoch_ms: now_epoch_millis(),
+            rows: rows.clone(),
+        });
 
         Ok(rows)
     }
@@ -441,18 +438,23 @@ impl CodexSource {
     fn summary_hint(&self, path: &Path) -> Option<RolloutHint> {
         let (modified_at_epoch_ms, file_len) = rollout_cache_signature(path).ok()?;
 
-        if let Ok(cache) = self.summary_cache.lock()
-            && let Some(entry) = cache.get(path)
-            && entry.schema_version == SUMMARY_CACHE_SCHEMA_VERSION
-            && entry.modified_at_epoch_ms == modified_at_epoch_ms
-            && entry.file_len == file_len
-        {
-            return Some(entry.hint.clone());
+        if let Ok(mut cache) = self.summary_cache.lock() {
+            if cache.is_none() {
+                *cache = Some(load_summary_cache_from_disk().unwrap_or_default());
+            }
+            if let Some(entry) = cache.as_ref().and_then(|cache| cache.get(path))
+                && entry.schema_version == SUMMARY_CACHE_SCHEMA_VERSION
+                && entry.modified_at_epoch_ms == modified_at_epoch_ms
+                && entry.file_len == file_len
+            {
+                return Some(entry.hint.clone());
+            }
         }
 
         let hint = analyze_rollout(path, ReadMode::Summary).ok()?;
 
         if let Ok(mut cache) = self.summary_cache.lock() {
+            let cache = cache.get_or_insert_with(HashMap::new);
             cache.insert(
                 path.to_path_buf(),
                 SummaryHintCacheEntry {
@@ -474,7 +476,7 @@ impl CodexSource {
         }
 
         let snapshot = if let Ok(cache) = self.summary_cache.lock() {
-            cache.clone()
+            cache.clone().unwrap_or_default()
         } else {
             return;
         };
@@ -616,12 +618,27 @@ impl CodexSource {
 #[async_trait]
 impl SessionSource for CodexSource {
     async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
+        self.list_sessions_with_progress(query, None).await
+    }
+
+    async fn list_sessions_with_progress(
+        &self,
+        query: SessionQuery,
+        progress: Option<UnboundedSender<SessionLoadProgress>>,
+    ) -> Result<SessionList> {
         let now = Utc::now();
         let mut sessions = Vec::new();
         let mut latest_quota: Option<(DateTime<Utc>, ProviderQuota)> = None;
-        let litellm_pricing = self.litellm_pricing().await;
+        let mut litellm_pricing = None;
+        let rows = self.load_threads()?;
+        let total_sessions = rows
+            .iter()
+            .filter(|row| query.include_archived || !row.archived)
+            .count();
+        emit_session_progress(progress.as_ref(), 0, total_sessions);
+        let mut loaded_sessions = 0usize;
 
-        for row in self.load_threads()? {
+        for row in rows {
             if !query.include_archived && row.archived {
                 continue;
             }
@@ -631,6 +648,14 @@ impl SessionSource for CodexSource {
             } else {
                 self.summary_hint(Path::new(&row.rollout_path))
             };
+            if litellm_pricing.is_none()
+                && row
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| builtin_codex_pricing(model).is_none())
+            {
+                litellm_pricing = self.litellm_pricing().await;
+            }
 
             let summary = build_summary(
                 &self.machine_id,
@@ -651,6 +676,10 @@ impl SessionSource for CodexSource {
             }
 
             sessions.push(summary);
+            loaded_sessions += 1;
+            if loaded_sessions == total_sessions || loaded_sessions.is_multiple_of(8) {
+                emit_session_progress(progress.as_ref(), loaded_sessions, total_sessions);
+            }
 
             if let Some(limit) = query.limit
                 && sessions.len() >= limit
@@ -663,7 +692,11 @@ impl SessionSource for CodexSource {
 
         Ok(SessionList {
             generated_at: now,
-            overview: build_overview(&sessions, latest_quota.map(|(_, quota)| quota)),
+            overview: build_overview(
+                &sessions,
+                latest_quota.map(|(_, quota)| quota),
+                total_sessions,
+            ),
             sessions,
         })
     }
@@ -672,7 +705,15 @@ impl SessionSource for CodexSource {
         let now = Utc::now();
         let row = self.thread_by_id(id)?;
         let hint = analyze_rollout(&PathBuf::from(&row.rollout_path), ReadMode::Detail)?;
-        let litellm_pricing = self.litellm_pricing().await;
+        let litellm_pricing = if row
+            .model
+            .as_deref()
+            .is_some_and(|model| builtin_codex_pricing(model).is_none())
+        {
+            self.litellm_pricing().await
+        } else {
+            None
+        };
         let summary = build_summary(
             &self.machine_id,
             &self.machine_label,
@@ -700,6 +741,19 @@ impl SessionSource for CodexSource {
             active_turns: hint.active_turns,
             pending_tool_calls: hint.pending_call_ids.len(),
         })
+    }
+}
+
+fn emit_session_progress(
+    progress: Option<&UnboundedSender<SessionLoadProgress>>,
+    loaded_sessions: usize,
+    total_sessions: usize,
+) {
+    if let Some(progress) = progress {
+        let _ = progress.send(SessionLoadProgress {
+            loaded_sessions,
+            total_sessions,
+        });
     }
 }
 
@@ -922,7 +976,11 @@ fn build_navigation(row: &ThreadRow, rollout_path: Option<String>) -> Vec<Naviga
     navigation
 }
 
-fn build_overview(sessions: &[SessionSummary], quota: Option<ProviderQuota>) -> UsageOverview {
+fn build_overview(
+    sessions: &[SessionSummary],
+    quota: Option<ProviderQuota>,
+    total_sessions: usize,
+) -> UsageOverview {
     let total_tokens = sessions
         .iter()
         .map(|session| session.tokens.total_tokens)
@@ -941,6 +999,7 @@ fn build_overview(sessions: &[SessionSummary], quota: Option<ProviderQuota>) -> 
         .count();
 
     UsageOverview {
+        total_sessions,
         total_tokens,
         total_cost_usd,
         sessions_with_cost,
@@ -953,12 +1012,20 @@ fn resolve_codex_pricing(
     model: &str,
     litellm_pricing: Option<&LitellmPricingMap>,
 ) -> Option<CodexPricing> {
+    if let Some(pricing) = builtin_codex_pricing(model) {
+        return Some(pricing);
+    }
+
     if let Some(entry) = litellm_pricing.and_then(|entries| find_litellm_entry(model, entries))
         && let Some(pricing) = litellm_to_codex_pricing(entry)
     {
         return Some(pricing);
     }
 
+    None
+}
+
+fn builtin_codex_pricing(model: &str) -> Option<CodexPricing> {
     match model.to_ascii_lowercase().as_str() {
         "gpt-5.4" => Some(CodexPricing {
             input_per_million: 2.5,
@@ -1183,40 +1250,6 @@ fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>
             confidence: StatusConfidence::Inferred,
             reason: "The session has not emitted activity recently".to_string(),
         }
-    }
-}
-
-fn enrich_thread_from_db(row: &mut ThreadRow, sqlite_row: ThreadRow) {
-    if row.rollout_path.is_empty() && !sqlite_row.rollout_path.is_empty() {
-        row.rollout_path = sqlite_row.rollout_path;
-    }
-    if sqlite_row.created_at < row.created_at {
-        row.created_at = sqlite_row.created_at;
-    }
-    if sqlite_row.updated_at > row.updated_at {
-        row.updated_at = sqlite_row.updated_at;
-    }
-    if row.cwd.is_empty() && !sqlite_row.cwd.is_empty() {
-        row.cwd = sqlite_row.cwd;
-    }
-    if !sqlite_row.title.is_empty() {
-        row.title = sqlite_row.title;
-    }
-    if sqlite_row.tokens_used > row.tokens_used {
-        row.tokens_used = sqlite_row.tokens_used;
-    }
-    row.archived |= sqlite_row.archived;
-    if row.git_branch.is_none() {
-        row.git_branch = sqlite_row.git_branch;
-    }
-    if row.git_origin_url.is_none() {
-        row.git_origin_url = sqlite_row.git_origin_url;
-    }
-    if row.agent_role.is_none() {
-        row.agent_role = sqlite_row.agent_role;
-    }
-    if row.model.is_none() {
-        row.model = sqlite_row.model;
     }
 }
 
@@ -1996,6 +2029,16 @@ fn summary_cache_path() -> Option<PathBuf> {
     )
 }
 
+fn threads_cache_path() -> Option<PathBuf> {
+    let base_dirs = BaseDirs::new()?;
+    Some(
+        base_dirs
+            .cache_dir()
+            .join("cow-watch")
+            .join("codex_threads.json"),
+    )
+}
+
 fn load_summary_cache_from_disk() -> Result<HashMap<PathBuf, SummaryHintCacheEntry>> {
     let Some(path) = summary_cache_path() else {
         return Ok(HashMap::new());
@@ -2042,6 +2085,36 @@ fn store_summary_cache_to_disk(cache: &HashMap<PathBuf, SummaryHintCacheEntry>) 
     Ok(())
 }
 
+fn load_threads_cache_from_disk() -> Result<Option<ThreadsCache>> {
+    let Some(path) = threads_cache_path() else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read threads cache {}", path.display()))?;
+    let parsed = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse threads cache {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn store_threads_cache_to_disk(cache: &ThreadsCache) -> Result<()> {
+    let Some(path) = threads_cache_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let raw = serde_json::to_string(cache)
+        .with_context(|| format!("failed to serialize threads cache {}", path.display()))?;
+    fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 fn is_pricing_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
     age_ms >= 0 && age_ms <= LITELLM_PRICING_CACHE_TTL.as_millis() as i64
@@ -2050,6 +2123,11 @@ fn is_pricing_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
 fn is_threads_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
     age_ms >= 0 && age_ms <= THREAD_DISCOVERY_CACHE_TTL.as_millis() as i64
+}
+
+fn is_threads_disk_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+    let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
+    age_ms >= 0 && age_ms <= THREAD_DISCOVERY_DISK_CACHE_TTL.as_millis() as i64
 }
 
 fn now_epoch_millis() -> i64 {
