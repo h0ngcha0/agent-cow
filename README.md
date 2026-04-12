@@ -15,33 +15,49 @@
 
 Agent Cow is a local-first observability tool for coding agents.
 
-It watches your Codex and Claude sessions, shows what they are doing, what they cost, how much context they have burned, and whether they are waiting for you. It runs as a fast terminal UI, or as a headless machine agent that another TUI can subscribe to.
+It watches your agent sessions, shows what they are doing, what they cost, how much context they have burned, and whether they are waiting for you. It runs as a fast terminal UI, or as a headless machine agent that another TUI can subscribe to.
 
-Today it supports **Codex** and **Claude**. The architecture is intentionally provider-oriented, so more agent runtimes can be added later without reinventing the UI or core data model.
+Today it ships with **Codex** and **Claude** adapters. The architecture is intentionally provider-oriented, so more agent runtimes can be added later without reinventing the UI or core data model.
 
 No dashboard religion. No cloud dependency. Just a sharp TUI and a cow with opinions.
 
-## Screenshot
+The cow is a deliberate nod to the long and noble `cowsay` tradition. If you enjoy ranking terminal cattle, see [rank-amateur-cowsay](https://github.com/tnalpgge/rank-amateur-cowsay).
 
-![Agent Cow TUI](docs/agent-cow-tui.png)
+## See The Herd
+
+The list view is the control tower: what is running, what is waiting, what is quietly burning tokens, and which machine it lives on.
+
+![Agent Cow session list](docs/agent-cow-tui.png)
+
+## Crack Open A Session
+
+The details pane shows the shape of a single run without forcing you to dig through raw logs: status, spend, context pressure, tokens, workspace, and execution state.
+
+![Agent Cow details pane](docs/agent-cow-details.png)
+
+## Follow The Thread
+
+Sometimes you do not need every event. You just need the latest conversation and the last few tool moves so you can tell whether the agent is making progress or waiting on you.
+
+![Agent Cow latest conversation](docs/agent-cow-follow.png)
 
 ## What It Does
 
-- Watches **Codex** and **Claude** sessions from local machine state
+- Watches agent sessions from local machine state
 - Shows **live session status**: `Thinking`, `Exploring`, `Compacting`, `Waiting`, `Idle`
 - Tracks **tokens**, **cost**, **context usage**, and **quota/subscription** summaries
-- Lets you open the underlying session in **Codex** or **Claude**
+- Lets you open the underlying session in the provider app
 - Shows **Latest Conversation** so you can quickly see what an agent is doing
 - Supports **multi-machine** setups with a headless `agent` mode
 - Uses **HTTP + websocket subscriptions** for low-friction remote monitoring
-- Is built to support **more providers in the future**
+- Is built to support **more providers and runtimes in the future**
 
 ## Current Shape
 
 - **TUI mode**: local all-in-one experience
 - **Agent mode**: headless remote node for another TUI to connect to
-- **Providers today**: Codex and Claude
-- **Providers later**: whatever else is worth watching
+- **Adapters today**: Codex and Claude
+- **Adapters later**: whatever else is worth watching
 - **Web UI**: intentionally not shipped right now
 
 ## Quick Start
@@ -178,7 +194,7 @@ AGENT_COW_CODEX_HOME=...
 AGENT_COW_CLAUDE_HOME=...
 ```
 
-Agent Cow also falls back to normal local provider locations when possible.
+Agent Cow also falls back to normal local runtime locations when possible.
 
 ## Performance Notes
 
@@ -194,7 +210,7 @@ If performance is bad, that is a bug.
 
 ## Status
 
-Open-source ready, actively evolving, and intentionally biased toward:
+Open-source, actively evolving, and intentionally biased toward:
 
 - fast terminal workflows
 - local ownership of your data
