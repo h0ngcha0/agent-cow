@@ -5,10 +5,9 @@
 [![License](https://img.shields.io/github/license/h0ngcha0/agent-cow)](https://github.com/h0ngcha0/agent-cow/blob/main/LICENSE)
 
 ```text
- ________________________________________________
-< Agent Cow: the philosophical watcher of your >
-< agents.                                       >
- ------------------------------------------------
+ ______________________
+< Agent 3 is stuck... >
+ ----------------------
         \   ^__^
          \  (oo)\_______
             (__)\       )\/\
@@ -16,7 +15,7 @@
                 ||     ||
 ```
 
-Agent Cow is the philosophical watcher of your coding agents.
+Agent Cow is the philosophical watcher of your coding agents across multiple machines.
 
 It watches your agent sessions, shows what they are doing, what they cost, how much context they have burned, and whether they are waiting for you. It runs as a fast terminal UI, or as a headless machine agent that another TUI can subscribe to.
 
