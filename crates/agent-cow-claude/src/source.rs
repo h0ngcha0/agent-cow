@@ -428,7 +428,7 @@ struct ClaudeQuotaUsage {
     seven_day_usd: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct SessionsIndexFile {
     #[serde(rename = "originalPath")]
     original_path: Option<String>,
@@ -577,12 +577,14 @@ impl ClaudeSource {
     fn load_sessions(&self) -> Result<Vec<SessionRow>> {
         if let Some(cache) = self.sessions_cache.lock().expect("lock poisoned").clone()
             && is_sessions_cache_fresh(cache.fetched_at_epoch_ms)
+            && should_use_cached_sessions(cache.rows.len(), &self.projects_dir)
         {
             return Ok(cache.rows);
         }
 
         if let Some(cache) = load_sessions_cache_from_disk()?
             && is_sessions_disk_cache_fresh(cache.fetched_at_epoch_ms)
+            && should_use_cached_sessions(cache.rows.len(), &self.projects_dir)
         {
             *self.sessions_cache.lock().expect("lock poisoned") = Some(cache.clone());
             return Ok(cache.rows);
@@ -1999,18 +2001,10 @@ fn collect_sessions_from_projects(
         }
 
         let index_path = entry.path().join("sessions-index.json");
-        if !index_path.exists() {
-            continue;
-        }
-
-        let raw = match fs::read_to_string(&index_path) {
-            Ok(raw) => raw,
-            Err(_) => continue,
-        };
-        let parsed: SessionsIndexFile = match serde_json::from_str(&raw) {
-            Ok(parsed) => parsed,
-            Err(_) => continue,
-        };
+        let parsed: SessionsIndexFile = fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
 
         let index_entries: HashMap<String, SessionIndexEntry> = parsed
             .entries
@@ -3023,6 +3017,37 @@ fn claude_projects_dir(path: &Path) -> PathBuf {
     }
 }
 
+fn should_use_cached_sessions(row_count: usize, projects_dir: &Path) -> bool {
+    !(row_count == 0 && projects_contain_transcripts(projects_dir))
+}
+
+fn projects_contain_transcripts(projects_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(projects_dir) else {
+        return false;
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let Ok(children) = fs::read_dir(entry.path()) else {
+            continue;
+        };
+        if children
+            .filter_map(Result::ok)
+            .any(|child| child.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -3443,9 +3468,10 @@ fn now_epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudePricing, TranscriptHint, analyze_transcript, builtin_claude_pricing,
-        derive_activity_state, estimate_session_cost, looks_like_compaction_signal,
-        normalize_message_text, normalize_title, parse_claude_status_quota, parse_claude_usage,
+        ClaudePricing, ClaudeSource, TranscriptHint, analyze_transcript, builtin_claude_pricing,
+        collect_sessions_from_projects, derive_activity_state, estimate_session_cost,
+        looks_like_compaction_signal, normalize_message_text, normalize_title,
+        parse_claude_status_quota, parse_claude_usage, should_use_cached_sessions,
     };
     use agent_cow_core::{
         ActivityEvent, ActivityKind, PricingSource, ProviderKind, ProviderQuota,
@@ -3662,6 +3688,66 @@ mod tests {
                 .iter()
                 .any(|event| event.summary == "Context compacted")
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collect_sessions_from_projects_reads_transcripts_without_index_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-cow-claude-projects-{unique}"));
+        let projects_dir = root.join("projects");
+        let project_dir = projects_dir.join("-tmp-demo");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "12345678-1234-1234-1234-123456789abc";
+        let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &transcript_path,
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"2026-04-13T08:00:00.000Z\",\"cwd\":\"/tmp/demo\",\"sessionId\":\"{session_id}\",\"message\":{{\"content\":\"Investigate listing bug\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let source = ClaudeSource::new(&root);
+        let mut rows = Vec::new();
+        collect_sessions_from_projects(&projects_dir, &mut rows, &source).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, session_id);
+        assert_eq!(rows[0].cwd, "/tmp/demo");
+        assert_eq!(rows[0].title, "Investigate listing bug");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn should_not_use_empty_cache_when_transcripts_exist() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-cow-claude-cache-{unique}"));
+        let projects_dir = root.join("projects");
+        let project_dir = projects_dir.join("-tmp-demo");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "12345678-1234-1234-1234-123456789abc";
+        let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
+        fs::write(
+            &transcript_path,
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"2026-04-13T08:00:00.000Z\",\"cwd\":\"/tmp/demo\",\"sessionId\":\"{session_id}\",\"message\":{{\"content\":\"Investigate listing bug\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(!should_use_cached_sessions(0, &projects_dir));
+        assert!(should_use_cached_sessions(1, &projects_dir));
 
         fs::remove_dir_all(root).unwrap();
     }
