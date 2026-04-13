@@ -1069,13 +1069,23 @@ impl TuiApp {
 
     fn visible_host_label(&self) -> String {
         if let Some(scope) = &self.machine_scope {
-            return scope.clone();
+            return if scope.eq_ignore_ascii_case("local") {
+                "Localhost".to_string()
+            } else {
+                scope.clone()
+            };
         }
 
         let labels = self.machine_labels();
         match labels.as_slice() {
             [] => "none".to_string(),
-            [single] => single.clone(),
+            [single] => {
+                if single.eq_ignore_ascii_case("local") {
+                    "Localhost".to_string()
+                } else {
+                    single.clone()
+                }
+            }
             _ => "All".to_string(),
         }
     }
@@ -1260,11 +1270,12 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let action_width = keymap_grid_width(&action_rows);
     let action_gap = u16::from(action_width > 0) * 5;
     let center_gap = u16::from(action_width > 0) * 4;
+    let meta_width = header_meta_width(app);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(18),
+            Constraint::Length(meta_width),
             Constraint::Length(action_gap),
             Constraint::Length(action_width),
             Constraint::Length(center_gap),
@@ -1666,7 +1677,7 @@ fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
         format!("{visible_sessions}/{scoped_total_sessions}")
     };
     let mut lines = vec![
-        header_meta_line("Machine", app.visible_host_label()),
+        header_meta_line_with_limit("Machine", app.visible_host_label(), 15),
         header_meta_line("Sessions", sessions_value),
     ];
     if let Some((loaded_sessions, total_sessions)) = app.active_loading_progress() {
@@ -1684,6 +1695,15 @@ fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn render_header_meta(app: &TuiApp) -> Paragraph<'static> {
     Paragraph::new(Text::from(header_meta_lines(app)))
+}
+
+fn header_meta_width(app: &TuiApp) -> u16 {
+    let max_width = header_meta_lines(app)
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(18);
+    (max_width as u16).saturating_add(1).clamp(18, 28)
 }
 
 type HeaderActionRows = Vec<(Option<KeymapItem>, Option<KeymapItem>)>;
@@ -3269,7 +3289,11 @@ fn meta_line(label: &str, value: String) -> Line<'static> {
 }
 
 fn header_meta_line(label: &str, value: String) -> Line<'static> {
-    meta_line(label, truncate_chars(&value, 8))
+    header_meta_line_with_limit(label, value, 8)
+}
+
+fn header_meta_line_with_limit(label: &str, value: String, max_chars: usize) -> Line<'static> {
+    meta_line(label, truncate_chars(&value, max_chars))
 }
 
 fn section_header(label: &str) -> Line<'static> {
