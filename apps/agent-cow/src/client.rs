@@ -635,8 +635,8 @@ fn namespace_summary(
             summary.machine_label = label.to_string();
         }
 
-        let replace_id =
-            summary.machine_id.trim().is_empty() || summary.machine_id.eq_ignore_ascii_case("local");
+        let replace_id = summary.machine_id.trim().is_empty()
+            || summary.machine_id.eq_ignore_ascii_case("local");
         if replace_id {
             summary.machine_id = label.to_string();
         }

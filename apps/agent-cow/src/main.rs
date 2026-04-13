@@ -185,7 +185,11 @@ fn build_monitor_client(
     if !options.no_local
         && let Some(local_service) = local_service
     {
-        client.push_client("local", None, Arc::new(LocalMonitorClient::new(local_service)));
+        client.push_client(
+            "local",
+            None,
+            Arc::new(LocalMonitorClient::new(local_service)),
+        );
     }
 
     for (index, machine) in options.machines.iter().enumerate() {
