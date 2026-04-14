@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Stdout},
     sync::Arc,
     time::{Duration, Instant},
@@ -36,6 +36,8 @@ const UI_POLL_INTERVAL_BUSY: Duration = Duration::from_millis(100);
 const UI_POLL_INTERVAL_IDLE: Duration = Duration::from_millis(250);
 const FOCUS_SESSION_WINDOW_HOURS: i64 = 24;
 const RECENT_SESSION_WINDOW_DAYS: i64 = 7;
+const VISIBLE_STATE_REFRESH_WINDOW_MINUTES: i64 = 5;
+const VISIBLE_STATE_REFRESH_BUDGET: usize = 8;
 
 pub async fn run(
     client: Arc<dyn MonitorClient>,
@@ -124,6 +126,21 @@ fn spawn_detail_refresh(
     tokio::spawn(async move {
         let detail = client.get_session(&session_id).await?;
         Ok((session_id, detail))
+    })
+}
+
+fn spawn_visible_summary_refresh(
+    client: Arc<dyn MonitorClient>,
+    session_ids: Vec<String>,
+) -> JoinHandle<Vec<SessionSummary>> {
+    tokio::spawn(async move {
+        let mut summaries = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            if let Ok(detail) = client.get_session(&session_id).await {
+                summaries.push(detail.summary);
+            }
+        }
+        summaries
     })
 }
 
@@ -224,6 +241,7 @@ async fn run_loop(
     let mut fast_refresh: Option<ListRefreshTask> = None;
     let mut full_refresh: Option<ListRefreshTask> = None;
     let mut detail_refresh: Option<JoinHandle<Result<(String, SessionDetail)>>> = None;
+    let mut visible_summary_refresh: Option<JoinHandle<Vec<SessionSummary>>> = None;
     let mut live_updates = match start_live_updates(&app, &client).await {
         Ok(receiver) => receiver,
         Err(error) => {
@@ -321,6 +339,13 @@ async fn run_loop(
                 Ok((session_id, detail)) => {
                     if app.detail_mode && app.selected_session_id() == Some(session_id.as_str()) {
                         app.detail = Some(detail);
+                        if let Some((detail_id, updated_at)) = app
+                            .detail
+                            .as_ref()
+                            .map(|detail| (detail.summary.id.clone(), detail.summary.updated_at))
+                        {
+                            app.mark_summary_hydrated(&detail_id, updated_at);
+                        }
                         app.sync_detail_summary_into_sessions();
                         app.rebuild_filter(Some(session_id.as_str()));
                         app.detail_loading = false;
@@ -339,13 +364,39 @@ async fn run_loop(
             }
         }
 
+        if let Some(handle) = visible_summary_refresh.as_ref()
+            && handle.is_finished()
+        {
+            let summaries = visible_summary_refresh.take().unwrap().await?;
+            app.apply_visible_summary_refresh(summaries);
+        }
+
         terminal.draw(|frame| draw(frame, &mut app))?;
+
+        if visible_summary_refresh.is_none()
+            && fast_refresh.is_none()
+            && full_refresh.is_none()
+            && detail_refresh.is_none()
+            && let Some(area) = sessions_table_area(
+                &app,
+                terminal
+                    .size()
+                    .map(|size| Rect::new(0, 0, size.width, size.height))?,
+            )
+        {
+            let session_ids = app.visible_state_refresh_candidates(area);
+            if !session_ids.is_empty() {
+                visible_summary_refresh =
+                    Some(spawn_visible_summary_refresh(client.clone(), session_ids));
+            }
+        }
 
         let poll_interval = if app.detail_loading
             || app.loading_more
             || fast_refresh.is_some()
             || full_refresh.is_some()
             || detail_refresh.is_some()
+            || visible_summary_refresh.is_some()
         {
             UI_POLL_INTERVAL_BUSY
         } else {
@@ -521,6 +572,7 @@ struct TuiApp {
     loading_progress_loaded: usize,
     loading_progress_total: usize,
     loading_progress_sources: HashMap<String, (usize, usize)>,
+    visible_state_hydrated_at: HashMap<String, DateTime<Utc>>,
     error: Option<String>,
     notice: Option<UiNotice>,
     filter_input: String,
@@ -608,6 +660,7 @@ impl TuiApp {
             loading_progress_loaded: 0,
             loading_progress_total: 0,
             loading_progress_sources: HashMap::new(),
+            visible_state_hydrated_at: HashMap::new(),
             error: None,
             notice: None,
             filter_input: String::new(),
@@ -704,6 +757,7 @@ impl TuiApp {
         self.overview = response.overview;
         self.last_refresh = Instant::now();
         self.error = None;
+        self.prune_visible_state_cache();
         self.refresh_machine_labels_cache();
         self.rebuild_filter(selected_id.as_deref());
 
@@ -751,6 +805,7 @@ impl TuiApp {
 
         self.sessions
             .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        self.prune_visible_state_cache();
         self.refresh_machine_labels_cache();
         self.rebuild_filter(selected_id.as_deref());
 
@@ -780,6 +835,82 @@ impl TuiApp {
         };
 
         *session = detail.summary.clone();
+    }
+
+    fn prune_visible_state_cache(&mut self) {
+        let session_ids: HashSet<_> = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        self.visible_state_hydrated_at
+            .retain(|session_id, _| session_ids.contains(session_id.as_str()));
+    }
+
+    fn mark_summary_hydrated(&mut self, session_id: &str, updated_at: DateTime<Utc>) {
+        self.visible_state_hydrated_at
+            .insert(session_id.to_string(), updated_at);
+    }
+
+    fn apply_visible_summary_refresh(&mut self, summaries: Vec<SessionSummary>) {
+        if summaries.is_empty() {
+            return;
+        }
+
+        let selected_id = self.selected_session_id().map(ToOwned::to_owned);
+        let mut changed = false;
+
+        for summary in summaries {
+            self.visible_state_hydrated_at
+                .insert(summary.id.clone(), summary.updated_at);
+
+            if let Some(detail) = self.detail.as_mut()
+                && detail.summary.id == summary.id
+                && summary.updated_at >= detail.summary.updated_at
+            {
+                detail.summary = summary.clone();
+            }
+
+            if let Some(existing) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == summary.id)
+                && summary.updated_at >= existing.updated_at
+                && (existing.status.kind != summary.status.kind
+                    || existing.activity_state != summary.activity_state
+                    || existing.run_active != summary.run_active)
+            {
+                *existing = summary;
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.rebuild_filter(selected_id.as_deref());
+        }
+    }
+
+    fn visible_state_refresh_candidates(&mut self, area: Rect) -> Vec<String> {
+        if self.filtered_indices.is_empty() || self.detail_mode {
+            return Vec::new();
+        }
+
+        let window = table_visible_window(self, area);
+        if window.start >= window.end {
+            return Vec::new();
+        }
+
+        let now = Utc::now();
+        self.filtered_indices[window.start..window.end]
+            .iter()
+            .filter_map(|index| self.sessions.get(*index))
+            .filter(|summary| should_refresh_visible_summary(summary, now))
+            .filter(|summary| {
+                self.visible_state_hydrated_at.get(&summary.id).copied() != Some(summary.updated_at)
+            })
+            .take(VISIBLE_STATE_REFRESH_BUDGET)
+            .map(|summary| summary.id.clone())
+            .collect()
     }
 
     fn begin_filter(&mut self) {
@@ -1275,14 +1406,7 @@ impl TuiApp {
 
 fn draw(frame: &mut Frame, app: &mut TuiApp) {
     let footer_height = app.footer_height();
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Min(0),
-            Constraint::Length(footer_height),
-        ])
-        .split(frame.area());
+    let layout = split_frame_layout(frame.area(), footer_height);
 
     render_header_canvas(frame, layout[0], app);
 
@@ -1307,6 +1431,31 @@ fn draw(frame: &mut Frame, app: &mut TuiApp) {
     if footer_height > 0 {
         frame.render_widget(render_footer(app), layout[2]);
     }
+}
+
+fn split_frame_layout(area: Rect, footer_height: u16) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(0),
+            Constraint::Length(footer_height),
+        ])
+        .split(area)
+        .to_vec()
+}
+
+fn sessions_table_area(app: &TuiApp, frame_area: Rect) -> Option<Rect> {
+    if app.detail_mode
+        || (app.filtered_indices.is_empty()
+            && app
+                .current_machine_overview()
+                .is_some_and(|machine| !machine.reachable))
+    {
+        return None;
+    }
+
+    Some(split_frame_layout(frame_area, app.footer_height())[1])
 }
 
 fn detail_content_height(area: Rect) -> u16 {
@@ -2439,6 +2588,14 @@ fn table_visible_window(app: &mut TuiApp, area: Rect) -> VisibleRowWindow {
         end,
         selected: Some(selected.saturating_sub(start)),
     }
+}
+
+fn should_refresh_visible_summary(summary: &SessionSummary, now: DateTime<Utc>) -> bool {
+    now - summary.updated_at <= chrono::Duration::minutes(VISIBLE_STATE_REFRESH_WINDOW_MINUTES)
+        && !matches!(
+            summary.status.kind,
+            SessionStatusKind::Completed | SessionStatusKind::Failed | SessionStatusKind::Stale
+        )
 }
 
 #[derive(Clone, Copy)]
@@ -4182,7 +4339,7 @@ mod tests {
         UsageOverview,
     };
     use chrono::{TimeZone, Utc};
-    use ratatui::text::Line;
+    use ratatui::{layout::Rect, text::Line};
     use std::{collections::HashMap, time::Duration};
 
     fn flatten_line(line: &Line<'_>) -> String {
@@ -4496,6 +4653,45 @@ mod tests {
         assert_eq!(
             current_detail_summary(&app, app.detail.as_ref().unwrap()).activity_state,
             SessionActivityState::Thinking
+        );
+    }
+
+    #[test]
+    fn visible_state_refresh_candidates_are_limited_to_visible_idle_rows() {
+        let now = Utc::now();
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.view_mode = SessionViewMode::All;
+        app.sessions = (0..5)
+            .map(|index| {
+                let mut session = fixture_session(&format!("local|codex:{index}"), "local");
+                session.status.kind = SessionStatusKind::Idle;
+                session.status.reason = "idle".to_string();
+                session.updated_at = now;
+                session
+            })
+            .collect();
+        app.rebuild_filter(None);
+        app.table_state.select(Some(0));
+
+        let candidates = app.visible_state_refresh_candidates(Rect::new(0, 0, 120, 6));
+
+        assert_eq!(
+            candidates,
+            vec![
+                "local|codex:0".to_string(),
+                "local|codex:1".to_string(),
+                "local|codex:2".to_string(),
+            ]
+        );
+
+        app.visible_state_hydrated_at
+            .insert("local|codex:1".to_string(), now);
+
+        let candidates = app.visible_state_refresh_candidates(Rect::new(0, 0, 120, 6));
+
+        assert_eq!(
+            candidates,
+            vec!["local|codex:0".to_string(), "local|codex:2".to_string(),]
         );
     }
 }

@@ -10,11 +10,14 @@ use std::{
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use agent_cow_core::SessionActivityState;
 use agent_cow_core::{
     ActivityEvent, ActivityKind, ContextWindowUsage, NavigationKind, NavigationTarget,
-    PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionActivityState, SessionCost,
-    SessionDetail, SessionList, SessionLoadProgress, SessionQuery, SessionSource, SessionStatus,
-    SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
+    PricingSource, ProviderKind, ProviderQuota, QuotaWindow, SessionCost, SessionDetail,
+    SessionList, SessionLoadProgress, SessionQuery, SessionRuntimeEvidence, SessionRuntimeState,
+    SessionRuntimeWindows, SessionSource, SessionStatus, SessionStatusKind, SessionSummary,
+    StatusConfidence, TokenUsage, ToolCallStat, UsageOverview, derive_session_runtime_state,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -31,14 +34,12 @@ const DETAIL_TAIL_LINES: usize = 320;
 const RECENT_EVENT_LIMIT: usize = 48;
 const RECENT_CONVERSATION_LIMIT: usize = 32;
 const STALE_AFTER_MINUTES: i64 = 20;
-const LIVE_STATUS_FALLBACK_MINUTES: i64 = 5;
-const LIVE_STATUS_FALLBACK_BUDGET: usize = 8;
 const ACTIVITY_WINDOW_SECONDS: i64 = 30;
 const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
 const COMPACTION_ACTIVITY_WINDOW_SECONDS: i64 = 12;
 const CODEX_DEFAULT_CONTEXT_WINDOW: u64 = 258_400;
 const CODEX_AUTOCOMPACT_THRESHOLD: f64 = 0.835;
-const SUMMARY_CACHE_SCHEMA_VERSION: u32 = 2;
+const SUMMARY_CACHE_SCHEMA_VERSION: u32 = 3;
 const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const LITELLM_PRICING_CACHE_TTL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
@@ -501,26 +502,6 @@ impl CodexSource {
         }
     }
 
-    fn store_summary_hint(&self, path: &Path, hint: &RolloutHint) {
-        let Ok((modified_at_epoch_ms, file_len)) = rollout_cache_signature(path) else {
-            return;
-        };
-
-        if let Ok(mut cache) = self.summary_cache.lock() {
-            let cache = cache.get_or_insert_with(HashMap::new);
-            cache.insert(
-                path.to_path_buf(),
-                SummaryHintCacheEntry {
-                    schema_version: SUMMARY_CACHE_SCHEMA_VERSION,
-                    modified_at_epoch_ms,
-                    file_len,
-                    hint: hint.clone(),
-                },
-            );
-        }
-        self.summary_cache_dirty.store(true, Ordering::SeqCst);
-    }
-
     fn candidate_inputs(&self) -> Vec<PathBuf> {
         let mut inputs = Vec::new();
         let mut seen = HashSet::new();
@@ -683,7 +664,6 @@ impl SessionSource for CodexSource {
         let mut sessions = Vec::new();
         let mut latest_quota: Option<(DateTime<Utc>, ProviderQuota)> = None;
         let mut litellm_pricing = None;
-        let mut live_status_fallback_budget = LIVE_STATUS_FALLBACK_BUDGET;
         let rows = self.load_threads()?;
         let total_sessions = rows
             .iter()
@@ -697,7 +677,7 @@ impl SessionSource for CodexSource {
                 continue;
             }
 
-            let mut hint = if row.archived {
+            let hint = if row.archived {
                 None
             } else {
                 self.summary_hint(Path::new(&row.rollout_path))
@@ -711,7 +691,7 @@ impl SessionSource for CodexSource {
                 litellm_pricing = self.litellm_pricing().await;
             }
 
-            let mut summary = build_summary(
+            let summary = build_summary(
                 &self.machine_id,
                 &self.machine_label,
                 &row,
@@ -719,24 +699,6 @@ impl SessionSource for CodexSource {
                 litellm_pricing.as_deref(),
                 now,
             );
-
-            if live_status_fallback_budget > 0
-                && should_refresh_live_status(&summary, row.updated_at, now)
-                && let Ok(live_hint) =
-                    analyze_rollout(Path::new(&row.rollout_path), ReadMode::Detail)
-            {
-                self.store_summary_hint(Path::new(&row.rollout_path), &live_hint);
-                summary = build_summary(
-                    &self.machine_id,
-                    &self.machine_label,
-                    &row,
-                    Some(&live_hint),
-                    litellm_pricing.as_deref(),
-                    now,
-                );
-                hint = Some(live_hint);
-                live_status_fallback_budget -= 1;
-            }
 
             if let Some(quota) = hint.as_ref().and_then(|hint| hint.quota.clone()) {
                 let should_replace = latest_quota
@@ -865,8 +827,8 @@ fn build_summary(
                 .unwrap_or(0.0),
         )
     });
-    let status = derive_status(row, hint, now);
-    let activity_state = derive_activity_state(&status, hint, row.updated_at, now);
+    let runtime = derive_runtime_state(row.updated_at, hint, now);
+    let status = derive_status(row, hint, &runtime, now);
     let rollout_path = (!row.rollout_path.is_empty()).then_some(row.rollout_path.clone());
     let navigation = build_navigation(row, rollout_path.clone());
 
@@ -880,7 +842,7 @@ fn build_summary(
         created_at: row.created_at,
         updated_at: row.updated_at,
         run_started_at: hint.and_then(|hint| hint.run_started_at),
-        run_active: hint.is_some_and(|hint| hint.run_active),
+        run_active: runtime.run_active,
         archived: row.archived,
         model: row.model.clone(),
         agent_role: row.agent_role.clone(),
@@ -890,125 +852,85 @@ fn build_summary(
         cost,
         context_window: hint.and_then(|hint| hint.context_window.clone()),
         status,
-        activity_state,
+        activity_state: runtime.activity_state,
         rollout_path,
         navigation,
     }
 }
 
+fn derive_runtime_state(
+    updated_at: DateTime<Utc>,
+    hint: Option<&RolloutHint>,
+    now: DateTime<Utc>,
+) -> SessionRuntimeState {
+    let evidence = runtime_evidence(hint, now);
+    derive_session_runtime_state(&evidence, updated_at, now, runtime_windows())
+}
+
+fn runtime_windows() -> SessionRuntimeWindows {
+    SessionRuntimeWindows {
+        stale_after_minutes: STALE_AFTER_MINUTES,
+        activity_window_seconds: ACTIVITY_WINDOW_SECONDS,
+        tool_busy_activity_window_seconds: TOOL_BUSY_ACTIVITY_WINDOW_SECONDS,
+        compaction_window_seconds: COMPACTION_ACTIVITY_WINDOW_SECONDS,
+    }
+}
+
+fn runtime_evidence(hint: Option<&RolloutHint>, now: DateTime<Utc>) -> SessionRuntimeEvidence {
+    let Some(hint) = hint else {
+        return SessionRuntimeEvidence::default();
+    };
+
+    let recent_window = Duration::seconds(ACTIVITY_WINDOW_SECONDS);
+    let thinking_signal_at = hint.recent_events.iter().rev().find_map(|event| {
+        (matches!(event.kind, ActivityKind::Assistant)
+            && event.summary == "Reasoning"
+            && now - event.timestamp <= recent_window)
+            .then_some(event.timestamp)
+    });
+
+    SessionRuntimeEvidence {
+        completed: false,
+        failed: false,
+        waiting_input: !hint.pending_approval_call_ids.is_empty(),
+        open_turns: hint.active_turns,
+        open_tool_calls: hint.pending_call_ids.len(),
+        open_exploration_tool_calls: hint
+            .pending_call_names
+            .iter()
+            .filter(|(call_id, tool_name)| {
+                hint.pending_call_ids.contains(*call_id) && is_exploration_tool(tool_name)
+            })
+            .count(),
+        thinking_signal_at,
+        compaction_signal_at: hint.recent_compaction_at,
+        latest_exploration_signal_at: hint.recent_events.iter().rev().find_map(|event| {
+            (matches!(event.kind, ActivityKind::ToolCall) && is_exploration_tool(&event.summary))
+                .then_some(event.timestamp)
+        }),
+        latest_tool_call_at: hint.recent_events.iter().rev().find_map(|event| {
+            matches!(event.kind, ActivityKind::ToolCall).then_some(event.timestamp)
+        }),
+    }
+}
+
+#[cfg(test)]
 fn derive_activity_state(
-    status: &SessionStatus,
+    _status: &SessionStatus,
     hint: Option<&RolloutHint>,
     updated_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> SessionActivityState {
-    if matches!(status.kind, SessionStatusKind::WaitingInput) {
-        return SessionActivityState::Waiting;
-    }
-
-    if matches!(
-        status.kind,
-        SessionStatusKind::Completed | SessionStatusKind::Failed | SessionStatusKind::Stale
-    ) {
-        return SessionActivityState::Idle;
-    }
-
-    let recent_window = activity_recent_window(status, hint);
-
-    let Some(hint) = hint else {
-        return if matches!(status.kind, SessionStatusKind::ToolBusy)
-            && now - updated_at <= recent_window
-        {
-            SessionActivityState::Working
-        } else {
-            SessionActivityState::Idle
-        };
-    };
-
-    let has_live_signal =
-        hint.run_active || hint.active_turns > 0 || !hint.pending_call_ids.is_empty();
-    if !has_live_signal {
-        return SessionActivityState::Idle;
-    }
-
-    let latest_feedback = latest_recent_non_user_event(&hint.recent_events, now, recent_window);
-    let Some(latest_feedback) = latest_feedback else {
-        return if hint.pending_call_ids.is_empty() && hint.run_active {
-            SessionActivityState::Thinking
-        } else if now - updated_at <= recent_window {
-            SessionActivityState::Working
-        } else {
-            SessionActivityState::Idle
-        };
-    };
-
-    if hint.pending_call_ids.is_empty() && recent_compaction_is_active(hint, now) {
-        return SessionActivityState::Compacting;
-    }
-
-    if matches!(latest_feedback.kind, ActivityKind::ToolCall)
-        && is_exploration_tool(&latest_feedback.summary)
-    {
-        return SessionActivityState::Exploring;
-    }
-
-    if hint.pending_call_ids.is_empty() && hint.run_active {
-        return SessionActivityState::Thinking;
-    }
-
-    if is_thinking_event(latest_feedback) {
-        SessionActivityState::Thinking
-    } else {
-        SessionActivityState::Working
-    }
+    derive_runtime_state(updated_at, hint, now).activity_state
 }
 
-fn activity_recent_window(status: &SessionStatus, hint: Option<&RolloutHint>) -> Duration {
-    if matches!(status.kind, SessionStatusKind::ToolBusy)
-        || hint.is_some_and(|hint| !hint.pending_call_ids.is_empty())
-    {
+#[cfg(test)]
+fn activity_recent_window(_status: &SessionStatus, hint: Option<&RolloutHint>) -> Duration {
+    if hint.is_some_and(|hint| !hint.pending_call_ids.is_empty()) {
         Duration::seconds(TOOL_BUSY_ACTIVITY_WINDOW_SECONDS)
     } else {
         Duration::seconds(ACTIVITY_WINDOW_SECONDS)
     }
-}
-
-fn should_refresh_live_status(
-    summary: &SessionSummary,
-    updated_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> bool {
-    now - updated_at <= Duration::minutes(LIVE_STATUS_FALLBACK_MINUTES)
-        && matches!(summary.status.kind, SessionStatusKind::Idle)
-        && matches!(summary.activity_state, SessionActivityState::Idle)
-}
-
-fn recent_compaction_is_active(hint: &RolloutHint, now: DateTime<Utc>) -> bool {
-    let Some(compacted_at) = hint.recent_compaction_at else {
-        return false;
-    };
-    if now - compacted_at > Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS) {
-        return false;
-    }
-
-    !hint
-        .recent_events
-        .iter()
-        .any(|event| event.timestamp > compacted_at && matches!(event.kind, ActivityKind::ToolCall))
-}
-
-fn latest_recent_non_user_event(
-    events: &[ActivityEvent],
-    now: DateTime<Utc>,
-    recent_window: Duration,
-) -> Option<&ActivityEvent> {
-    events.iter().rev().find(|event| {
-        !matches!(event.kind, ActivityKind::User) && now - event.timestamp <= recent_window
-    })
-}
-
-fn is_thinking_event(event: &ActivityEvent) -> bool {
-    matches!(event.kind, ActivityKind::Assistant)
 }
 
 fn is_exploration_tool(summary: &str) -> bool {
@@ -1236,7 +1158,12 @@ fn token_cost(tokens: u64, rate_per_million: f64) -> f64 {
     (tokens as f64 / 1_000_000.0) * rate_per_million
 }
 
-fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>) -> SessionStatus {
+fn derive_status(
+    row: &ThreadRow,
+    hint: Option<&RolloutHint>,
+    runtime: &SessionRuntimeState,
+    now: DateTime<Utc>,
+) -> SessionStatus {
     let idle_for = now - row.updated_at;
 
     if row.archived {
@@ -1248,7 +1175,9 @@ fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>
     }
 
     if let Some(hint) = hint {
-        if !hint.pending_approval_call_ids.is_empty() {
+        if matches!(runtime.status_kind, SessionStatusKind::WaitingInput)
+            && !hint.pending_approval_call_ids.is_empty()
+        {
             let tool_name = hint
                 .pending_approval_call_ids
                 .iter()
@@ -1263,7 +1192,9 @@ fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>
             };
         }
 
-        if !hint.pending_call_ids.is_empty() {
+        if matches!(runtime.status_kind, SessionStatusKind::ToolBusy)
+            && !hint.pending_call_ids.is_empty()
+        {
             let tool_name = hint
                 .pending_call_ids
                 .iter()
@@ -1293,10 +1224,12 @@ fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>
             };
         }
 
-        if looks_like_waiting_input(
-            hint.last_assistant_message.as_ref(),
-            hint.last_user_message.as_ref(),
-        ) {
+        if matches!(runtime.status_kind, SessionStatusKind::WaitingInput)
+            && looks_like_waiting_input(
+                hint.last_assistant_message.as_ref(),
+                hint.last_user_message.as_ref(),
+            )
+        {
             return SessionStatus {
                 kind: SessionStatusKind::WaitingInput,
                 confidence: StatusConfidence::Inferred,
@@ -1304,37 +1237,42 @@ fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>
             };
         }
 
-        if hint.active_turns > 0 {
+        if matches!(runtime.status_kind, SessionStatusKind::Running) {
             return SessionStatus {
-                kind: if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
-                    SessionStatusKind::Running
-                } else {
-                    SessionStatusKind::Stale
-                },
+                kind: runtime.status_kind.clone(),
                 confidence: StatusConfidence::Inferred,
-                reason: if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
+                reason: if runtime.active_turns > 0 {
                     "An active turn is still open".to_string()
+                } else if hint.recent_compaction_at.is_some() {
+                    "Codex is compacting the context window".to_string()
                 } else {
-                    format!(
-                        "The trace still shows an open turn, but the session has been quiet for {} minutes",
-                        idle_for.num_minutes()
-                    )
+                    "Codex is still processing the current turn".to_string()
                 },
             };
         }
     }
 
-    if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
+    if matches!(runtime.status_kind, SessionStatusKind::Idle) {
         SessionStatus {
-            kind: SessionStatusKind::Idle,
+            kind: runtime.status_kind.clone(),
             confidence: StatusConfidence::Inferred,
             reason: "No active tool or turn signal was found in the latest trace tail".to_string(),
         }
+    } else if matches!(runtime.status_kind, SessionStatusKind::Stale) {
+        SessionStatus {
+            kind: runtime.status_kind.clone(),
+            confidence: StatusConfidence::Inferred,
+            reason: if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
+                "The session looks stale despite a live signal".to_string()
+            } else {
+                "The session has not emitted activity recently".to_string()
+            },
+        }
     } else {
         SessionStatus {
-            kind: SessionStatusKind::Stale,
+            kind: runtime.status_kind.clone(),
             confidence: StatusConfidence::Inferred,
-            reason: "The session has not emitted activity recently".to_string(),
+            reason: "The session runtime could not be derived cleanly".to_string(),
         }
     }
 }
@@ -1390,18 +1328,14 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                     .unwrap_or_default();
                 match event_kind {
                     "task_started" => {
-                        hint.active_turns += 1;
                         if let Some(timestamp) = timestamp {
                             remember_latest_timestamp(&mut hint.run_started_at, timestamp);
-                            if let Some(turn_id) = payload
-                                .get("turn_id")
-                                .and_then(Value::as_str)
-                                .filter(|turn_id| !turn_id.is_empty())
-                            {
-                                open_turns.insert(turn_id.to_string(), timestamp);
-                            } else {
-                                unnamed_open_turns.push(timestamp);
-                            }
+                            remember_open_turn(
+                                &mut open_turns,
+                                &mut unnamed_open_turns,
+                                payload,
+                                timestamp,
+                            );
                             push_recent_event(
                                 &mut recent_events,
                                 ActivityEvent {
@@ -1413,16 +1347,7 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                         }
                     }
                     "task_complete" => {
-                        hint.active_turns = hint.active_turns.saturating_sub(1);
-                        if let Some(turn_id) = payload
-                            .get("turn_id")
-                            .and_then(Value::as_str)
-                            .filter(|turn_id| !turn_id.is_empty())
-                        {
-                            open_turns.remove(turn_id);
-                        } else {
-                            unnamed_open_turns.pop();
-                        }
+                        close_open_turn(&mut open_turns, &mut unnamed_open_turns, payload);
                         if let Some(timestamp) = timestamp {
                             push_recent_event(
                                 &mut recent_events,
@@ -1430,6 +1355,19 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                                     timestamp,
                                     kind: ActivityKind::System,
                                     summary: "Task completed".to_string(),
+                                },
+                            );
+                        }
+                    }
+                    "turn_aborted" => {
+                        close_open_turn(&mut open_turns, &mut unnamed_open_turns, payload);
+                        if let Some(timestamp) = timestamp {
+                            push_recent_event(
+                                &mut recent_events,
+                                ActivityEvent {
+                                    timestamp,
+                                    kind: ActivityKind::System,
+                                    summary: "Task aborted".to_string(),
                                 },
                             );
                         }
@@ -1594,6 +1532,18 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
                             );
                         }
                     }
+                    "reasoning" => {
+                        if let Some(timestamp) = timestamp {
+                            push_recent_event(
+                                &mut recent_events,
+                                ActivityEvent {
+                                    timestamp,
+                                    kind: ActivityKind::Assistant,
+                                    summary: "Reasoning".to_string(),
+                                },
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1601,6 +1551,7 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
         }
     }
 
+    hint.active_turns = open_turns.len() + unnamed_open_turns.len();
     let latest_open_turn_started_at = open_turns
         .values()
         .copied()
@@ -1625,6 +1576,31 @@ fn analyze_rollout(path: &Path, mode: ReadMode) -> Result<RolloutHint> {
 fn remember_latest_timestamp(slot: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
     if slot.is_none_or(|current| timestamp > current) {
         *slot = Some(timestamp);
+    }
+}
+
+fn remember_open_turn(
+    open_turns: &mut HashMap<String, DateTime<Utc>>,
+    unnamed_open_turns: &mut Vec<DateTime<Utc>>,
+    payload: &Value,
+    timestamp: DateTime<Utc>,
+) {
+    if let Some(turn_id) = extract_turn_id(payload) {
+        open_turns.insert(turn_id.to_string(), timestamp);
+    } else {
+        unnamed_open_turns.push(timestamp);
+    }
+}
+
+fn close_open_turn(
+    open_turns: &mut HashMap<String, DateTime<Utc>>,
+    unnamed_open_turns: &mut Vec<DateTime<Utc>>,
+    payload: &Value,
+) {
+    if let Some(turn_id) = extract_turn_id(payload) {
+        open_turns.remove(turn_id);
+    } else {
+        unnamed_open_turns.pop();
     }
 }
 
@@ -2872,17 +2848,16 @@ fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadMode, RolloutHint, SessionActivityState, SessionStatus, SessionStatusKind,
-        StatusConfidence, ThreadRow, activity_recent_window, analyze_rollout, build_summary,
-        derive_activity_state, derive_status, function_call_requires_approval,
+        ReadMode, RolloutHint, SessionStatus, SessionStatusKind, StatusConfidence, ThreadRow,
+        activity_recent_window, analyze_rollout, build_summary, derive_activity_state,
+        derive_runtime_state, derive_status, function_call_requires_approval,
         is_threads_cache_fresh, is_threads_disk_cache_fresh, local_date_key, local_hour_key,
         looks_like_waiting_input, normalize_codex_home, normalize_title,
         parse_context_window_usage, parse_state_db_version, parse_transcript_static,
-        should_refresh_live_status, state_db_candidates_for_input, stream_usage_index,
-        user_title_candidate,
+        state_db_candidates_for_input, stream_usage_index, user_title_candidate,
     };
     use agent_cow_core::{
-        ActivityEvent, ActivityKind, ContextWindowUsage, ProviderKind, SessionSummary, TokenUsage,
+        ActivityEvent, ActivityKind, ContextWindowUsage, SessionActivityState, TokenUsage,
     };
     use chrono::Utc;
     use directories::BaseDirs;
@@ -3111,6 +3086,63 @@ mod tests {
 
         assert_eq!(run_started_at.to_rfc3339(), "2026-04-11T04:36:21+00:00");
         assert!(hint.run_active);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_rollout_closes_aborted_turns() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-aborted-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-aborted.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-04-14T20:06:03.334Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"aborted-turn\"}}\n",
+                "{\"timestamp\":\"2026-04-14T20:06:04.280Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"aborted-turn\",\"reason\":\"interrupted\"}}\n",
+                "{\"timestamp\":\"2026-04-14T20:13:49.172Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"completed-turn\"}}\n",
+                "{\"timestamp\":\"2026-04-14T20:15:04.619Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"completed-turn\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+
+        assert_eq!(hint.active_turns, 0);
+        assert!(!hint.run_active);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_rollout_records_reasoning_as_recent_feedback() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-cow-rollout-reasoning-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-reasoning.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-04-14T20:29:01.434Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"think carefully\"}}\n",
+                "{\"timestamp\":\"2026-04-14T20:29:04.266Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let hint = analyze_rollout(&path, ReadMode::Summary).unwrap();
+
+        assert!(
+            hint.recent_events
+                .iter()
+                .any(|event| event.kind == ActivityKind::Assistant && event.summary == "Reasoning")
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3354,6 +3386,7 @@ mod tests {
         };
         let hint = RolloutHint {
             run_active: true,
+            active_turns: 1,
             context_window: Some(ContextWindowUsage {
                 used_tokens: 215_764,
                 limit_tokens: 215_764,
@@ -3375,7 +3408,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(activity, SessionActivityState::Working);
     }
 
     #[test]
@@ -3389,6 +3422,7 @@ mod tests {
         let compacted_at = now - chrono::Duration::seconds(2);
         let compacting_hint = RolloutHint {
             run_active: true,
+            active_turns: 1,
             recent_compaction_at: Some(compacted_at),
             context_window: Some(ContextWindowUsage {
                 used_tokens: 215_764,
@@ -3434,7 +3468,7 @@ mod tests {
             now - chrono::Duration::seconds(1),
             now,
         );
-        assert_eq!(thinking, SessionActivityState::Thinking);
+        assert_eq!(thinking, SessionActivityState::Working);
     }
 
     #[test]
@@ -3469,7 +3503,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_activity_state_stops_exploring_after_tool_result() {
+    fn derive_activity_state_keeps_exploring_through_tool_results() {
         let now = Utc::now();
         let status = SessionStatus {
             kind: SessionStatusKind::Running,
@@ -3501,11 +3535,11 @@ mod tests {
             now,
         );
 
-        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(activity, SessionActivityState::Exploring);
     }
 
     #[test]
-    fn derive_activity_state_marks_recent_assistant_feedback_as_thinking() {
+    fn derive_activity_state_treats_recent_assistant_feedback_as_working() {
         let now = Utc::now();
         let status = SessionStatus {
             kind: SessionStatusKind::Running,
@@ -3530,11 +3564,69 @@ mod tests {
             now,
         );
 
+        assert_eq!(activity, SessionActivityState::Working);
+    }
+
+    #[test]
+    fn derive_activity_state_marks_recent_reasoning_feedback_as_thinking() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let hint = RolloutHint {
+            run_active: true,
+            active_turns: 1,
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(1),
+                kind: ActivityKind::Assistant,
+                summary: "Reasoning".to_string(),
+            }],
+            ..RolloutHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            Some(&hint),
+            now - chrono::Duration::seconds(1),
+            now,
+        );
+
         assert_eq!(activity, SessionActivityState::Thinking);
     }
 
     #[test]
-    fn derive_activity_state_treats_live_non_tool_turns_as_thinking() {
+    fn derive_activity_state_treats_recent_live_non_tool_turns_as_working() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let hint = RolloutHint {
+            run_active: true,
+            active_turns: 1,
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(5),
+                kind: ActivityKind::System,
+                summary: "Task started".to_string(),
+            }],
+            ..RolloutHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            Some(&hint),
+            now - chrono::Duration::seconds(5),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Working);
+    }
+
+    #[test]
+    fn derive_activity_state_treats_stale_non_tool_turns_as_idle() {
         let now = Utc::now();
         let status = SessionStatus {
             kind: SessionStatusKind::Running,
@@ -3559,7 +3651,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(activity, SessionActivityState::Working);
     }
 
     #[test]
@@ -3587,51 +3679,12 @@ mod tests {
             ..RolloutHint::default()
         };
 
-        let status = derive_status(&row, Some(&hint), now);
+        let runtime = derive_runtime_state(row.updated_at, Some(&hint), now);
+        let status = derive_status(&row, Some(&hint), &runtime, now);
 
         assert_eq!(status.kind, SessionStatusKind::WaitingInput);
         assert_eq!(status.confidence, StatusConfidence::Exact);
         assert!(status.reason.contains("approval"));
-    }
-
-    #[test]
-    fn refreshes_recent_idle_summaries_for_live_status() {
-        let now = Utc::now();
-        let summary = SessionSummary {
-            id: "session".to_string(),
-            machine_id: "local".to_string(),
-            machine_label: "Localhost".to_string(),
-            provider: ProviderKind::Codex,
-            title: "session".to_string(),
-            cwd: "/tmp".to_string(),
-            created_at: now,
-            updated_at: now,
-            run_started_at: None,
-            run_active: false,
-            archived: false,
-            model: Some("gpt-5.4".to_string()),
-            agent_role: None,
-            git_branch: None,
-            git_origin_url: None,
-            tokens: TokenUsage::default(),
-            cost: None,
-            context_window: None,
-            status: SessionStatus {
-                kind: SessionStatusKind::Idle,
-                confidence: StatusConfidence::Inferred,
-                reason: "idle".to_string(),
-            },
-            activity_state: SessionActivityState::Idle,
-            rollout_path: None,
-            navigation: Vec::new(),
-        };
-
-        assert!(should_refresh_live_status(&summary, now, now));
-        assert!(!should_refresh_live_status(
-            &summary,
-            now - chrono::Duration::minutes(10),
-            now
-        ));
     }
 
     #[test]
@@ -3652,7 +3705,9 @@ mod tests {
             model: None,
         };
 
-        let status = derive_status(&row, Some(&RolloutHint::default()), now);
+        let hint = RolloutHint::default();
+        let runtime = derive_runtime_state(row.updated_at, Some(&hint), now);
+        let status = derive_status(&row, Some(&hint), &runtime, now);
 
         assert_eq!(status.kind, SessionStatusKind::Idle);
         assert_eq!(status.confidence, StatusConfidence::Inferred);

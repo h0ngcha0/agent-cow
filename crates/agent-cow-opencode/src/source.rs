@@ -7,8 +7,9 @@ use std::{
 use agent_cow_core::{
     ActivityEvent, ActivityKind, NavigationKind, NavigationTarget, PricingSource, ProviderKind,
     SessionActivityState, SessionCost, SessionDetail, SessionList, SessionLoadProgress,
-    SessionQuery, SessionSource, SessionStatus, SessionStatusKind, SessionSummary,
-    StatusConfidence, TokenUsage, ToolCallStat, UsageOverview,
+    SessionQuery, SessionRuntimeEvidence, SessionRuntimeState, SessionRuntimeWindows,
+    SessionSource, SessionStatus, SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage,
+    ToolCallStat, UsageOverview, derive_session_runtime_state,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -73,6 +74,7 @@ struct SessionAnalysis {
     tool_stats: HashMap<String, ToolCallStat>,
     active_turns: usize,
     pending_tool_calls: usize,
+    pending_exploration_tool_calls: usize,
     run_active: bool,
     latest_tool: Option<(DateTime<Utc>, String)>,
     latest_assistant_feedback_at: Option<DateTime<Utc>>,
@@ -391,7 +393,7 @@ impl OpenCodeSource {
                             .tool_stats
                             .entry(tool_name.clone())
                             .or_insert(ToolCallStat {
-                                name: tool_name,
+                                name: tool_name.clone(),
                                 count: 0,
                                 last_seen: None,
                             });
@@ -399,6 +401,9 @@ impl OpenCodeSource {
                     entry.last_seen = Some(part.time_created);
                     if status != "completed" {
                         analysis.pending_tool_calls += 1;
+                        if is_exploration_tool(&tool_name) {
+                            analysis.pending_exploration_tool_calls += 1;
+                        }
                     }
                 }
                 "text" => {
@@ -510,8 +515,9 @@ impl OpenCodeSource {
         let parts = self.load_parts(conn, &row.id)?;
         let analysis = self.analyze_session(row, &messages, &parts);
         let cost = analysis.cost.clone();
-        let status = derive_status(row, &analysis);
-        let activity_state = derive_activity_state(&analysis);
+        let runtime = derive_runtime_state(row.updated_at, row.archived, &analysis, Utc::now());
+        let status = derive_status_from_runtime(row, &analysis, &runtime);
+        let activity_state = runtime.activity_state.clone();
 
         Ok(SessionSummary {
             id: row.id.clone(),
@@ -526,7 +532,7 @@ impl OpenCodeSource {
                 .last_user_message
                 .as_ref()
                 .map(|(timestamp, _)| *timestamp),
-            run_active: analysis.run_active,
+            run_active: runtime.run_active,
             archived: row.archived,
             model: analysis.model,
             agent_role: analysis.agent_role,
@@ -645,9 +651,55 @@ impl SessionSource for OpenCodeSource {
     }
 }
 
+fn derive_runtime_state(
+    updated_at: DateTime<Utc>,
+    archived: bool,
+    analysis: &SessionAnalysis,
+    now: DateTime<Utc>,
+) -> SessionRuntimeState {
+    let evidence = SessionRuntimeEvidence {
+        completed: archived || analysis.finished,
+        failed: false,
+        waiting_input: false,
+        open_turns: analysis.active_turns,
+        open_tool_calls: analysis.pending_tool_calls,
+        open_exploration_tool_calls: analysis.pending_exploration_tool_calls,
+        thinking_signal_at: analysis.latest_reasoning_at,
+        compaction_signal_at: analysis.latest_compaction_at,
+        latest_exploration_signal_at: analysis
+            .latest_tool
+            .as_ref()
+            .and_then(|(timestamp, tool)| is_exploration_tool(tool).then_some(*timestamp)),
+        latest_tool_call_at: analysis
+            .latest_tool
+            .as_ref()
+            .map(|(timestamp, _)| *timestamp),
+    };
+    derive_session_runtime_state(
+        &evidence,
+        updated_at,
+        now,
+        SessionRuntimeWindows {
+            stale_after_minutes: STALE_AFTER_MINUTES,
+            activity_window_seconds: ACTIVITY_WINDOW_SECONDS,
+            tool_busy_activity_window_seconds: TOOL_BUSY_ACTIVITY_WINDOW_SECONDS,
+            compaction_window_seconds: COMPACTION_ACTIVITY_WINDOW_SECONDS,
+        },
+    )
+}
+
+#[cfg(test)]
 fn derive_status(row: &SessionRow, analysis: &SessionAnalysis) -> SessionStatus {
-    let now = Utc::now();
-    if analysis.pending_tool_calls > 0 {
+    let runtime = derive_runtime_state(row.updated_at, row.archived, analysis, Utc::now());
+    derive_status_from_runtime(row, analysis, &runtime)
+}
+
+fn derive_status_from_runtime(
+    _row: &SessionRow,
+    _analysis: &SessionAnalysis,
+    runtime: &SessionRuntimeState,
+) -> SessionStatus {
+    if matches!(runtime.status_kind, SessionStatusKind::ToolBusy) {
         return SessionStatus {
             kind: SessionStatusKind::ToolBusy,
             confidence: StatusConfidence::Exact,
@@ -655,15 +707,21 @@ fn derive_status(row: &SessionRow, analysis: &SessionAnalysis) -> SessionStatus 
         };
     }
 
-    if analysis.active_turns > 0 {
+    if matches!(runtime.status_kind, SessionStatusKind::Running) {
         return SessionStatus {
             kind: SessionStatusKind::Running,
             confidence: StatusConfidence::Inferred,
-            reason: "An OpenCode assistant turn is still active".to_string(),
+            reason: if runtime.activity_state == SessionActivityState::Compacting {
+                "OpenCode is compacting the context window".to_string()
+            } else if runtime.activity_state == SessionActivityState::Thinking {
+                "OpenCode still has in-flight reasoning".to_string()
+            } else {
+                "An OpenCode assistant turn is still active".to_string()
+            },
         };
     }
 
-    if analysis.finished || row.archived {
+    if matches!(runtime.status_kind, SessionStatusKind::Completed) {
         return SessionStatus {
             kind: SessionStatusKind::Completed,
             confidence: StatusConfidence::Inferred,
@@ -671,7 +729,7 @@ fn derive_status(row: &SessionRow, analysis: &SessionAnalysis) -> SessionStatus 
         };
     }
 
-    if row.updated_at >= now - Duration::minutes(STALE_AFTER_MINUTES) {
+    if matches!(runtime.status_kind, SessionStatusKind::Idle) {
         return SessionStatus {
             kind: SessionStatusKind::Idle,
             confidence: StatusConfidence::Inferred,
@@ -679,69 +737,24 @@ fn derive_status(row: &SessionRow, analysis: &SessionAnalysis) -> SessionStatus 
         };
     }
 
-    SessionStatus {
-        kind: SessionStatusKind::Stale,
-        confidence: StatusConfidence::Inferred,
-        reason: "The session has been inactive for a while".to_string(),
-    }
-}
-
-fn derive_activity_state(analysis: &SessionAnalysis) -> SessionActivityState {
-    let now = Utc::now();
-
-    if analysis.finished {
-        return SessionActivityState::Idle;
-    }
-
-    let latest_tool = analysis
-        .latest_tool
-        .as_ref()
-        .map(|(timestamp, tool)| (*timestamp, tool.as_str()));
-
-    if recent_compaction_is_active(analysis, now, latest_tool.map(|(timestamp, _)| timestamp)) {
-        return SessionActivityState::Compacting;
-    }
-
-    if let Some((timestamp, tool_name)) = latest_tool
-        && timestamp >= now - Duration::seconds(TOOL_BUSY_ACTIVITY_WINDOW_SECONDS)
-    {
-        if is_exploration_tool(tool_name) {
-            return SessionActivityState::Exploring;
+    if matches!(runtime.status_kind, SessionStatusKind::Stale) {
+        SessionStatus {
+            kind: SessionStatusKind::Stale,
+            confidence: StatusConfidence::Inferred,
+            reason: "The session has been inactive for a while".to_string(),
         }
-        return SessionActivityState::Working;
+    } else {
+        SessionStatus {
+            kind: runtime.status_kind.clone(),
+            confidence: StatusConfidence::Inferred,
+            reason: "The OpenCode runtime could not be derived cleanly".to_string(),
+        }
     }
-
-    if analysis
-        .latest_reasoning_at
-        .is_some_and(|timestamp| timestamp >= now - Duration::seconds(ACTIVITY_WINDOW_SECONDS))
-        || analysis
-            .latest_assistant_feedback_at
-            .is_some_and(|timestamp| timestamp >= now - Duration::seconds(ACTIVITY_WINDOW_SECONDS))
-    {
-        return SessionActivityState::Thinking;
-    }
-
-    if analysis.run_active {
-        return SessionActivityState::Thinking;
-    }
-
-    SessionActivityState::Idle
 }
 
-fn recent_compaction_is_active(
-    analysis: &SessionAnalysis,
-    now: DateTime<Utc>,
-    latest_tool_at: Option<DateTime<Utc>>,
-) -> bool {
-    let Some(compacted_at) = analysis.latest_compaction_at else {
-        return false;
-    };
-
-    if compacted_at < now - Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS) {
-        return false;
-    }
-
-    latest_tool_at.is_none_or(|tool_ts| compacted_at >= tool_ts)
+#[cfg(test)]
+fn derive_activity_state(analysis: &SessionAnalysis) -> SessionActivityState {
+    derive_runtime_state(Utc::now(), false, analysis, Utc::now()).activity_state
 }
 
 fn navigation_targets(
@@ -1057,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn live_non_tool_opencode_runs_stay_thinking() {
+    fn stale_non_tool_opencode_runs_become_idle() {
         let now = Utc::now();
         let analysis = SessionAnalysis {
             run_active: true,
@@ -1065,10 +1078,7 @@ mod tests {
             ..SessionAnalysis::default()
         };
 
-        assert_eq!(
-            derive_activity_state(&analysis),
-            SessionActivityState::Thinking
-        );
+        assert_eq!(derive_activity_state(&analysis), SessionActivityState::Idle);
     }
 
     #[test]
