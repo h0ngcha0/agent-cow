@@ -7,9 +7,9 @@ use std::{
 
 use crate::client::MonitorClient;
 use agent_cow_core::{
-    ActivityEvent, ActivityKind, ProviderQuota, SessionActivityState, SessionDetail, SessionList,
-    SessionLoadProgress, SessionQuery, SessionStatusKind, SessionSummary, TokenUsage,
-    UsageOverview,
+    ActivityEvent, ActivityKind, MachineOverview, ProviderQuota, SessionActivityState,
+    SessionDetail, SessionList, SessionLoadProgress, SessionQuery, SessionStatusKind,
+    SessionSummary, TokenUsage, UsageOverview,
 };
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
@@ -193,8 +193,20 @@ async fn run_loop(
         terminal.draw(|frame| draw_loading(frame, &initial_progress))?;
 
         if initial_load.handle.is_finished() {
-            let (kind, response) = initial_load.handle.await??;
-            app.apply_list_refresh(kind, response);
+            match initial_load.handle.await? {
+                Ok((kind, response)) => app.apply_list_refresh(kind, response),
+                Err(error) => {
+                    app.error = Some(error.to_string());
+                    app.apply_list_refresh(
+                        ListRefreshKind::Fast,
+                        SessionList {
+                            generated_at: Utc::now(),
+                            overview: UsageOverview::default(),
+                            sessions: Vec::new(),
+                        },
+                    );
+                }
+            }
             break;
         }
 
@@ -210,7 +222,13 @@ async fn run_loop(
     let mut fast_refresh: Option<ListRefreshTask> = None;
     let mut full_refresh: Option<ListRefreshTask> = None;
     let mut detail_refresh: Option<JoinHandle<Result<(String, SessionDetail)>>> = None;
-    let mut live_updates = start_live_updates(&app, &client).await?;
+    let mut live_updates = match start_live_updates(&app, &client).await {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            app.error = Some(error.to_string());
+            None
+        }
+    };
 
     if app.should_load_more() {
         queue_progressive_refresh(&mut app, &client, &mut full_refresh);
@@ -244,10 +262,18 @@ async fn run_loop(
         if let Some(handle) = fast_refresh.as_ref().map(|task| &task.handle)
             && handle.is_finished()
         {
-            let (kind, response) = fast_refresh.take().unwrap().handle.await??;
-            app.apply_list_refresh(kind, response);
-            if app.detail_mode {
-                queue_detail_refresh(&mut app, &client, &mut detail_refresh);
+            match fast_refresh.take().unwrap().handle.await? {
+                Ok((kind, response)) => {
+                    app.apply_list_refresh(kind, response);
+                    if app.detail_mode {
+                        queue_detail_refresh(&mut app, &client, &mut detail_refresh);
+                    }
+                }
+                Err(error) => {
+                    app.error = Some(error.to_string());
+                    app.loading_more = false;
+                    app.last_full_refresh = Instant::now();
+                }
             }
         }
 
@@ -259,31 +285,53 @@ async fn run_loop(
         if let Some(handle) = full_refresh.as_ref().map(|task| &task.handle)
             && handle.is_finished()
         {
-            let (kind, response) = full_refresh.take().unwrap().handle.await??;
-            app.apply_list_refresh(kind, response);
-            if kind == ListRefreshKind::Progressive && app.should_load_more() {
-                queue_progressive_refresh(&mut app, &client, &mut full_refresh);
-                live_updates = None;
-            } else if live_updates.is_none() {
-                live_updates = start_live_updates(&app, &client).await?;
-            }
-            if app.detail_mode {
-                queue_detail_refresh(&mut app, &client, &mut detail_refresh);
+            match full_refresh.take().unwrap().handle.await? {
+                Ok((kind, response)) => {
+                    app.apply_list_refresh(kind, response);
+                    if kind == ListRefreshKind::Progressive && app.should_load_more() {
+                        queue_progressive_refresh(&mut app, &client, &mut full_refresh);
+                        live_updates = None;
+                    } else if live_updates.is_none() {
+                        live_updates = match start_live_updates(&app, &client).await {
+                            Ok(receiver) => receiver,
+                            Err(error) => {
+                                app.error = Some(error.to_string());
+                                None
+                            }
+                        };
+                    }
+                    if app.detail_mode {
+                        queue_detail_refresh(&mut app, &client, &mut detail_refresh);
+                    }
+                }
+                Err(error) => {
+                    app.error = Some(error.to_string());
+                    app.loading_more = false;
+                    app.last_full_refresh = Instant::now();
+                }
             }
         }
 
         if let Some(handle) = detail_refresh.as_ref()
             && handle.is_finished()
         {
-            let (session_id, detail) = detail_refresh.take().unwrap().await??;
-            if app.detail_mode && app.selected_session_id() == Some(session_id.as_str()) {
-                app.detail = Some(detail);
-                app.detail_loading = false;
-                app.detail_loading_session_id = None;
-                app.error = None;
-            } else {
-                app.detail_loading = false;
-                app.detail_loading_session_id = None;
+            match detail_refresh.take().unwrap().await? {
+                Ok((session_id, detail)) => {
+                    if app.detail_mode && app.selected_session_id() == Some(session_id.as_str()) {
+                        app.detail = Some(detail);
+                        app.detail_loading = false;
+                        app.detail_loading_session_id = None;
+                        app.error = None;
+                    } else {
+                        app.detail_loading = false;
+                        app.detail_loading_session_id = None;
+                    }
+                }
+                Err(error) => {
+                    app.detail_loading = false;
+                    app.detail_loading_session_id = None;
+                    app.error = Some(error.to_string());
+                }
             }
         }
 
@@ -783,8 +831,27 @@ impl TuiApp {
         self.scoped_sessions().count()
     }
 
+    fn scoped_machine_overview(&self) -> Option<&MachineOverview> {
+        let scope = self.machine_scope.as_deref()?;
+        self.overview
+            .machines
+            .iter()
+            .find(|machine| machine.machine_label == scope)
+    }
+
+    fn current_machine_overview(&self) -> Option<&MachineOverview> {
+        self.scoped_machine_overview()
+            .or(match self.overview.machines.as_slice() {
+                [single] => Some(single),
+                _ => None,
+            })
+    }
+
     fn namespace_machine_labels(&self) -> HashMap<&str, &str> {
         let mut labels = HashMap::new();
+        for machine in &self.overview.machines {
+            labels.insert(machine.source.as_str(), machine.machine_label.as_str());
+        }
         for session in &self.sessions {
             if let Some((namespace, _)) = session.id.split_once('|') {
                 labels
@@ -864,11 +931,18 @@ impl TuiApp {
     }
 
     fn machine_labels(&self) -> Vec<String> {
-        let mut labels = self
-            .sessions
-            .iter()
-            .map(|session| session.machine_label.clone())
-            .collect::<Vec<_>>();
+        let mut labels = if !self.overview.machines.is_empty() {
+            self.overview
+                .machines
+                .iter()
+                .map(|machine| machine.machine_label.clone())
+                .collect::<Vec<_>>()
+        } else {
+            self.sessions
+                .iter()
+                .map(|session| session.machine_label.clone())
+                .collect::<Vec<_>>()
+        };
         labels.sort();
         labels.dedup();
         labels
@@ -995,7 +1069,7 @@ impl TuiApp {
     }
 
     fn open_detail_pane(&mut self, pane: DetailPane) -> bool {
-        if self.selected_summary().is_none() {
+        if self.selected_summary().is_none() && self.current_machine_overview().is_none() {
             self.notice = Some(UiNotice {
                 message: "No session selected.".to_string(),
                 is_error: true,
@@ -1132,7 +1206,13 @@ impl TuiApp {
 
     fn footer_height(&self) -> u16 {
         u16::from(
-            self.notice.is_some() || self.error.is_some() || self.filter_mode || self.loading_more,
+            self.notice.is_some()
+                || self.error.is_some()
+                || self.filter_mode
+                || self.loading_more
+                || self
+                    .current_machine_overview()
+                    .is_some_and(|machine| !machine.reachable),
         )
     }
 }
@@ -1152,6 +1232,12 @@ fn draw(frame: &mut Frame, app: &mut TuiApp) {
 
     if app.detail_mode {
         render_detail_view(frame, layout[1], app);
+    } else if app.filtered_indices.is_empty()
+        && app
+            .current_machine_overview()
+            .is_some_and(|machine| !machine.reachable)
+    {
+        render_machine_unreachable_view(frame, layout[1], app);
     } else {
         let window = table_visible_window(app, layout[1]);
         let mut render_state = TableState::default().with_selected(window.selected);
@@ -2418,6 +2504,15 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
         return;
     }
 
+    if app.detail.is_none()
+        && app
+            .current_machine_overview()
+            .is_some_and(|machine| !machine.reachable)
+    {
+        render_machine_unreachable_view(frame, area, app);
+        return;
+    }
+
     let Some(detail) = &app.detail else {
         frame.render_widget(
             Paragraph::new("No session selected.").block(
@@ -2589,6 +2684,79 @@ fn render_detail_loading(frame: &mut Frame, area: Rect, pane: DetailPane) {
     );
 }
 
+fn render_machine_unreachable_view(frame: &mut Frame, area: Rect, app: &TuiApp) {
+    let title = if app.detail_mode {
+        detail_pane_title(app.detail_pane).to_string()
+    } else {
+        format!("Sessions ({})", app.filtered_indices.len())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(panel_border_color()))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(accent_cyan())
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let machine_label = app.visible_host_label();
+    let error = app
+        .current_machine_overview()
+        .and_then(|machine| machine.error.as_deref())
+        .unwrap_or("Machine temporarily unreachable");
+    let lines = vec![
+        Line::from(Span::styled(
+            truncate_chars(
+                &format!("{machine_label} is temporarily unreachable"),
+                inner.width.saturating_sub(2) as usize,
+            ),
+            Style::default()
+                .fg(accent_red())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            truncate_chars(
+                "Agent Cow will keep retrying in the background.",
+                inner.width.saturating_sub(2) as usize,
+            ),
+            Style::default().fg(text_primary_color()),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            truncate_chars(error, inner.width.saturating_sub(2) as usize),
+            Style::default().fg(text_muted_color()),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("    ^__^", Style::default().fg(accent_gold()))),
+        Line::from(Span::styled(
+            "    (oo)\\_______",
+            Style::default().fg(accent_gold()),
+        )),
+        Line::from(Span::styled(
+            "    (__)\\       )\\/\\",
+            Style::default().fg(accent_gold()),
+        )),
+        Line::from(Span::styled(
+            "        ||----w |",
+            Style::default().fg(accent_gold()),
+        )),
+        Line::from(Span::styled(
+            "        ||     ||",
+            Style::default().fg(accent_gold()),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
 fn detail_pane_title(pane: DetailPane) -> &'static str {
     match pane {
         DetailPane::Describe => "Describe",
@@ -2635,6 +2803,26 @@ fn footer_line(app: &TuiApp) -> Line<'static> {
                     total_sessions,
                     app.filtered_indices.len()
                 ),
+                Style::default().fg(text_muted_color()),
+            ),
+        ])
+    } else if let Some(machine) = app
+        .current_machine_overview()
+        .filter(|machine| !machine.reachable)
+    {
+        Line::from(vec![
+            Span::styled(
+                truncate_chars(&machine.machine_label, 40),
+                Style::default()
+                    .fg(accent_red())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " is temporarily unreachable",
+                Style::default().fg(accent_red()),
+            ),
+            Span::styled(
+                "  •  retrying automatically",
                 Style::default().fg(text_muted_color()),
             ),
         ])

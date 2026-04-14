@@ -159,6 +159,16 @@ pub struct UsageOverview {
     pub sessions_with_cost: usize,
     pub sessions_with_context: usize,
     pub quotas: Vec<ProviderQuota>,
+    pub machines: Vec<MachineOverview>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineOverview {
+    pub source: String,
+    pub machine_id: String,
+    pub machine_label: String,
+    pub reachable: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

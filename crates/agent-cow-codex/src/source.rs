@@ -1002,6 +1002,7 @@ fn build_overview(
         sessions_with_cost,
         sessions_with_context,
         quotas: quota.into_iter().collect(),
+        machines: Vec::new(),
     }
 }
 

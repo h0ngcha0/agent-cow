@@ -273,6 +273,19 @@ fn build_combined_overview(
     quotas: Vec<crate::ProviderQuota>,
     total_sessions: usize,
 ) -> UsageOverview {
+    let mut machines = HashMap::<String, crate::MachineOverview>::new();
+    for session in sessions {
+        machines
+            .entry(session.machine_id.clone())
+            .or_insert_with(|| crate::MachineOverview {
+                source: session.machine_id.clone(),
+                machine_id: session.machine_id.clone(),
+                machine_label: session.machine_label.clone(),
+                reachable: true,
+                error: None,
+            });
+    }
+
     UsageOverview {
         total_sessions,
         total_tokens: sessions
@@ -292,5 +305,6 @@ fn build_combined_overview(
             .filter(|session| session.context_window.is_some())
             .count(),
         quotas,
+        machines: machines.into_values().collect(),
     }
 }

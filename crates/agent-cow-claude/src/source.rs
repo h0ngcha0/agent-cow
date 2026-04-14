@@ -1138,6 +1138,7 @@ fn build_overview(
             .filter(|session| session.context_window.is_some())
             .count(),
         quotas: subscription.into_iter().collect(),
+        machines: Vec::new(),
     }
 }
 

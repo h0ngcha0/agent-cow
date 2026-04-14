@@ -2,12 +2,12 @@ use std::{
     cmp::Reverse,
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agent_cow_core::{
-    MonitorService, ProviderQuota, SessionDetail, SessionList, SessionLoadProgress, SessionQuery,
-    SessionSummary, UsageOverview,
+    MachineOverview, MonitorService, ProviderQuota, SessionDetail, SessionList,
+    SessionLoadProgress, SessionQuery, SessionSummary, UsageOverview,
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -27,6 +27,8 @@ const REMOTE_STREAM_RECONNECT_MIN: Duration = Duration::from_secs(1);
 const REMOTE_STREAM_RECONNECT_MAX: Duration = Duration::from_secs(30);
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const REMOTE_HTTP_RETRY_MIN: Duration = Duration::from_secs(5);
+const REMOTE_HTTP_RETRY_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenActionResponse {
@@ -179,6 +181,14 @@ impl MonitorClient for LocalMonitorClient {
 pub struct RemoteMonitorClient {
     http: reqwest::Client,
     base_url: reqwest::Url,
+    availability: Arc<Mutex<RemoteAvailability>>,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteAvailability {
+    next_http_retry_at: Option<Instant>,
+    http_backoff: Duration,
+    last_error: Option<String>,
 }
 
 impl RemoteMonitorClient {
@@ -195,6 +205,11 @@ impl RemoteMonitorClient {
                 .timeout(REMOTE_REQUEST_TIMEOUT)
                 .build()?,
             base_url,
+            availability: Arc::new(Mutex::new(RemoteAvailability {
+                next_http_retry_at: None,
+                http_backoff: REMOTE_HTTP_RETRY_MIN,
+                last_error: None,
+            })),
         })
     }
 
@@ -204,6 +219,70 @@ impl RemoteMonitorClient {
             .filter(|host| !host.is_empty())
             .unwrap_or("remote")
             .to_string()
+    }
+
+    fn offline_error(&self) -> Option<String> {
+        self.availability
+            .lock()
+            .expect("lock poisoned")
+            .last_error
+            .clone()
+    }
+
+    fn offline_machine(&self, error: Option<String>) -> MachineOverview {
+        let label = self.fallback_machine_label();
+        MachineOverview {
+            source: String::new(),
+            machine_id: label.clone(),
+            machine_label: label,
+            reachable: false,
+            error,
+        }
+    }
+
+    fn offline_session_list(&self, error: Option<String>) -> SessionList {
+        SessionList {
+            generated_at: Utc::now(),
+            overview: UsageOverview {
+                machines: vec![self.offline_machine(error)],
+                ..UsageOverview::default()
+            },
+            sessions: Vec::new(),
+        }
+    }
+
+    fn note_http_success(&self) {
+        let mut availability = self.availability.lock().expect("lock poisoned");
+        availability.next_http_retry_at = None;
+        availability.http_backoff = REMOTE_HTTP_RETRY_MIN;
+        availability.last_error = None;
+    }
+
+    fn note_http_failure(&self, error: String) {
+        let mut availability = self.availability.lock().expect("lock poisoned");
+        availability.last_error = Some(error);
+        availability.next_http_retry_at = Some(Instant::now() + availability.http_backoff);
+        availability.http_backoff = (availability.http_backoff * 2).min(REMOTE_HTTP_RETRY_MAX);
+    }
+
+    fn current_http_backoff_error(&self) -> Option<anyhow::Error> {
+        let availability = self.availability.lock().expect("lock poisoned");
+        let next_retry_at = availability.next_http_retry_at?;
+        if Instant::now() >= next_retry_at {
+            return None;
+        }
+
+        let seconds = next_retry_at
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .max(1);
+        let last_error = availability
+            .last_error
+            .as_deref()
+            .unwrap_or("machine temporarily unreachable");
+        Some(anyhow!(
+            "machine temporarily unreachable, retrying in {seconds}s: {last_error}"
+        ))
     }
 
     fn endpoint(&self, path: &str) -> Result<reqwest::Url> {
@@ -294,6 +373,10 @@ struct ApiErrorBody {
 #[async_trait]
 impl MonitorClient for RemoteMonitorClient {
     async fn list_sessions(&self, query: SessionQuery) -> Result<SessionList> {
+        if let Some(error) = self.current_http_backoff_error() {
+            return Err(error);
+        }
+
         let mut request = self
             .http
             .get(self.endpoint("api/sessions")?)
@@ -301,26 +384,66 @@ impl MonitorClient for RemoteMonitorClient {
         if let Some(limit) = query.limit {
             request = request.query(&[("limit", limit)]);
         }
-        let response = request.send().await?;
-        Self::decode_json(response).await
+        let response = request.send().await.map_err(|error| {
+            let message = error.to_string();
+            self.note_http_failure(message.clone());
+            anyhow!(message)
+        })?;
+        let list = Self::decode_json(response).await.map_err(|error| {
+            let message = error.to_string();
+            self.note_http_failure(message.clone());
+            anyhow!(message)
+        })?;
+        self.note_http_success();
+        Ok(list)
     }
 
     async fn get_session(&self, id: &str) -> Result<SessionDetail> {
+        if let Some(error) = self.current_http_backoff_error() {
+            return Err(error);
+        }
+
         let response = self
             .http
             .get(self.session_endpoint(id, None)?)
             .send()
-            .await?;
-        Self::decode_json(response).await
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                self.note_http_failure(message.clone());
+                anyhow!(message)
+            })?;
+        let detail = Self::decode_json(response).await.map_err(|error| {
+            let message = error.to_string();
+            self.note_http_failure(message.clone());
+            anyhow!(message)
+        })?;
+        self.note_http_success();
+        Ok(detail)
     }
 
     async fn open_session_app(&self, id: &str) -> Result<OpenActionResponse> {
+        if let Some(error) = self.current_http_backoff_error() {
+            return Err(error);
+        }
+
         let response = self
             .http
             .post(self.session_endpoint(id, Some("open-app"))?)
             .send()
-            .await?;
-        Self::decode_json(response).await
+            .await
+            .map_err(|error| {
+                let message = error.to_string();
+                self.note_http_failure(message.clone());
+                anyhow!(message)
+            })?;
+        let action = Self::decode_json(response).await.map_err(|error| {
+            let message = error.to_string();
+            self.note_http_failure(message.clone());
+            anyhow!(message)
+        })?;
+        self.note_http_success();
+        Ok(action)
     }
 
     async fn subscribe_sessions(
@@ -330,13 +453,16 @@ impl MonitorClient for RemoteMonitorClient {
     ) -> Result<Option<UnboundedReceiver<SessionList>>> {
         let stream_url = self.stream_endpoint(query, refresh_every)?;
         let (tx, rx) = unbounded_channel();
+        let client = self.clone();
 
         tokio::spawn(async move {
             let mut reconnect_delay = REMOTE_STREAM_RECONNECT_MIN;
+            let mut last_signature: Option<String> = None;
 
             loop {
                 match timeout(REMOTE_CONNECT_TIMEOUT, connect_async(stream_url.as_str())).await {
                     Ok(Ok((stream, _))) => {
+                        client.note_http_success();
                         reconnect_delay = REMOTE_STREAM_RECONNECT_MIN;
                         let (_, mut read) = stream.split();
 
@@ -351,6 +477,10 @@ impl MonitorClient for RemoteMonitorClient {
                                     else {
                                         continue;
                                     };
+                                    let Ok(signature) = session_list_signature(&list) else {
+                                        continue;
+                                    };
+                                    last_signature = Some(signature);
                                     if tx.send(list).is_err() {
                                         return;
                                     }
@@ -359,12 +489,27 @@ impl MonitorClient for RemoteMonitorClient {
                                 _ => {}
                             }
                         }
+                        client.note_http_failure("remote session stream disconnected".to_string());
                     }
                     Ok(Err(error)) => {
+                        client.note_http_failure(error.to_string());
                         tracing::debug!(%stream_url, ?error, "remote session stream connect failed");
                     }
                     Err(_) => {
+                        client.note_http_failure(
+                            "remote session stream connect timed out".to_string(),
+                        );
                         tracing::debug!(%stream_url, "remote session stream connect timed out");
+                    }
+                }
+
+                let offline = client.offline_session_list(client.offline_error());
+                if let Ok(signature) = session_list_signature(&offline)
+                    && last_signature.as_deref() != Some(signature.as_str())
+                {
+                    last_signature = Some(signature);
+                    if tx.send(offline).is_err() {
+                        return;
                     }
                 }
 
@@ -431,6 +576,7 @@ impl MonitorClient for MultiMonitorClient {
     ) -> Result<SessionList> {
         let mut sessions = Vec::new();
         let mut quotas = Vec::new();
+        let mut machines = Vec::new();
         let mut total_sessions = 0usize;
         let mut join_set = JoinSet::new();
         let progress_state = Arc::new(Mutex::new(HashMap::<String, (usize, usize)>::new()));
@@ -473,21 +619,49 @@ impl MonitorClient for MultiMonitorClient {
             }
 
             join_set.spawn(async move {
-                let list = client
+                let result = client
                     .client
                     .list_sessions_with_progress(query, Some(client_progress_tx))
-                    .await?;
-                Ok::<_, anyhow::Error>((client.namespace, client.fallback_machine_label, list))
+                    .await;
+                (client.namespace, client.fallback_machine_label, result)
             });
         }
 
         while let Some(result) = join_set.join_next().await {
-            let (namespace, fallback_machine_label, mut list) = result??;
-            total_sessions += list.overview.total_sessions;
-            quotas.append(&mut list.overview.quotas);
-            for mut session in list.sessions {
-                namespace_summary(&namespace, fallback_machine_label.as_deref(), &mut session);
-                sessions.push(session);
+            let (namespace, fallback_machine_label, result) = result?;
+            match result {
+                Ok(mut list) => {
+                    total_sessions += list.overview.total_sessions;
+                    quotas.append(&mut list.overview.quotas);
+                    machines.extend(namespace_machines(
+                        &namespace,
+                        fallback_machine_label.as_deref(),
+                        &list.overview.machines,
+                        &list.sessions,
+                    ));
+                    for mut session in list.sessions {
+                        namespace_summary(
+                            &namespace,
+                            fallback_machine_label.as_deref(),
+                            &mut session,
+                        );
+                        sessions.push(session);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        source = %namespace,
+                        ?error,
+                        "monitor source list failed; keeping source offline"
+                    );
+                    machines.push(source_machine_overview(
+                        &namespace,
+                        fallback_machine_label.as_deref(),
+                        &[],
+                        false,
+                        Some("Machine temporarily unreachable".to_string()),
+                    ));
+                }
             }
         }
 
@@ -498,7 +672,7 @@ impl MonitorClient for MultiMonitorClient {
 
         let list = SessionList {
             generated_at: Utc::now(),
-            overview: build_combined_overview(&sessions, quotas, total_sessions),
+            overview: build_combined_overview(&sessions, quotas, total_sessions, machines),
             sessions,
         };
 
@@ -553,18 +727,66 @@ impl MonitorClient for MultiMonitorClient {
         refresh_every: Duration,
     ) -> Result<Option<UnboundedReceiver<SessionList>>> {
         let mut subscriptions = Vec::new();
+        let mut latest_lists = HashMap::<String, (Option<String>, SessionList)>::new();
 
         for client in &self.clients {
-            if let Some(receiver) = client
+            let offline = SessionList {
+                generated_at: Utc::now(),
+                overview: UsageOverview {
+                    machines: vec![source_machine_overview(
+                        &client.namespace,
+                        client.fallback_machine_label.as_deref(),
+                        &[],
+                        false,
+                        Some("Machine temporarily unreachable".to_string()),
+                    )],
+                    ..UsageOverview::default()
+                },
+                sessions: Vec::new(),
+            };
+            latest_lists.insert(
+                client.namespace.clone(),
+                (client.fallback_machine_label.clone(), offline),
+            );
+
+            match client
                 .client
                 .subscribe_sessions(query.clone(), refresh_every)
-                .await?
+                .await
             {
-                subscriptions.push((
+                Ok(Some(receiver)) => subscriptions.push((
                     client.namespace.clone(),
                     client.fallback_machine_label.clone(),
                     receiver,
-                ));
+                )),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        source = %client.namespace,
+                        ?error,
+                        "monitor source subscribe failed; keeping source offline"
+                    );
+                    latest_lists.insert(
+                        client.namespace.clone(),
+                        (
+                            client.fallback_machine_label.clone(),
+                            SessionList {
+                                generated_at: Utc::now(),
+                                overview: UsageOverview {
+                                    machines: vec![source_machine_overview(
+                                        &client.namespace,
+                                        client.fallback_machine_label.as_deref(),
+                                        &[],
+                                        false,
+                                        Some("Machine temporarily unreachable".to_string()),
+                                    )],
+                                    ..UsageOverview::default()
+                                },
+                                sessions: Vec::new(),
+                            },
+                        ),
+                    );
+                }
             }
         }
 
@@ -572,7 +794,6 @@ impl MonitorClient for MultiMonitorClient {
             return Ok(None);
         }
 
-        let expected_clients = subscriptions.len();
         let (tx, rx) = unbounded_channel();
         let (update_tx, mut update_rx) = unbounded_channel();
 
@@ -592,14 +813,8 @@ impl MonitorClient for MultiMonitorClient {
         drop(update_tx);
 
         tokio::spawn(async move {
-            let mut latest_lists = HashMap::<String, (Option<String>, SessionList)>::new();
-
             while let Some((namespace, fallback_machine_label, list)) = update_rx.recv().await {
                 latest_lists.insert(namespace, (fallback_machine_label, list));
-                if latest_lists.len() < expected_clients {
-                    continue;
-                }
-
                 let combined = build_combined_session_list(
                     latest_lists
                         .iter()
@@ -647,7 +862,10 @@ fn build_combined_overview(
     sessions: &[SessionSummary],
     quotas: Vec<ProviderQuota>,
     total_sessions: usize,
+    mut machines: Vec<MachineOverview>,
 ) -> UsageOverview {
+    machines.sort_by(|left, right| left.machine_label.cmp(&right.machine_label));
+    machines.dedup_by(|left, right| left.source == right.source);
     UsageOverview {
         total_sessions,
         total_tokens: sessions
@@ -667,6 +885,7 @@ fn build_combined_overview(
             .filter(|session| session.context_window.is_some())
             .count(),
         quotas,
+        machines,
     }
 }
 
@@ -676,11 +895,18 @@ fn build_combined_session_list<'a>(
 ) -> SessionList {
     let mut sessions = Vec::new();
     let mut quotas = Vec::new();
+    let mut machines = Vec::new();
     let mut total_sessions = 0usize;
 
     for (namespace, fallback_machine_label, list) in lists {
         total_sessions += list.overview.total_sessions;
         quotas.extend(list.overview.quotas.clone());
+        machines.extend(namespace_machines(
+            namespace,
+            fallback_machine_label,
+            &list.overview.machines,
+            &list.sessions,
+        ));
         for mut session in list.sessions.clone() {
             namespace_summary(namespace, fallback_machine_label, &mut session);
             sessions.push(session);
@@ -694,9 +920,85 @@ fn build_combined_session_list<'a>(
 
     SessionList {
         generated_at: Utc::now(),
-        overview: build_combined_overview(&sessions, quotas, total_sessions),
+        overview: build_combined_overview(&sessions, quotas, total_sessions, machines),
         sessions,
     }
+}
+
+fn namespace_machine(
+    namespace: &str,
+    fallback_machine_label: Option<&str>,
+    machine: &MachineOverview,
+) -> MachineOverview {
+    let mut machine = machine.clone();
+    machine.source = namespace.to_string();
+
+    if let Some(label) = fallback_machine_label {
+        let replace_label = machine.machine_label.trim().is_empty()
+            || machine.machine_label.eq_ignore_ascii_case("local");
+        if replace_label {
+            machine.machine_label = label.to_string();
+        }
+
+        let replace_id = machine.machine_id.trim().is_empty()
+            || machine.machine_id.eq_ignore_ascii_case("local");
+        if replace_id {
+            machine.machine_id = label.to_string();
+        }
+    }
+
+    machine
+}
+
+fn source_machine_overview(
+    namespace: &str,
+    fallback_machine_label: Option<&str>,
+    sessions: &[SessionSummary],
+    reachable: bool,
+    error: Option<String>,
+) -> MachineOverview {
+    let session = sessions.first();
+    let machine_label = session
+        .map(|session| session.machine_label.as_str())
+        .filter(|label| !label.trim().is_empty() && !label.eq_ignore_ascii_case("local"))
+        .or(fallback_machine_label)
+        .unwrap_or(namespace)
+        .to_string();
+    let machine_id = session
+        .map(|session| session.machine_id.as_str())
+        .filter(|id| !id.trim().is_empty() && !id.eq_ignore_ascii_case("local"))
+        .unwrap_or(machine_label.as_str())
+        .to_string();
+
+    MachineOverview {
+        source: namespace.to_string(),
+        machine_id,
+        machine_label,
+        reachable,
+        error,
+    }
+}
+
+fn namespace_machines(
+    namespace: &str,
+    fallback_machine_label: Option<&str>,
+    machines: &[MachineOverview],
+    sessions: &[SessionSummary],
+) -> Vec<MachineOverview> {
+    if !machines.is_empty() {
+        return machines
+            .iter()
+            .map(|machine| namespace_machine(namespace, fallback_machine_label, machine))
+            .collect();
+    }
+
+    vec![source_machine_overview(
+        namespace,
+        fallback_machine_label,
+        sessions,
+        true,
+        None,
+    )]
 }
 
 fn session_list_signature(list: &SessionList) -> Result<String> {
@@ -708,7 +1010,7 @@ mod tests {
     use super::*;
     use agent_cow_core::{
         SessionActivityState, SessionCost, SessionStatus, SessionStatusKind, StatusConfidence,
-        TokenUsage,
+        TokenUsage, UsageOverview,
     };
 
     fn fixture_summary(machine_id: &str, machine_label: &str) -> SessionSummary {
@@ -760,5 +1062,33 @@ mod tests {
         namespace_summary("remote1", Some("192.168.1.10"), &mut summary);
         assert_eq!(summary.machine_label, "buildbox");
         assert_eq!(summary.machine_id, "buildbox");
+    }
+
+    #[test]
+    fn combined_session_list_keeps_unreachable_machine_visible() {
+        let offline = SessionList {
+            generated_at: Utc::now(),
+            overview: UsageOverview {
+                machines: vec![MachineOverview {
+                    source: String::new(),
+                    machine_id: "192.168.1.10".to_string(),
+                    machine_label: "192.168.1.10".to_string(),
+                    reachable: false,
+                    error: Some("Machine temporarily unreachable".to_string()),
+                }],
+                ..UsageOverview::default()
+            },
+            sessions: Vec::new(),
+        };
+
+        let combined = build_combined_session_list(
+            [("remote1", Some("192.168.1.10"), &offline)].into_iter(),
+            None,
+        );
+
+        assert!(combined.sessions.is_empty());
+        assert_eq!(combined.overview.machines.len(), 1);
+        assert_eq!(combined.overview.machines[0].machine_label, "192.168.1.10");
+        assert!(!combined.overview.machines[0].reachable);
     }
 }
