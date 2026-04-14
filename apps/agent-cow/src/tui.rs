@@ -7,9 +7,9 @@ use std::{
 
 use crate::client::MonitorClient;
 use agent_cow_core::{
-    ActivityEvent, ActivityKind, MachineOverview, ProviderQuota, SessionActivityState,
-    SessionDetail, SessionList, SessionLoadProgress, SessionQuery, SessionStatusKind,
-    SessionSummary, TokenUsage, UsageOverview,
+    ActivityEvent, ActivityKind, MachineOverview, ProviderKind, ProviderQuota,
+    SessionActivityState, SessionDetail, SessionList, SessionLoadProgress, SessionQuery,
+    SessionStatusKind, SessionSummary, TokenUsage, UsageOverview,
 };
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
@@ -34,6 +34,8 @@ const FAST_LIST_LIMIT: usize = 64;
 const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const UI_POLL_INTERVAL_BUSY: Duration = Duration::from_millis(100);
 const UI_POLL_INTERVAL_IDLE: Duration = Duration::from_millis(250);
+const FOCUS_SESSION_WINDOW_HOURS: i64 = 24;
+const RECENT_SESSION_WINDOW_DAYS: i64 = 7;
 
 pub async fn run(
     client: Arc<dyn MonitorClient>,
@@ -397,6 +399,7 @@ async fn run_loop(
                     }
                     KeyCode::End | KeyCode::Char('G') => app.select_last(),
                     KeyCode::Char('/') if !app.detail_mode => app.begin_filter(),
+                    KeyCode::Char('v') if !app.detail_mode => app.cycle_view_mode(),
                     KeyCode::Char('m') if !app.detail_mode => app.cycle_machine_scope(),
                     KeyCode::Esc if app.detail_mode => app.close_detail_mode(),
                     KeyCode::Esc => app.clear_filter(),
@@ -514,6 +517,7 @@ struct TuiApp {
     notice: Option<UiNotice>,
     filter_input: String,
     filter_mode: bool,
+    view_mode: SessionViewMode,
     selection_changed: bool,
 }
 
@@ -526,6 +530,39 @@ struct UiNotice {
 enum DetailPane {
     Describe,
     Follow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionViewMode {
+    Focus,
+    Recent,
+    All,
+}
+
+impl SessionViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Focus => "Focus",
+            Self::Recent => "Recent",
+            Self::All => "All",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Focus => Self::Recent,
+            Self::Recent => Self::All,
+            Self::All => Self::Focus,
+        }
+    }
+
+    fn hidden_hint(self) -> &'static str {
+        match self {
+            Self::Focus => "older sessions hidden • press v for Recent",
+            Self::Recent => "older sessions hidden • press v for All",
+            Self::All => "",
+        }
+    }
 }
 
 impl TuiApp {
@@ -561,6 +598,7 @@ impl TuiApp {
             notice: None,
             filter_input: String::new(),
             filter_mode: false,
+            view_mode: SessionViewMode::Focus,
             selection_changed: false,
         }
     }
@@ -760,12 +798,14 @@ impl TuiApp {
 
     fn rebuild_filter(&mut self, preserve_id: Option<&str>) {
         let filter = self.filter_input.trim().to_lowercase();
+        let now = Utc::now();
         self.filtered_indices = self
             .sessions
             .iter()
             .enumerate()
             .filter_map(|(index, session)| {
                 (matches_machine_scope(session, self.machine_scope.as_deref())
+                    && matches_view_mode(session, self.view_mode, now)
                     && matches_text_filter(session, &filter))
                 .then_some(index)
             })
@@ -799,6 +839,17 @@ impl TuiApp {
         self.table_state.select(Some(next_selected));
     }
 
+    fn cycle_view_mode(&mut self) {
+        let selected_id = self.selected_session_id().map(ToOwned::to_owned);
+        self.view_mode = self.view_mode.next();
+        self.rebuild_filter(selected_id.as_deref());
+        self.selection_changed = true;
+        self.notice = Some(UiNotice {
+            message: format!("View: {}", self.view_mode.label()),
+            is_error: false,
+        });
+    }
+
     fn selected_session_id(&self) -> Option<&str> {
         self.table_state
             .selected()
@@ -821,16 +872,6 @@ impl TuiApp {
             .filter_map(|index| self.sessions.get(*index))
     }
 
-    fn scoped_sessions(&self) -> impl Iterator<Item = &SessionSummary> {
-        self.sessions
-            .iter()
-            .filter(|session| matches_machine_scope(session, self.machine_scope.as_deref()))
-    }
-
-    fn scoped_session_count(&self) -> usize {
-        self.scoped_sessions().count()
-    }
-
     fn scoped_machine_overview(&self) -> Option<&MachineOverview> {
         let scope = self.machine_scope.as_deref()?;
         self.overview
@@ -847,75 +888,45 @@ impl TuiApp {
             })
     }
 
-    fn namespace_machine_labels(&self) -> HashMap<&str, &str> {
-        let mut labels = HashMap::new();
-        for machine in &self.overview.machines {
-            labels.insert(machine.source.as_str(), machine.machine_label.as_str());
-        }
-        for session in &self.sessions {
-            if let Some((namespace, _)) = session.id.split_once('|') {
-                labels
-                    .entry(namespace)
-                    .or_insert(session.machine_label.as_str());
-            }
-        }
-        labels
-    }
-
-    fn scoped_loading_progress(&self) -> Option<(usize, usize)> {
-        let scope = self.machine_scope.as_deref()?;
-        let namespace_labels = self.namespace_machine_labels();
-        let mut loaded_sessions = 0usize;
-        let mut total_sessions = 0usize;
-        let mut found = false;
-
-        for (namespace, (loaded, total)) in &self.loading_progress_sources {
-            if namespace_labels.get(namespace.as_str()).copied() == Some(scope) {
-                loaded_sessions += *loaded;
-                total_sessions += *total;
-                found = true;
-            }
-        }
-
-        found.then(|| {
-            let current = self.scoped_session_count();
-            (loaded_sessions.max(current), total_sessions.max(current))
-        })
-    }
-
-    fn active_loading_progress(&self) -> Option<(usize, usize)> {
+    fn active_loading_label(&self) -> Option<String> {
         if !self.loading_more {
             return None;
         }
 
-        if let Some((loaded_sessions, total_sessions)) = self.scoped_loading_progress() {
-            return (loaded_sessions < total_sessions).then_some((loaded_sessions, total_sessions));
-        }
-
-        if self.machine_scope.is_some() {
-            return None;
-        }
-
-        let total_sessions = self
-            .loading_progress_total
-            .max(self.overview.total_sessions)
-            .max(self.sessions.len());
-        let loaded_sessions = self.loading_progress_loaded.max(self.sessions.len());
-        (loaded_sessions < total_sessions).then_some((loaded_sessions, total_sessions))
+        let shown = self.filtered_indices.len();
+        Some(format!("{shown} shown"))
     }
 
-    fn scoped_total_sessions_for_display(&self) -> usize {
-        if let Some((_, total_sessions)) = self.scoped_loading_progress() {
-            return total_sessions;
+    fn hidden_session_count(&self) -> usize {
+        if !self.filter_input.is_empty() || matches!(self.view_mode, SessionViewMode::All) {
+            return 0;
         }
 
-        if self.machine_scope.is_some() {
-            return self.scoped_session_count();
-        }
+        self.scoped_next_view_session_count()
+            .saturating_sub(self.scoped_view_session_count())
+    }
 
-        self.loading_progress_total
-            .max(self.overview.total_sessions)
-            .max(self.sessions.len())
+    fn scoped_view_session_count(&self) -> usize {
+        let now = Utc::now();
+        self.sessions
+            .iter()
+            .filter(|session| {
+                matches_machine_scope(session, self.machine_scope.as_deref())
+                    && matches_view_mode(session, self.view_mode, now)
+            })
+            .count()
+    }
+
+    fn scoped_next_view_session_count(&self) -> usize {
+        let now = Utc::now();
+        let next_mode = self.view_mode.next();
+        self.sessions
+            .iter()
+            .filter(|session| {
+                matches_machine_scope(session, self.machine_scope.as_deref())
+                    && matches_view_mode(session, next_mode, now)
+            })
+            .count()
     }
 
     fn visible_total_tokens(&self) -> u64 {
@@ -1210,6 +1221,7 @@ impl TuiApp {
                 || self.error.is_some()
                 || self.filter_mode
                 || self.loading_more
+                || (!self.detail_mode && self.hidden_session_count() > 0)
                 || self
                     .current_machine_overview()
                     .is_some_and(|machine| !machine.reachable),
@@ -1314,12 +1326,11 @@ fn draw_loading(frame: &mut Frame, progress: &SessionLoadProgress) {
         body[2],
     );
 
-    let progress_total = progress.total_sessions;
-    let progress_line = if progress_total > 0 {
+    let progress_line = if progress.loaded_sessions > 0 {
         Line::from(vec![
             Span::styled("Scanning ", Style::default().fg(text_muted_color())),
             Span::styled(
-                format!("{} / {}", progress.loaded_sessions, progress_total),
+                "recent agent sessions",
                 Style::default()
                     .fg(accent_gold())
                     .add_modifier(Modifier::BOLD),
@@ -1755,22 +1766,19 @@ fn loading_dots_field() -> String {
 
 fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let visible_sessions = app.filtered_indices.len();
-    let scoped_total_sessions = app.scoped_total_sessions_for_display();
-    let sessions_value = if app.filter_input.is_empty() && visible_sessions == scoped_total_sessions
-    {
-        scoped_total_sessions.to_string()
+    let view_scoped_sessions = app.scoped_view_session_count();
+    let sessions_value = if !app.filter_input.is_empty() {
+        format!("{visible_sessions}/{view_scoped_sessions}")
     } else {
-        format!("{visible_sessions}/{scoped_total_sessions}")
+        view_scoped_sessions.to_string()
     };
     let mut lines = vec![
         header_meta_line_with_limit("Machine", app.visible_host_label(), 15),
         header_meta_line("Sessions", sessions_value),
+        header_meta_line("View", app.view_mode.label().to_string()),
     ];
-    if let Some((loaded_sessions, total_sessions)) = app.active_loading_progress() {
-        lines.push(header_meta_line(
-            "Scanning",
-            format!("{}/{}", loaded_sessions, total_sessions),
-        ));
+    if let Some(scanning_label) = app.active_loading_label() {
+        lines.push(header_meta_line("Scanning", scanning_label));
     }
     lines.extend([
         header_meta_line("Spend", format_usd_short(app.visible_total_cost_usd())),
@@ -1841,9 +1849,10 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                 Some(action_item("r", "Refresh", true)),
             ),
             (
+                Some(action_item("v", "View", true)),
                 Some(action_item("m", "Machine", true)),
-                Some(action_item("q", "Quit", true)),
             ),
+            (Some(action_item("q", "Quit", true)), None),
         ]
     } else {
         vec![
@@ -1860,10 +1869,13 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                 Some(action_item("r", "Refresh", true)),
             ),
             (
+                Some(action_item("v", "View", true)),
                 Some(action_item("m", "Machine", true)),
-                Some(action_item("esc", "Clear", true)),
             ),
-            (Some(action_item("q", "Quit", true)), None),
+            (
+                Some(action_item("esc", "Clear", true)),
+                Some(action_item("q", "Quit", true)),
+            ),
         ]
     }
 }
@@ -2787,7 +2799,7 @@ fn footer_line(app: &TuiApp) -> Line<'static> {
                 Style::default().fg(accent_gold()),
             ),
         ])
-    } else if let Some((loaded_sessions, total_sessions)) = app.active_loading_progress() {
+    } else if let Some(scanning_label) = app.active_loading_label() {
         Line::from(vec![
             Span::styled(
                 "Scanning sessions",
@@ -2797,12 +2809,7 @@ fn footer_line(app: &TuiApp) -> Line<'static> {
             ),
             Span::styled(loading_dots_field(), Style::default().fg(accent_cyan())),
             Span::styled(
-                format!(
-                    " {} of {}  •  showing {}",
-                    loaded_sessions,
-                    total_sessions,
-                    app.filtered_indices.len()
-                ),
+                format!(" {}", scanning_label),
                 Style::default().fg(text_muted_color()),
             ),
         ])
@@ -2823,6 +2830,19 @@ fn footer_line(app: &TuiApp) -> Line<'static> {
             ),
             Span::styled(
                 "  •  retrying automatically",
+                Style::default().fg(text_muted_color()),
+            ),
+        ])
+    } else if !app.detail_mode && app.hidden_session_count() > 0 {
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", app.hidden_session_count()),
+                Style::default()
+                    .fg(accent_gold())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                app.view_mode.hidden_hint(),
                 Style::default().fg(text_muted_color()),
             ),
         ])
@@ -3473,6 +3493,58 @@ fn matches_machine_scope(session: &SessionSummary, scope: Option<&str>) -> bool 
     }
 }
 
+fn matches_view_mode(
+    session: &SessionSummary,
+    view_mode: SessionViewMode,
+    now: DateTime<Utc>,
+) -> bool {
+    match view_mode {
+        SessionViewMode::All => is_meaningful_session(session),
+        SessionViewMode::Recent => {
+            is_meaningful_session(session)
+                && session.updated_at >= now - chrono::Duration::days(RECENT_SESSION_WINDOW_DAYS)
+        }
+        SessionViewMode::Focus => {
+            is_meaningful_session(session)
+                && (session.updated_at >= now - chrono::Duration::hours(FOCUS_SESSION_WINDOW_HOURS)
+                    || matches!(
+                        session.status.kind,
+                        SessionStatusKind::Running
+                            | SessionStatusKind::ToolBusy
+                            | SessionStatusKind::WaitingInput
+                    )
+                    || !matches!(session.activity_state, SessionActivityState::Idle))
+        }
+    }
+}
+
+fn is_meaningful_session(session: &SessionSummary) -> bool {
+    match session.provider {
+        ProviderKind::Codex => true,
+        ProviderKind::Claude => !is_claude_noise_session(session),
+    }
+}
+
+fn is_claude_noise_session(session: &SessionSummary) -> bool {
+    if session
+        .rollout_path
+        .as_deref()
+        .is_some_and(|path| path.contains("/subagents/"))
+    {
+        return true;
+    }
+
+    let normalized = session.title.trim().to_ascii_lowercase();
+    if normalized.starts_with("do not browse, inspect files, or run shell commands.") {
+        return true;
+    }
+
+    matches!(
+        normalized.as_str(),
+        "exit" | "/exit" | "/status" | "/status/exit" | "statusline"
+    )
+}
+
 fn meta_line(label: &str, value: String) -> Line<'static> {
     Line::from(vec![
         info_label(label),
@@ -4068,8 +4140,8 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ListRefreshKind, TuiApp, animated_cow_lines, brand_cluster_lines, footer_line,
-        header_meta_lines,
+        ListRefreshKind, SessionViewMode, TuiApp, animated_cow_lines, brand_cluster_lines,
+        footer_line, header_meta_lines,
     };
     use agent_cow_core::{
         ProviderKind, SessionActivityState, SessionList, SessionLoadProgress, SessionStatus,
@@ -4116,6 +4188,20 @@ mod tests {
             rollout_path: None,
             navigation: Vec::new(),
         }
+    }
+
+    fn fixture_claude_session(
+        id: &str,
+        machine_label: &str,
+        title: &str,
+        rollout_path: Option<&str>,
+    ) -> SessionSummary {
+        let mut session = fixture_session(id, machine_label);
+        session.provider = ProviderKind::Claude;
+        session.title = title.to_string();
+        session.model = Some("claude-opus-4-6".to_string());
+        session.rollout_path = rollout_path.map(ToOwned::to_owned);
+        session
     }
 
     #[test]
@@ -4202,7 +4288,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(lines.iter().any(|line| line.contains("Scanning")));
-        assert!(lines.iter().any(|line| line.contains("72/377")));
+        assert!(lines.iter().any(|line| line.contains("0 shown")));
     }
 
     #[test]
@@ -4230,6 +4316,7 @@ mod tests {
     #[test]
     fn machine_scope_uses_scoped_loading_progress_in_header_and_footer() {
         let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.view_mode = SessionViewMode::All;
         app.sessions = vec![
             fixture_session("local|codex:1", "local"),
             fixture_session("remote1|codex:2", "host2"),
@@ -4248,9 +4335,86 @@ mod tests {
             .collect::<Vec<_>>();
         let footer_text = flatten_line(&footer_line(&app));
 
-        assert!(header.iter().any(|line| line.contains("1/377")));
-        assert!(header.iter().any(|line| line.contains("120/377")));
-        assert!(footer_text.contains("120 of 377"));
+        assert!(
+            header
+                .iter()
+                .any(|line| line.contains("Sessions") && line.contains("1"))
+        );
+        assert!(
+            header
+                .iter()
+                .any(|line| line.contains("Scanning") && line.contains("1 shown"))
+        );
+        assert!(footer_text.contains("1 shown"));
         assert!(!footer_text.contains("754"));
+    }
+
+    #[test]
+    fn focus_view_hides_old_stale_sessions_by_default() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.sessions = vec![fixture_session("local|codex:1", "local")];
+        app.rebuild_filter(None);
+
+        assert!(app.filtered_indices.is_empty());
+
+        let header = header_meta_lines(&app)
+            .into_iter()
+            .map(|line| flatten_line(&line))
+            .collect::<Vec<_>>();
+        let footer_text = flatten_line(&footer_line(&app));
+
+        assert!(
+            header
+                .iter()
+                .any(|line| line.contains("View") && line.contains("Focus"))
+        );
+        assert!(
+            header
+                .iter()
+                .any(|line| line.contains("Sessions") && line.contains("0"))
+        );
+        assert!(footer_text.contains("1 older sessions hidden"));
+    }
+
+    #[test]
+    fn cycling_view_mode_reveals_old_sessions() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.sessions = vec![fixture_session("local|codex:1", "local")];
+        app.rebuild_filter(None);
+        assert!(app.filtered_indices.is_empty());
+
+        app.cycle_view_mode();
+        assert_eq!(app.view_mode, SessionViewMode::Recent);
+        assert!(app.filtered_indices.contains(&0));
+    }
+
+    #[test]
+    fn all_view_hides_claude_noise() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.view_mode = SessionViewMode::All;
+        app.sessions = vec![
+            fixture_claude_session(
+                "local|claude:1",
+                "local",
+                "exit",
+                Some("/tmp/project/subagents/agent-123.jsonl"),
+            ),
+            fixture_claude_session(
+                "local|claude:2",
+                "local",
+                "Do not browse, inspect files, or run shell commands. Use only the provided bundle.",
+                Some("/tmp/project/session-automation.jsonl"),
+            ),
+            fixture_claude_session(
+                "local|claude:3",
+                "local",
+                "useful session",
+                Some("/tmp/project/session.jsonl"),
+            ),
+        ];
+        app.rebuild_filter(None);
+
+        assert_eq!(app.filtered_indices, vec![2]);
+        assert_eq!(app.hidden_session_count(), 0);
     }
 }

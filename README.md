@@ -166,6 +166,7 @@ Agent Cow works well over:
 | `f` | Open latest conversation |
 | `o` | Open the session in the provider app |
 | `m` | Cycle machine scope |
+| `v` | Cycle view: `Focus` → `Recent` → `All` |
 | `/` | Filter sessions |
 | `r` | Refresh |
 | `q` | Quit |
