@@ -494,6 +494,12 @@ struct TuiApp {
     sessions: Vec<SessionSummary>,
     overview: UsageOverview,
     filtered_indices: Vec<usize>,
+    machine_labels_cache: Vec<String>,
+    view_scoped_session_count: usize,
+    next_view_scoped_session_count: usize,
+    visible_total_tokens_cache: u64,
+    visible_total_cost_usd_cache: f64,
+    visible_has_multiple_hosts: bool,
     machine_scope: Option<String>,
     detail: Option<SessionDetail>,
     detail_loading: bool,
@@ -575,6 +581,12 @@ impl TuiApp {
             sessions: Vec::new(),
             overview: UsageOverview::default(),
             filtered_indices: Vec::new(),
+            machine_labels_cache: Vec::new(),
+            view_scoped_session_count: 0,
+            next_view_scoped_session_count: 0,
+            visible_total_tokens_cache: 0,
+            visible_total_cost_usd_cache: 0.0,
+            visible_has_multiple_hosts: false,
             machine_scope: None,
             detail: None,
             detail_loading: false,
@@ -690,6 +702,7 @@ impl TuiApp {
         self.overview = response.overview;
         self.last_refresh = Instant::now();
         self.error = None;
+        self.refresh_machine_labels_cache();
         self.rebuild_filter(selected_id.as_deref());
 
         if let Some(selected_id) = selected_id.as_deref()
@@ -735,6 +748,7 @@ impl TuiApp {
 
         self.sessions
             .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        self.refresh_machine_labels_cache();
         self.rebuild_filter(selected_id.as_deref());
 
         if let Some(selected_id) = selected_id.as_deref()
@@ -799,17 +813,57 @@ impl TuiApp {
     fn rebuild_filter(&mut self, preserve_id: Option<&str>) {
         let filter = self.filter_input.trim().to_lowercase();
         let now = Utc::now();
-        self.filtered_indices = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, session)| {
-                (matches_machine_scope(session, self.machine_scope.as_deref())
-                    && matches_view_mode(session, self.view_mode, now)
-                    && matches_text_filter(session, &filter))
-                .then_some(index)
-            })
-            .collect();
+        let next_view_mode = self.view_mode.next();
+        let mut filtered_indices = Vec::new();
+        let mut view_scoped_session_count = 0usize;
+        let mut next_view_scoped_session_count = 0usize;
+        let mut visible_total_tokens = 0u64;
+        let mut visible_total_cost_usd = 0.0f64;
+        let mut first_visible_host: Option<&str> = None;
+        let mut visible_has_multiple_hosts = false;
+
+        for (index, session) in self.sessions.iter().enumerate() {
+            if !matches_machine_scope(session, self.machine_scope.as_deref()) {
+                continue;
+            }
+
+            let in_current_view = matches_view_mode(session, self.view_mode, now);
+            if in_current_view {
+                view_scoped_session_count += 1;
+            }
+            if matches_view_mode(session, next_view_mode, now) {
+                next_view_scoped_session_count += 1;
+            }
+
+            if !(in_current_view && matches_text_filter(session, &filter)) {
+                continue;
+            }
+
+            filtered_indices.push(index);
+            visible_total_tokens = visible_total_tokens.saturating_add(session.tokens.total_tokens);
+            visible_total_cost_usd += session
+                .cost
+                .as_ref()
+                .map(|cost| cost.total_usd)
+                .unwrap_or(0.0);
+
+            if !visible_has_multiple_hosts {
+                match first_visible_host {
+                    None => first_visible_host = Some(session.machine_label.as_str()),
+                    Some(host) if host != session.machine_label => {
+                        visible_has_multiple_hosts = true
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        self.filtered_indices = filtered_indices;
+        self.view_scoped_session_count = view_scoped_session_count;
+        self.next_view_scoped_session_count = next_view_scoped_session_count;
+        self.visible_total_tokens_cache = visible_total_tokens;
+        self.visible_total_cost_usd_cache = visible_total_cost_usd;
+        self.visible_has_multiple_hosts = visible_has_multiple_hosts;
 
         if self.filtered_indices.is_empty() {
             self.table_state.select(None);
@@ -866,10 +920,22 @@ impl TuiApp {
             .or_else(|| self.detail.as_ref().map(|detail| &detail.summary))
     }
 
-    fn visible_sessions(&self) -> impl Iterator<Item = &SessionSummary> {
-        self.filtered_indices
-            .iter()
-            .filter_map(|index| self.sessions.get(*index))
+    fn refresh_machine_labels_cache(&mut self) {
+        let mut labels = if !self.overview.machines.is_empty() {
+            self.overview
+                .machines
+                .iter()
+                .map(|machine| machine.machine_label.clone())
+                .collect::<Vec<_>>()
+        } else {
+            self.sessions
+                .iter()
+                .map(|session| session.machine_label.clone())
+                .collect::<Vec<_>>()
+        };
+        labels.sort();
+        labels.dedup();
+        self.machine_labels_cache = labels;
     }
 
     fn scoped_machine_overview(&self) -> Option<&MachineOverview> {
@@ -902,61 +968,24 @@ impl TuiApp {
             return 0;
         }
 
-        self.scoped_next_view_session_count()
-            .saturating_sub(self.scoped_view_session_count())
+        self.next_view_scoped_session_count
+            .saturating_sub(self.view_scoped_session_count)
     }
 
     fn scoped_view_session_count(&self) -> usize {
-        let now = Utc::now();
-        self.sessions
-            .iter()
-            .filter(|session| {
-                matches_machine_scope(session, self.machine_scope.as_deref())
-                    && matches_view_mode(session, self.view_mode, now)
-            })
-            .count()
-    }
-
-    fn scoped_next_view_session_count(&self) -> usize {
-        let now = Utc::now();
-        let next_mode = self.view_mode.next();
-        self.sessions
-            .iter()
-            .filter(|session| {
-                matches_machine_scope(session, self.machine_scope.as_deref())
-                    && matches_view_mode(session, next_mode, now)
-            })
-            .count()
+        self.view_scoped_session_count
     }
 
     fn visible_total_tokens(&self) -> u64 {
-        self.visible_sessions()
-            .map(|session| session.tokens.total_tokens)
-            .sum()
+        self.visible_total_tokens_cache
     }
 
     fn visible_total_cost_usd(&self) -> f64 {
-        self.visible_sessions()
-            .filter_map(|session| session.cost.as_ref().map(|cost| cost.total_usd))
-            .sum()
+        self.visible_total_cost_usd_cache
     }
 
     fn machine_labels(&self) -> Vec<String> {
-        let mut labels = if !self.overview.machines.is_empty() {
-            self.overview
-                .machines
-                .iter()
-                .map(|machine| machine.machine_label.clone())
-                .collect::<Vec<_>>()
-        } else {
-            self.sessions
-                .iter()
-                .map(|session| session.machine_label.clone())
-                .collect::<Vec<_>>()
-        };
-        labels.sort();
-        labels.dedup();
-        labels
+        self.machine_labels_cache.clone()
     }
 
     fn select_next(&mut self) {
@@ -1146,10 +1175,7 @@ impl TuiApp {
     }
 
     fn show_host_column(&self) -> bool {
-        has_multiple_strings(
-            self.visible_sessions()
-                .map(|session| session.machine_label.as_str()),
-        )
+        self.visible_has_multiple_hosts
     }
 
     fn visible_host_label(&self) -> String {
@@ -1161,8 +1187,7 @@ impl TuiApp {
             };
         }
 
-        let labels = self.machine_labels();
-        match labels.as_slice() {
+        match self.machine_labels_cache.as_slice() {
             [] => "none".to_string(),
             [single] => {
                 if single.eq_ignore_ascii_case("local") {
@@ -1367,7 +1392,8 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
     let action_width = keymap_grid_width(&action_rows);
     let action_gap = u16::from(action_width > 0) * 5;
     let center_gap = u16::from(action_width > 0) * 4;
-    let meta_width = header_meta_width(app);
+    let meta_lines = header_meta_lines(app);
+    let meta_width = header_meta_width(&meta_lines);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -1380,7 +1406,7 @@ fn render_header_canvas(frame: &mut Frame, area: Rect, app: &TuiApp) {
         ])
         .split(body);
 
-    frame.render_widget(render_header_meta(app), columns[0]);
+    frame.render_widget(render_header_meta(meta_lines), columns[0]);
     frame.render_widget(render_action_grid(&action_rows), columns[2]);
     render_header_center(frame, columns[4], app);
 }
@@ -1787,16 +1813,12 @@ fn header_meta_lines(app: &TuiApp) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_header_meta(app: &TuiApp) -> Paragraph<'static> {
-    Paragraph::new(Text::from(header_meta_lines(app)))
+fn render_header_meta(lines: Vec<Line<'static>>) -> Paragraph<'static> {
+    Paragraph::new(Text::from(lines))
 }
 
-fn header_meta_width(app: &TuiApp) -> u16 {
-    let max_width = header_meta_lines(app)
-        .iter()
-        .map(Line::width)
-        .max()
-        .unwrap_or(18);
+fn header_meta_width(lines: &[Line<'static>]) -> u16 {
+    let max_width = lines.iter().map(Line::width).max().unwrap_or(18);
     (max_width as u16).saturating_add(1).clamp(18, 28)
 }
 
@@ -3519,9 +3541,14 @@ fn matches_view_mode(
 }
 
 fn is_meaningful_session(session: &SessionSummary) -> bool {
+    if session.model.is_none() {
+        return false;
+    }
+
     match session.provider {
         ProviderKind::Codex => true,
         ProviderKind::Claude => !is_claude_noise_session(session),
+        ProviderKind::Opencode => !is_opencode_noise_session(session),
     }
 }
 
@@ -3543,6 +3570,11 @@ fn is_claude_noise_session(session: &SessionSummary) -> bool {
         normalized.as_str(),
         "exit" | "/exit" | "/status" | "/status/exit" | "statusline"
     )
+}
+
+fn is_opencode_noise_session(session: &SessionSummary) -> bool {
+    session.agent_role.as_deref() == Some("subagent")
+        || session.title.to_ascii_lowercase().contains("subagent")
 }
 
 fn meta_line(label: &str, value: String) -> Line<'static> {
@@ -4049,18 +4081,6 @@ fn format_context_window(context: &agent_cow_core::ContextWindowUsage) -> String
     )
 }
 
-fn has_multiple_strings<I, S>(mut values: I) -> bool
-where
-    I: Iterator<Item = S>,
-    S: AsRef<str>,
-{
-    let Some(first) = values.next() else {
-        return false;
-    };
-    let first = first.as_ref().to_string();
-    values.any(|value| value.as_ref() != first)
-}
-
 fn relative_age(timestamp: DateTime<Utc>) -> String {
     let delta = Utc::now() - timestamp;
 
@@ -4416,5 +4436,19 @@ mod tests {
 
         assert_eq!(app.filtered_indices, vec![2]);
         assert_eq!(app.hidden_session_count(), 0);
+    }
+
+    #[test]
+    fn all_view_hides_sessions_without_model() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.view_mode = SessionViewMode::All;
+        let mut unknown_model = fixture_session("local|codex:1", "local");
+        unknown_model.model = None;
+        let known_model = fixture_session("local|codex:2", "local");
+        app.sessions = vec![unknown_model, known_model];
+
+        app.rebuild_filter(None);
+
+        assert_eq!(app.filtered_indices, vec![1]);
     }
 }

@@ -8,6 +8,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use agent_cow_claude::ClaudeSource;
 use agent_cow_codex::CodexSource;
 use agent_cow_core::{CombinedSource, MonitorService, SessionDetail, SessionQuery, SessionSummary};
+use agent_cow_opencode::OpenCodeSource;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
@@ -23,6 +24,9 @@ struct Cli {
 
     #[arg(long, env = "AGENT_COW_CLAUDE_HOME")]
     claude_home: Option<PathBuf>,
+
+    #[arg(long, env = "AGENT_COW_OPENCODE_HOME")]
+    opencode_home: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -90,8 +94,11 @@ async fn main() -> Result<()> {
     let claude_home = cli
         .claude_home
         .or_else(|| std::env::var_os("CLAUDE_HOME").map(PathBuf::from));
+    let opencode_home = cli
+        .opencode_home
+        .or_else(|| std::env::var_os("OPENCODE_HOME").map(PathBuf::from));
 
-    let local_service = build_local_service(codex_home, claude_home)?;
+    let local_service = build_local_service(codex_home, claude_home, opencode_home)?;
 
     match cli.command {
         Command::Sessions { client, command } => {
@@ -143,7 +150,9 @@ async fn main() -> Result<()> {
         }
         Command::Agent { bind } => {
             let service = local_service.ok_or_else(|| {
-                anyhow::anyhow!("no provider homes were found; looked for ~/.codex and ~/.claude")
+                anyhow::anyhow!(
+                    "no provider homes were found; looked for ~/.codex, ~/.claude, and ~/.local/share/opencode"
+                )
             })?;
             api::run(service, bind).await?;
         }
@@ -155,6 +164,7 @@ async fn main() -> Result<()> {
 fn build_local_service(
     codex_home: Option<PathBuf>,
     claude_home: Option<PathBuf>,
+    opencode_home: Option<PathBuf>,
 ) -> Result<Option<MonitorService>> {
     let mut source = CombinedSource::new();
     if let Some(path) = codex_home {
@@ -167,6 +177,12 @@ fn build_local_service(
         source.push_source("claude", Arc::new(ClaudeSource::new(path)));
     } else if let Some(path) = default_provider_home(".claude").filter(|path| path.exists()) {
         source.push_source("claude", Arc::new(ClaudeSource::new(path)));
+    }
+
+    if let Some(path) = opencode_home {
+        source.push_source("opencode", Arc::new(OpenCodeSource::new(path)));
+    } else if let Some(path) = default_opencode_home().filter(|path| path.exists()) {
+        source.push_source("opencode", Arc::new(OpenCodeSource::new(path)));
     }
 
     if source.is_empty() {
@@ -204,7 +220,7 @@ fn build_monitor_client(
 
     if client.is_empty() {
         return Err(anyhow::anyhow!(
-            "no monitor sources are available; add --machine or ensure ~/.codex or ~/.claude exist"
+            "no monitor sources are available; add --machine or ensure ~/.codex, ~/.claude, or ~/.local/share/opencode exist"
         ));
     }
 
@@ -221,6 +237,19 @@ fn init_tracing() {
 
 fn default_provider_home(dir_name: &str) -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(dir_name))
+}
+
+fn default_opencode_home() -> Option<PathBuf> {
+    if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
+        return Some(PathBuf::from(xdg_data_home).join("opencode"));
+    }
+
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("opencode")
+    })
 }
 
 fn print_sessions(sessions: &[SessionSummary]) {

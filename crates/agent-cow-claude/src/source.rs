@@ -31,7 +31,6 @@ const SUMMARY_TAIL_LINES: usize = 384;
 const DETAIL_TAIL_LINES: usize = 512;
 const RECENT_EVENT_LIMIT: usize = 48;
 const RECENT_CONVERSATION_LIMIT: usize = 32;
-const RUNNING_TTL_SECONDS: i64 = 90;
 const STALE_AFTER_MINUTES: i64 = 20;
 const ACTIVITY_WINDOW_SECONDS: i64 = 30;
 const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
@@ -363,9 +362,11 @@ struct SummaryHintCacheRecord {
     entry: SummaryHintCacheEntry,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct SessionsCache {
     fetched_at_epoch_ms: i64,
+    projects_modified_at_epoch_ms: i64,
     rows: Vec<SessionRow>,
 }
 
@@ -575,15 +576,25 @@ impl ClaudeSource {
     }
 
     fn load_sessions(&self) -> Result<Vec<SessionRow>> {
+        let projects_modified_at_epoch_ms = self.current_projects_modified_at_epoch_ms();
+
         if let Some(cache) = self.sessions_cache.lock().expect("lock poisoned").clone()
-            && is_sessions_cache_fresh(cache.fetched_at_epoch_ms)
+            && is_sessions_cache_fresh(
+                cache.fetched_at_epoch_ms,
+                cache.projects_modified_at_epoch_ms,
+                projects_modified_at_epoch_ms,
+            )
             && should_use_cached_sessions(cache.rows.len(), &self.projects_dir)
         {
             return Ok(cache.rows);
         }
 
         if let Some(cache) = load_sessions_cache_from_disk()?
-            && is_sessions_disk_cache_fresh(cache.fetched_at_epoch_ms)
+            && is_sessions_disk_cache_fresh(
+                cache.fetched_at_epoch_ms,
+                cache.projects_modified_at_epoch_ms,
+                projects_modified_at_epoch_ms,
+            )
             && should_use_cached_sessions(cache.rows.len(), &self.projects_dir)
         {
             *self.sessions_cache.lock().expect("lock poisoned") = Some(cache.clone());
@@ -598,6 +609,7 @@ impl ClaudeSource {
 
         let cache = SessionsCache {
             fetched_at_epoch_ms: now_epoch_millis(),
+            projects_modified_at_epoch_ms,
             rows: rows.clone(),
         };
         *self.sessions_cache.lock().expect("lock poisoned") = Some(cache.clone());
@@ -674,6 +686,27 @@ impl ClaudeSource {
         if let Err(error) = store_summary_cache_to_disk(cache_ref) {
             tracing::debug!("failed to persist Claude summary cache: {error:#}");
         }
+    }
+
+    fn current_projects_modified_at_epoch_ms(&self) -> i64 {
+        let Ok(entries) = fs::read_dir(&self.projects_dir) else {
+            return 0;
+        };
+
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .metadata()
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_millis() as i64)
+            })
+            .max()
+            .unwrap_or_default()
     }
 
     async fn litellm_pricing(&self) -> Option<Arc<LitellmPricingMap>> {
@@ -965,15 +998,11 @@ fn derive_status(row: &SessionRow, hint: &TranscriptHint, now: DateTime<Utc>) ->
         };
     }
 
-    if hint.run_active || idle_for <= Duration::seconds(RUNNING_TTL_SECONDS) {
+    if hint.run_active {
         return SessionStatus {
             kind: SessionStatusKind::Running,
             confidence: StatusConfidence::Inferred,
-            reason: if hint.run_active {
-                "Claude still has recent in-flight reasoning or tool activity".to_string()
-            } else {
-                "Recent Claude activity is still inside the running TTL".to_string()
-            },
+            reason: "Claude still has recent in-flight reasoning or tool activity".to_string(),
         };
     }
 
@@ -3463,14 +3492,26 @@ fn is_status_probe_in_backoff(last_attempt_epoch_ms: i64) -> bool {
     age_ms >= 0 && age_ms <= CLAUDE_STATUS_FAILURE_BACKOFF.as_millis() as i64
 }
 
-fn is_sessions_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+fn is_sessions_cache_fresh(
+    fetched_at_epoch_ms: i64,
+    cached_projects_modified_at_epoch_ms: i64,
+    current_projects_modified_at_epoch_ms: i64,
+) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
-    age_ms >= 0 && age_ms <= SESSION_DISCOVERY_CACHE_TTL.as_millis() as i64
+    age_ms >= 0
+        && age_ms <= SESSION_DISCOVERY_CACHE_TTL.as_millis() as i64
+        && cached_projects_modified_at_epoch_ms >= current_projects_modified_at_epoch_ms
 }
 
-fn is_sessions_disk_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+fn is_sessions_disk_cache_fresh(
+    fetched_at_epoch_ms: i64,
+    cached_projects_modified_at_epoch_ms: i64,
+    current_projects_modified_at_epoch_ms: i64,
+) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
-    age_ms >= 0 && age_ms <= SESSION_DISCOVERY_DISK_CACHE_TTL.as_millis() as i64
+    age_ms >= 0
+        && age_ms <= SESSION_DISCOVERY_DISK_CACHE_TTL.as_millis() as i64
+        && cached_projects_modified_at_epoch_ms >= current_projects_modified_at_epoch_ms
 }
 
 fn now_epoch_millis() -> i64 {
@@ -3485,8 +3526,9 @@ mod tests {
     use super::{
         ClaudePricing, ClaudeSource, TranscriptHint, analyze_transcript, builtin_claude_pricing,
         collect_sessions_from_projects, derive_activity_state, estimate_session_cost,
-        looks_like_compaction_signal, normalize_message_text, normalize_title,
-        parse_claude_status_quota, parse_claude_usage, should_use_cached_sessions,
+        is_sessions_cache_fresh, is_sessions_disk_cache_fresh, looks_like_compaction_signal,
+        normalize_message_text, normalize_title, parse_claude_status_quota, parse_claude_usage,
+        should_use_cached_sessions,
     };
     use agent_cow_core::{
         ActivityEvent, ActivityKind, PricingSource, ProviderKind, ProviderQuota,
@@ -3701,6 +3743,43 @@ mod tests {
         );
 
         assert_eq!(activity, SessionActivityState::Working);
+    }
+
+    #[test]
+    fn derive_status_does_not_mark_recent_sessions_running_without_live_signal() {
+        let now = Utc::now();
+        let row = super::SessionRow {
+            id: "session".to_string(),
+            transcript_path: std::path::PathBuf::from("/tmp/session.jsonl"),
+            created_at: now - chrono::Duration::minutes(5),
+            updated_at: now - chrono::Duration::seconds(5),
+            cwd: "/tmp/project".to_string(),
+            title: "Claude session".to_string(),
+            model: Some("claude-opus-4-6".to_string()),
+            git_branch: None,
+            is_sidechain: false,
+        };
+
+        let status = super::derive_status(&row, &TranscriptHint::default(), now);
+
+        assert_eq!(status.kind, SessionStatusKind::Idle);
+        assert_eq!(status.confidence, StatusConfidence::Inferred);
+    }
+
+    #[test]
+    fn sessions_cache_invalidates_when_projects_are_newer() {
+        let fetched_at_epoch_ms = super::now_epoch_millis();
+
+        assert!(!is_sessions_cache_fresh(fetched_at_epoch_ms, 100, 101));
+        assert!(!is_sessions_disk_cache_fresh(fetched_at_epoch_ms, 100, 101));
+    }
+
+    #[test]
+    fn sessions_cache_stays_fresh_when_projects_have_not_changed() {
+        let fetched_at_epoch_ms = super::now_epoch_millis();
+
+        assert!(is_sessions_cache_fresh(fetched_at_epoch_ms, 101, 101));
+        assert!(is_sessions_disk_cache_fresh(fetched_at_epoch_ms, 101, 100));
     }
 
     #[test]

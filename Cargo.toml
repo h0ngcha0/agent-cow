@@ -4,6 +4,7 @@ members = [
     "crates/agent-cow-claude",
     "crates/agent-cow-codex",
     "crates/agent-cow-core",
+    "crates/agent-cow-opencode",
 ]
 resolver = "2"
 
@@ -26,7 +27,7 @@ ratatui = { version = "0.29.0", default-features = false, features = ["crossterm
 rusqlite = { version = "0.37.0", features = ["bundled", "chrono"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = "0.28.0"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }

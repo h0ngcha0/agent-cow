@@ -14,6 +14,7 @@ crossterm.workspace = true
 agent-cow-claude = { path = "../../crates/agent-cow-claude" }
 agent-cow-codex = { path = "../../crates/agent-cow-codex" }
 agent-cow-core = { path = "../../crates/agent-cow-core" }
+agent-cow-opencode = { path = "../../crates/agent-cow-opencode" }
 futures-util.workspace = true
 ratatui.workspace = true
 reqwest.workspace = true

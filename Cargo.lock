@@ -9,6 +9,7 @@ dependencies = [
  "agent-cow-claude",
  "agent-cow-codex",
  "agent-cow-core",
+ "agent-cow-opencode",
  "anyhow",
  "async-trait",
  "axum",
@@ -67,6 +68,20 @@ dependencies = [
  "async-trait",
  "chrono",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agent-cow-opencode"
+version = "0.1.4"
+dependencies = [
+ "agent-cow-core",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "directories",
+ "rusqlite",
  "serde_json",
  "tokio",
 ]

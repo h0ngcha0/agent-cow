@@ -59,6 +59,20 @@ pub fn open_session_app(summary: &SessionSummary, local_machine_id: &str) -> Res
         ));
     }
 
+    if matches!(summary.provider, ProviderKind::Opencode) {
+        let target = summary
+            .navigation
+            .iter()
+            .find(|target| target.kind == NavigationKind::WorkingDirectory)
+            .map(|target| target.target.clone())
+            .unwrap_or_else(|| summary.cwd.clone());
+        open_target(&target)?;
+        return Ok(OpenAction {
+            label: "OpenCode Workspace".to_string(),
+            target,
+        });
+    }
+
     let (label, target) = provider_app_target(summary)
         .ok_or_else(|| anyhow!("this provider does not expose a local app target yet"))?;
 
@@ -97,6 +111,7 @@ fn provider_app_target(summary: &SessionSummary) -> Option<(String, String)> {
 
             Some(("Claude".to_string(), target))
         }
+        ProviderKind::Opencode => None,
     }
 }
 
@@ -173,6 +188,7 @@ fn activate_provider_app(provider: ProviderKind) -> Result<()> {
         let app_name = match provider {
             ProviderKind::Codex => "Codex",
             ProviderKind::Claude => "Claude",
+            ProviderKind::Opencode => return Ok(()),
         };
 
         let script = format!("tell application \"{app_name}\" to activate");

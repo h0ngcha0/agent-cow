@@ -30,7 +30,6 @@ const SUMMARY_TAIL_LINES: usize = 384;
 const DETAIL_TAIL_LINES: usize = 320;
 const RECENT_EVENT_LIMIT: usize = 48;
 const RECENT_CONVERSATION_LIMIT: usize = 32;
-const RUNNING_TTL_SECONDS: i64 = 90;
 const STALE_AFTER_MINUTES: i64 = 20;
 const ACTIVITY_WINDOW_SECONDS: i64 = 30;
 const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
@@ -173,9 +172,11 @@ struct UsageIndex {
     cost_by_hour: HashMap<String, RawCostBucket>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct ThreadsCache {
     fetched_at_epoch_ms: i64,
+    db_modified_at_epoch_ms: i64,
     rows: Vec<ThreadRow>,
 }
 
@@ -287,15 +288,25 @@ impl CodexSource {
     }
 
     fn load_threads(&self) -> Result<Vec<ThreadRow>> {
+        let db_modified_at_epoch_ms = self.current_threads_db_modified_at_epoch_ms();
+
         if let Ok(cache) = self.threads_cache.lock()
             && let Some(cache) = cache.as_ref()
-            && is_threads_cache_fresh(cache.fetched_at_epoch_ms)
+            && is_threads_cache_fresh(
+                cache.fetched_at_epoch_ms,
+                cache.db_modified_at_epoch_ms,
+                db_modified_at_epoch_ms,
+            )
         {
             return Ok(cache.rows.clone());
         }
 
         if let Some(cache) = load_threads_cache_from_disk()?
-            && is_threads_disk_cache_fresh(cache.fetched_at_epoch_ms)
+            && is_threads_disk_cache_fresh(
+                cache.fetched_at_epoch_ms,
+                cache.db_modified_at_epoch_ms,
+                db_modified_at_epoch_ms,
+            )
         {
             if let Ok(mut memory_cache) = self.threads_cache.lock() {
                 *memory_cache = Some(cache.clone());
@@ -317,11 +328,13 @@ impl CodexSource {
         if let Ok(mut cache) = self.threads_cache.lock() {
             *cache = Some(ThreadsCache {
                 fetched_at_epoch_ms: now_epoch_millis(),
+                db_modified_at_epoch_ms,
                 rows: rows.clone(),
             });
         }
         let _ = store_threads_cache_to_disk(&ThreadsCache {
             fetched_at_epoch_ms: now_epoch_millis(),
+            db_modified_at_epoch_ms,
             rows: rows.clone(),
         });
 
@@ -507,6 +520,24 @@ impl CodexSource {
         }
 
         inputs
+    }
+
+    fn current_threads_db_modified_at_epoch_ms(&self) -> i64 {
+        self.candidate_inputs()
+            .into_iter()
+            .filter_map(|input| state_db_candidates_for_input(&input).ok())
+            .flat_map(|paths| paths.into_iter())
+            .filter_map(|path| {
+                path.metadata()
+                    .ok()?
+                    .modified()
+                    .ok()?
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_millis() as i64)
+            })
+            .max()
+            .unwrap_or_default()
     }
 
     async fn litellm_pricing(&self) -> Option<Arc<LitellmPricingMap>> {
@@ -1230,13 +1261,7 @@ fn derive_status(row: &ThreadRow, hint: Option<&RolloutHint>, now: DateTime<Utc>
         }
     }
 
-    if idle_for <= Duration::seconds(RUNNING_TTL_SECONDS) {
-        SessionStatus {
-            kind: SessionStatusKind::Running,
-            confidence: StatusConfidence::Inferred,
-            reason: "Recent session activity is still inside the running TTL".to_string(),
-        }
-    } else if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
+    if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
         SessionStatus {
             kind: SessionStatusKind::Idle,
             confidence: StatusConfidence::Inferred,
@@ -2118,14 +2143,26 @@ fn is_pricing_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
     age_ms >= 0 && age_ms <= LITELLM_PRICING_CACHE_TTL.as_millis() as i64
 }
 
-fn is_threads_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+fn is_threads_cache_fresh(
+    fetched_at_epoch_ms: i64,
+    cached_db_modified_at_epoch_ms: i64,
+    current_db_modified_at_epoch_ms: i64,
+) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
-    age_ms >= 0 && age_ms <= THREAD_DISCOVERY_CACHE_TTL.as_millis() as i64
+    age_ms >= 0
+        && age_ms <= THREAD_DISCOVERY_CACHE_TTL.as_millis() as i64
+        && cached_db_modified_at_epoch_ms >= current_db_modified_at_epoch_ms
 }
 
-fn is_threads_disk_cache_fresh(fetched_at_epoch_ms: i64) -> bool {
+fn is_threads_disk_cache_fresh(
+    fetched_at_epoch_ms: i64,
+    cached_db_modified_at_epoch_ms: i64,
+    current_db_modified_at_epoch_ms: i64,
+) -> bool {
     let age_ms = now_epoch_millis().saturating_sub(fetched_at_epoch_ms);
-    age_ms >= 0 && age_ms <= THREAD_DISCOVERY_DISK_CACHE_TTL.as_millis() as i64
+    age_ms >= 0
+        && age_ms <= THREAD_DISCOVERY_DISK_CACHE_TTL.as_millis() as i64
+        && cached_db_modified_at_epoch_ms >= current_db_modified_at_epoch_ms
 }
 
 fn now_epoch_millis() -> i64 {
@@ -2774,8 +2811,9 @@ mod tests {
     use super::{
         ReadMode, RolloutHint, SessionActivityState, SessionStatus, SessionStatusKind,
         StatusConfidence, ThreadRow, activity_recent_window, analyze_rollout, build_summary,
-        derive_activity_state, derive_status, function_call_requires_approval, local_date_key,
-        local_hour_key, looks_like_waiting_input, normalize_codex_home, normalize_title,
+        derive_activity_state, derive_status, function_call_requires_approval,
+        is_threads_cache_fresh, is_threads_disk_cache_fresh, local_date_key, local_hour_key,
+        looks_like_waiting_input, normalize_codex_home, normalize_title,
         parse_context_window_usage, parse_state_db_version, parse_transcript_static,
         state_db_candidates_for_input, stream_usage_index, user_title_candidate,
     };
@@ -3428,6 +3466,46 @@ mod tests {
         assert_eq!(status.kind, SessionStatusKind::WaitingInput);
         assert_eq!(status.confidence, StatusConfidence::Exact);
         assert!(status.reason.contains("approval"));
+    }
+
+    #[test]
+    fn derive_status_does_not_mark_recent_threads_running_without_live_signal() {
+        let now = Utc::now();
+        let row = super::ThreadRow {
+            id: "thread".to_string(),
+            rollout_path: String::new(),
+            created_at: now - chrono::Duration::minutes(5),
+            updated_at: now - chrono::Duration::seconds(5),
+            cwd: "/tmp/project".to_string(),
+            title: "Session".to_string(),
+            tokens_used: 0,
+            archived: false,
+            git_branch: None,
+            git_origin_url: None,
+            agent_role: None,
+            model: None,
+        };
+
+        let status = derive_status(&row, Some(&RolloutHint::default()), now);
+
+        assert_eq!(status.kind, SessionStatusKind::Idle);
+        assert_eq!(status.confidence, StatusConfidence::Inferred);
+    }
+
+    #[test]
+    fn threads_cache_invalidates_when_db_is_newer() {
+        let fetched_at_epoch_ms = super::now_epoch_millis();
+
+        assert!(!is_threads_cache_fresh(fetched_at_epoch_ms, 100, 101));
+        assert!(!is_threads_disk_cache_fresh(fetched_at_epoch_ms, 100, 101));
+    }
+
+    #[test]
+    fn threads_cache_stays_fresh_when_db_has_not_changed() {
+        let fetched_at_epoch_ms = super::now_epoch_millis();
+
+        assert!(is_threads_cache_fresh(fetched_at_epoch_ms, 101, 101));
+        assert!(is_threads_disk_cache_fresh(fetched_at_epoch_ms, 101, 100));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum ProviderKind {
     Codex,
     Claude,
+    Opencode,
 }
 
 impl fmt::Display for ProviderKind {
@@ -15,6 +16,7 @@ impl fmt::Display for ProviderKind {
         match self {
             Self::Codex => f.write_str("codex"),
             Self::Claude => f.write_str("claude"),
+            Self::Opencode => f.write_str("opencode"),
         }
     }
 }

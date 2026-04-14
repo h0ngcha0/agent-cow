@@ -19,7 +19,7 @@ Agent Cow is the philosophical watcher of your coding agents across multiple mac
 
 It watches your agent sessions, shows what they are doing, what they cost, how much context they have burned, and whether they are waiting for you. It runs as a fast terminal UI, or as a headless machine agent that another TUI can subscribe to.
 
-Today it ships with **Codex** and **Claude** adapters. The architecture is intentionally provider-oriented, so more agent runtimes can be added later without reinventing the UI or core data model.
+Today it ships with **Codex**, **Claude**, and **OpenCode** adapters. The architecture is intentionally provider-oriented, so more agent runtimes can be added later without reinventing the UI or core data model.
 
 No dashboard religion. No cloud dependency. Just a sharp TUI and a cow with opinions.
 
@@ -192,6 +192,7 @@ Optional overrides:
 ```bash
 AGENT_COW_CODEX_HOME=...
 AGENT_COW_CLAUDE_HOME=...
+AGENT_COW_OPENCODE_HOME=...
 ```
 
 Agent Cow also falls back to normal local runtime locations when possible.
