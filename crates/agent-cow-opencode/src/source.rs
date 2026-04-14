@@ -50,7 +50,6 @@ struct SessionRow {
 #[derive(Clone, Debug)]
 struct MessageRow {
     time_created: DateTime<Utc>,
-    time_updated: DateTime<Utc>,
     data: Value,
 }
 
@@ -178,10 +177,9 @@ impl OpenCodeSource {
 
         let mut result = Vec::new();
         for row in rows {
-            let (_id, time_created, time_updated, data) = row?;
+            let (_id, time_created, _time_updated, data) = row?;
             result.push(MessageRow {
                 time_created: timestamp_millis_to_utc(time_created),
-                time_updated: timestamp_millis_to_utc(time_updated),
                 data: serde_json::from_str(&data).with_context(|| {
                     format!("failed to parse OpenCode message for session `{session_id}`")
                 })?,
@@ -222,6 +220,7 @@ impl OpenCodeSource {
         let mut total_cost_usd = 0.0f64;
         let mut hour_cost_usd = 0.0f64;
         let mut day_cost_usd = 0.0f64;
+        let mut open_steps = 0usize;
 
         for message in messages {
             let role = message
@@ -350,21 +349,7 @@ impl OpenCodeSource {
                 }
             }
 
-            let completed = message
-                .data
-                .get("time")
-                .and_then(|time| time.get("completed"))
-                .and_then(Value::as_i64)
-                .map(timestamp_millis_to_utc);
             let finish = message.data.get("finish").and_then(Value::as_str);
-            let active_message = completed.is_none()
-                || finish.is_none()
-                || message.time_updated >= now - Duration::seconds(RUNNING_TTL_SECONDS);
-            if active_message
-                && message.time_updated >= now - Duration::seconds(RUNNING_TTL_SECONDS)
-            {
-                analysis.active_turns += 1;
-            }
             if finish == Some("stop") {
                 analysis.finished = true;
             }
@@ -443,8 +428,12 @@ impl OpenCodeSource {
                 "reasoning" => {
                     analysis.latest_reasoning_at = Some(part.time_created);
                 }
+                "step-start" => {
+                    open_steps = open_steps.saturating_add(1);
+                }
                 "step-finish" => {
                     if let Some(reason) = part.data.get("reason").and_then(Value::as_str) {
+                        open_steps = open_steps.saturating_sub(1);
                         if reason == "stop" {
                             analysis.finished = true;
                         }
@@ -485,11 +474,13 @@ impl OpenCodeSource {
             }
         }
 
-        analysis.run_active = analysis.pending_tool_calls > 0
-            || analysis.active_turns > 0
-            || analysis
-                .latest_assistant_feedback_at
-                .is_some_and(|ts| ts >= now - Duration::seconds(RUNNING_TTL_SECONDS));
+        analysis.active_turns = open_steps;
+        analysis.run_active = !analysis.finished
+            && (analysis.pending_tool_calls > 0
+                || analysis.active_turns > 0
+                || analysis
+                    .latest_reasoning_at
+                    .is_some_and(|ts| ts >= now - Duration::seconds(RUNNING_TTL_SECONDS)));
 
         if total_cost_usd > 0.0 {
             analysis.cost = Some(SessionCost {
@@ -697,22 +688,17 @@ fn derive_status(row: &SessionRow, analysis: &SessionAnalysis) -> SessionStatus 
 
 fn derive_activity_state(analysis: &SessionAnalysis) -> SessionActivityState {
     let now = Utc::now();
+
+    if analysis.finished {
+        return SessionActivityState::Idle;
+    }
+
     let latest_tool = analysis
         .latest_tool
         .as_ref()
         .map(|(timestamp, tool)| (*timestamp, tool.as_str()));
 
-    if analysis.latest_compaction_at.is_some_and(|timestamp| {
-        timestamp >= now - Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS)
-    }) && analysis
-        .latest_compaction_at
-        .is_some_and(|timestamp| latest_tool.is_none_or(|(tool_ts, _)| timestamp >= tool_ts))
-        && analysis.latest_compaction_at.is_some_and(|timestamp| {
-            analysis
-                .latest_assistant_feedback_at
-                .is_none_or(|feedback| timestamp >= feedback)
-        })
-    {
+    if recent_compaction_is_active(analysis, now, latest_tool.map(|(timestamp, _)| timestamp)) {
         return SessionActivityState::Compacting;
     }
 
@@ -736,10 +722,26 @@ fn derive_activity_state(analysis: &SessionAnalysis) -> SessionActivityState {
     }
 
     if analysis.run_active {
-        return SessionActivityState::Working;
+        return SessionActivityState::Thinking;
     }
 
     SessionActivityState::Idle
+}
+
+fn recent_compaction_is_active(
+    analysis: &SessionAnalysis,
+    now: DateTime<Utc>,
+    latest_tool_at: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(compacted_at) = analysis.latest_compaction_at else {
+        return false;
+    };
+
+    if compacted_at < now - Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS) {
+        return false;
+    }
+
+    latest_tool_at.is_none_or(|tool_ts| compacted_at >= tool_ts)
 }
 
 fn navigation_targets(
@@ -1026,7 +1028,11 @@ fn resolve_opencode_db_path(opencode_home: &Path, configured_path: &Path) -> Pat
 
 #[cfg(test)]
 mod tests {
-    use super::parse_opencode_tokens;
+    use super::{
+        SessionAnalysis, SessionRow, derive_activity_state, derive_status, parse_opencode_tokens,
+    };
+    use agent_cow_core::{SessionActivityState, SessionStatusKind};
+    use chrono::{Duration, Utc};
     use serde_json::json;
 
     #[test]
@@ -1048,5 +1054,75 @@ mod tests {
         assert_eq!(tokens.output_tokens, Some(20));
         assert_eq!(tokens.reasoning_output_tokens, Some(5));
         assert_eq!(tokens.total_tokens, 100);
+    }
+
+    #[test]
+    fn live_non_tool_opencode_runs_stay_thinking() {
+        let now = Utc::now();
+        let analysis = SessionAnalysis {
+            run_active: true,
+            latest_reasoning_at: Some(now - Duration::seconds(45)),
+            ..SessionAnalysis::default()
+        };
+
+        assert_eq!(
+            derive_activity_state(&analysis),
+            SessionActivityState::Thinking
+        );
+    }
+
+    #[test]
+    fn finished_opencode_sessions_are_idle_not_working() {
+        let now = Utc::now();
+        let analysis = SessionAnalysis {
+            finished: true,
+            latest_assistant_feedback_at: Some(now - Duration::seconds(2)),
+            run_active: false,
+            ..SessionAnalysis::default()
+        };
+
+        assert_eq!(derive_activity_state(&analysis), SessionActivityState::Idle);
+    }
+
+    #[test]
+    fn finished_opencode_sessions_are_completed_not_running() {
+        let now = Utc::now();
+        let row = SessionRow {
+            id: "session".to_string(),
+            parent_id: None,
+            project_id: "global".to_string(),
+            title: "session".to_string(),
+            directory: "/tmp".to_string(),
+            created_at: now - Duration::minutes(1),
+            updated_at: now - Duration::seconds(1),
+            time_compacting: None,
+            archived: false,
+        };
+        let analysis = SessionAnalysis {
+            finished: true,
+            latest_assistant_feedback_at: Some(now - Duration::seconds(1)),
+            ..SessionAnalysis::default()
+        };
+
+        assert_eq!(
+            derive_status(&row, &analysis).kind,
+            SessionStatusKind::Completed
+        );
+    }
+
+    #[test]
+    fn opencode_compaction_stays_above_later_generic_feedback() {
+        let now = Utc::now();
+        let analysis = SessionAnalysis {
+            run_active: true,
+            latest_compaction_at: Some(now - Duration::seconds(5)),
+            latest_assistant_feedback_at: Some(now - Duration::seconds(1)),
+            ..SessionAnalysis::default()
+        };
+
+        assert_eq!(
+            derive_activity_state(&analysis),
+            SessionActivityState::Compacting
+        );
     }
 }

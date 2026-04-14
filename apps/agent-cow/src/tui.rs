@@ -321,6 +321,8 @@ async fn run_loop(
                 Ok((session_id, detail)) => {
                     if app.detail_mode && app.selected_session_id() == Some(session_id.as_str()) {
                         app.detail = Some(detail);
+                        app.sync_detail_summary_into_sessions();
+                        app.rebuild_filter(Some(session_id.as_str()));
                         app.detail_loading = false;
                         app.detail_loading_session_id = None;
                         app.error = None;
@@ -706,14 +708,15 @@ impl TuiApp {
         self.rebuild_filter(selected_id.as_deref());
 
         if let Some(selected_id) = selected_id.as_deref()
-            && let Some(detail) = self.detail.as_mut()
+            && let Some(detail) = self.detail.as_ref()
             && detail.summary.id == selected_id
             && let Some(summary) = self
                 .sessions
-                .iter()
+                .iter_mut()
                 .find(|session| session.id == selected_id)
+            && detail.summary.updated_at >= summary.updated_at
         {
-            detail.summary = summary.clone();
+            *summary = detail.summary.clone();
         }
 
         if self.filtered_indices.is_empty() {
@@ -752,15 +755,31 @@ impl TuiApp {
         self.rebuild_filter(selected_id.as_deref());
 
         if let Some(selected_id) = selected_id.as_deref()
-            && let Some(detail) = self.detail.as_mut()
+            && let Some(detail) = self.detail.as_ref()
             && detail.summary.id == selected_id
             && let Some(summary) = self
                 .sessions
-                .iter()
+                .iter_mut()
                 .find(|session| session.id == selected_id)
+            && detail.summary.updated_at >= summary.updated_at
         {
-            detail.summary = summary.clone();
+            *summary = detail.summary.clone();
         }
+    }
+
+    fn sync_detail_summary_into_sessions(&mut self) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == detail.summary.id)
+        else {
+            return;
+        };
+
+        *session = detail.summary.clone();
     }
 
     fn begin_filter(&mut self) {
@@ -2640,14 +2659,8 @@ fn render_detail_view(frame: &mut Frame, area: Rect, app: &mut TuiApp) {
     }
 }
 
-fn current_detail_summary<'a>(app: &'a TuiApp, detail: &'a SessionDetail) -> &'a SessionSummary {
-    app.selected_session_id()
-        .and_then(|selected_id| {
-            app.sessions
-                .iter()
-                .find(|session| session.id == selected_id)
-        })
-        .unwrap_or(&detail.summary)
+fn current_detail_summary<'a>(_app: &'a TuiApp, detail: &'a SessionDetail) -> &'a SessionSummary {
+    &detail.summary
 }
 
 fn render_detail_loading(frame: &mut Frame, area: Rect, pane: DetailPane) {
@@ -4161,11 +4174,12 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         ListRefreshKind, SessionViewMode, TuiApp, animated_cow_lines, brand_cluster_lines,
-        footer_line, header_meta_lines,
+        current_detail_summary, footer_line, header_meta_lines,
     };
     use agent_cow_core::{
-        ProviderKind, SessionActivityState, SessionList, SessionLoadProgress, SessionStatus,
-        SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage, UsageOverview,
+        ProviderKind, SessionActivityState, SessionDetail, SessionList, SessionLoadProgress,
+        SessionStatus, SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage,
+        UsageOverview,
     };
     use chrono::{TimeZone, Utc};
     use ratatui::text::Line;
@@ -4450,5 +4464,38 @@ mod tests {
         app.rebuild_filter(None);
 
         assert_eq!(app.filtered_indices, vec![1]);
+    }
+
+    #[test]
+    fn detail_summary_is_canonical_for_selected_session() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        let mut list_summary = fixture_session("local|codex:1", "local");
+        list_summary.activity_state = SessionActivityState::Exploring;
+        let mut detail_summary = list_summary.clone();
+        detail_summary.activity_state = SessionActivityState::Thinking;
+        app.sessions = vec![list_summary];
+        app.rebuild_filter(Some("local|codex:1"));
+        app.table_state.select(Some(0));
+        app.detail = Some(SessionDetail {
+            summary: detail_summary,
+            recent_events: Vec::new(),
+            recent_conversation: Vec::new(),
+            tool_stats: Vec::new(),
+            last_user_message: None,
+            last_assistant_message: None,
+            active_turns: 0,
+            pending_tool_calls: 0,
+        });
+
+        app.sync_detail_summary_into_sessions();
+
+        assert_eq!(
+            app.sessions[0].activity_state,
+            SessionActivityState::Thinking
+        );
+        assert_eq!(
+            current_detail_summary(&app, app.detail.as_ref().unwrap()).activity_state,
+            SessionActivityState::Thinking
+        );
     }
 }

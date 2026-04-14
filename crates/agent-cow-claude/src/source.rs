@@ -32,6 +32,8 @@ const DETAIL_TAIL_LINES: usize = 512;
 const RECENT_EVENT_LIMIT: usize = 48;
 const RECENT_CONVERSATION_LIMIT: usize = 32;
 const STALE_AFTER_MINUTES: i64 = 20;
+const LIVE_STATUS_FALLBACK_MINUTES: i64 = 5;
+const LIVE_STATUS_FALLBACK_BUDGET: usize = 8;
 const ACTIVITY_WINDOW_SECONDS: i64 = 30;
 const TOOL_BUSY_ACTIVITY_WINDOW_SECONDS: i64 = 75;
 const COMPACTION_ACTIVITY_WINDOW_SECONDS: i64 = 12;
@@ -279,6 +281,7 @@ struct TranscriptHint {
     pending_tool_names: HashMap<String, String>,
     run_started_at: Option<DateTime<Utc>>,
     run_active: bool,
+    latest_queue_dequeue_at: Option<DateTime<Utc>>,
     cumulative_token_usage: Option<TokenUsage>,
     cost_by_day: HashMap<String, RawCostBucket>,
     cost_by_hour: HashMap<String, RawCostBucket>,
@@ -688,6 +691,26 @@ impl ClaudeSource {
         }
     }
 
+    fn store_summary_hint(&self, path: &Path, hint: &TranscriptHint) {
+        let Ok((modified_at_epoch_ms, file_len)) = transcript_cache_signature(path) else {
+            return;
+        };
+
+        self.summary_cache
+            .lock()
+            .expect("lock poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                path.to_path_buf(),
+                SummaryHintCacheEntry {
+                    modified_at_epoch_ms,
+                    file_len,
+                    hint: hint.clone(),
+                },
+            );
+        self.summary_cache_dirty.store(true, Ordering::Relaxed);
+    }
+
     fn current_projects_modified_at_epoch_ms(&self) -> i64 {
         let Ok(entries) = fs::read_dir(&self.projects_dir) else {
             return 0;
@@ -796,6 +819,7 @@ impl SessionSource for ClaudeSource {
         let mut litellm_pricing = None;
         let mut subscription = self.subscription_quota().await;
         let mut quota_usage = ClaudeQuotaUsage::default();
+        let mut live_status_fallback_budget = LIVE_STATUS_FALLBACK_BUDGET;
         let mut sessions = Vec::new();
         let rows = self.load_sessions()?;
         let total_sessions = rows.len();
@@ -803,19 +827,47 @@ impl SessionSource for ClaudeSource {
         let mut loaded_sessions = 0usize;
 
         for row in rows {
-            let hint = self.summary_hint(&row.transcript_path)?;
+            let mut hint = self.summary_hint(&row.transcript_path)?;
             let pricing_model = row.model.as_deref().or(hint.latest_model.as_deref());
             if litellm_pricing.is_none()
                 && pricing_model.is_some_and(|model| builtin_claude_pricing(model).is_none())
             {
                 litellm_pricing = self.litellm_pricing().await;
             }
-            quota_usage.observe(&hint, pricing_model, litellm_pricing.as_deref(), now);
-            let summary = build_summary(
+            let mut summary = build_summary(
                 &self.machine_id,
                 &self.machine_label,
                 &row,
                 &hint,
+                litellm_pricing.as_deref(),
+                now,
+            );
+
+            if live_status_fallback_budget > 0
+                && should_refresh_live_status(&summary, row.updated_at, now)
+                && let Ok(live_hint) = analyze_transcript(&row.transcript_path, ReadMode::Detail)
+            {
+                self.store_summary_hint(&row.transcript_path, &live_hint);
+                quota_usage.observe(
+                    &live_hint,
+                    row.model.as_deref().or(live_hint.latest_model.as_deref()),
+                    litellm_pricing.as_deref(),
+                    now,
+                );
+                summary = build_summary(
+                    &self.machine_id,
+                    &self.machine_label,
+                    &row,
+                    &live_hint,
+                    litellm_pricing.as_deref(),
+                    now,
+                );
+                hint = live_hint;
+                live_status_fallback_budget -= 1;
+            }
+            quota_usage.observe(
+                &hint,
+                row.model.as_deref().or(hint.latest_model.as_deref()),
                 litellm_pricing.as_deref(),
                 now,
             );
@@ -1000,9 +1052,20 @@ fn derive_status(row: &SessionRow, hint: &TranscriptHint, now: DateTime<Utc>) ->
 
     if hint.run_active {
         return SessionStatus {
-            kind: SessionStatusKind::Running,
+            kind: if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
+                SessionStatusKind::Running
+            } else {
+                SessionStatusKind::Stale
+            },
             confidence: StatusConfidence::Inferred,
-            reason: "Claude still has recent in-flight reasoning or tool activity".to_string(),
+            reason: if idle_for <= Duration::minutes(STALE_AFTER_MINUTES) {
+                "Claude still has in-flight reasoning or prompt activity".to_string()
+            } else {
+                format!(
+                    "Claude still looks in-flight from the transcript tail, but the session has been quiet for {} minutes",
+                    idle_for.num_minutes()
+                )
+            },
         };
     }
 
@@ -1021,6 +1084,16 @@ fn derive_status(row: &SessionRow, hint: &TranscriptHint, now: DateTime<Utc>) ->
             reason: "The Claude session has not emitted activity recently".to_string(),
         }
     }
+}
+
+fn should_refresh_live_status(
+    summary: &SessionSummary,
+    updated_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    now - updated_at <= Duration::minutes(LIVE_STATUS_FALLBACK_MINUTES)
+        && matches!(summary.status.kind, SessionStatusKind::Idle)
+        && matches!(summary.activity_state, SessionActivityState::Idle)
 }
 
 fn derive_activity_state(
@@ -1058,11 +1131,7 @@ fn derive_activity_state(
 
     let latest_feedback = latest_recent_non_user_event(&hint.recent_events, now, recent_window);
 
-    if latest_feedback.is_some_and(is_compaction_event)
-        && hint.recent_compaction_at.is_some_and(|timestamp| {
-            now - timestamp <= Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS)
-        })
-    {
+    if hint.pending_tool_ids.is_empty() && recent_compaction_is_active(hint, now) {
         return SessionActivityState::Compacting;
     }
 
@@ -1071,6 +1140,10 @@ fn derive_activity_state(
         .is_some_and(|event| is_exploration_tool(&event.summary))
     {
         return SessionActivityState::Exploring;
+    }
+
+    if hint.pending_tool_ids.is_empty() && hint.run_active {
+        return SessionActivityState::Thinking;
     }
 
     if hint
@@ -1091,8 +1164,18 @@ fn derive_activity_state(
     }
 }
 
-fn is_compaction_event(event: &ActivityEvent) -> bool {
-    matches!(event.kind, ActivityKind::System) && looks_like_compaction_signal(&event.summary)
+fn recent_compaction_is_active(hint: &TranscriptHint, now: DateTime<Utc>) -> bool {
+    let Some(compacted_at) = hint.recent_compaction_at else {
+        return false;
+    };
+    if now - compacted_at > Duration::seconds(COMPACTION_ACTIVITY_WINDOW_SECONDS) {
+        return false;
+    }
+
+    !hint
+        .recent_events
+        .iter()
+        .any(|event| event.timestamp > compacted_at && matches!(event.kind, ActivityKind::ToolCall))
 }
 
 fn latest_recent_non_user_event(
@@ -2159,6 +2242,33 @@ fn analyze_transcript(path: &Path, mode: ReadMode) -> Result<TranscriptHint> {
             .unwrap_or_default();
 
         match root_kind {
+            "queue-operation" => {
+                let Some(timestamp) = timestamp else {
+                    continue;
+                };
+                match value
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                {
+                    "enqueue" => {
+                        remember_latest_timestamp(&mut hint.run_started_at, timestamp);
+                    }
+                    "dequeue" => {
+                        hint.latest_queue_dequeue_at = Some(timestamp);
+                        remember_latest_timestamp(&mut hint.run_started_at, timestamp);
+                        push_recent_event(
+                            &mut recent_events,
+                            ActivityEvent {
+                                timestamp,
+                                kind: ActivityKind::System,
+                                summary: "Prompt dequeued".to_string(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
             "user" => {
                 let Some(timestamp) = timestamp else {
                     continue;
@@ -2314,6 +2424,11 @@ fn analyze_transcript(path: &Path, mode: ReadMode) -> Result<TranscriptHint> {
     }
 
     hint.run_active = !hint.pending_tool_ids.is_empty()
+        || hint.latest_queue_dequeue_at.is_some_and(|timestamp| {
+            hint.last_assistant_message
+                .as_ref()
+                .is_none_or(|(assistant_at, _)| timestamp >= *assistant_at)
+        })
         || hint
             .latest_thinking_at
             .zip(
@@ -3528,11 +3643,12 @@ mod tests {
         collect_sessions_from_projects, derive_activity_state, estimate_session_cost,
         is_sessions_cache_fresh, is_sessions_disk_cache_fresh, looks_like_compaction_signal,
         normalize_message_text, normalize_title, parse_claude_status_quota, parse_claude_usage,
-        should_use_cached_sessions,
+        should_refresh_live_status, should_use_cached_sessions,
     };
     use agent_cow_core::{
         ActivityEvent, ActivityKind, PricingSource, ProviderKind, ProviderQuota,
-        SessionActivityState, SessionStatus, SessionStatusKind, StatusConfidence,
+        SessionActivityState, SessionStatus, SessionStatusKind, SessionSummary, StatusConfidence,
+        TokenUsage,
     };
     use chrono::{Local, TimeZone, Utc};
     use std::{
@@ -3624,7 +3740,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_activity_state_compacts_only_while_signal_is_latest() {
+    fn derive_activity_state_keeps_recent_compaction_above_later_generic_feedback() {
         let now = Utc::now();
         let status = SessionStatus {
             kind: SessionStatusKind::Running,
@@ -3669,14 +3785,14 @@ mod tests {
             ..compacting_hint
         };
 
-        let working = derive_activity_state(
+        let compacting = derive_activity_state(
             &status,
             &thinking_hint,
             None,
             now - chrono::Duration::seconds(1),
             now,
         );
-        assert_eq!(working, SessionActivityState::Working);
+        assert_eq!(compacting, SessionActivityState::Compacting);
     }
 
     #[test]
@@ -3746,6 +3862,36 @@ mod tests {
     }
 
     #[test]
+    fn derive_activity_state_keeps_live_non_tool_claude_runs_as_thinking() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let hint = TranscriptHint {
+            run_active: true,
+            latest_thinking_at: Some(now - chrono::Duration::seconds(45)),
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(45),
+                kind: ActivityKind::Assistant,
+                summary: "Thinking".to_string(),
+            }],
+            ..TranscriptHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            &hint,
+            None,
+            now - chrono::Duration::seconds(45),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Thinking);
+    }
+
+    #[test]
     fn derive_status_does_not_mark_recent_sessions_running_without_live_signal() {
         let now = Utc::now();
         let row = super::SessionRow {
@@ -3763,6 +3909,73 @@ mod tests {
         let status = super::derive_status(&row, &TranscriptHint::default(), now);
 
         assert_eq!(status.kind, SessionStatusKind::Idle);
+        assert_eq!(status.confidence, StatusConfidence::Inferred);
+    }
+
+    #[test]
+    fn refreshes_recent_idle_summaries_for_live_status() {
+        let now = Utc::now();
+        let summary = SessionSummary {
+            id: "session".to_string(),
+            machine_id: "local".to_string(),
+            machine_label: "Localhost".to_string(),
+            provider: ProviderKind::Claude,
+            title: "session".to_string(),
+            cwd: "/tmp".to_string(),
+            created_at: now,
+            updated_at: now,
+            run_started_at: None,
+            run_active: false,
+            archived: false,
+            model: Some("claude-opus-4-6".to_string()),
+            agent_role: None,
+            git_branch: None,
+            git_origin_url: None,
+            tokens: TokenUsage::default(),
+            cost: None,
+            context_window: None,
+            status: SessionStatus {
+                kind: SessionStatusKind::Idle,
+                confidence: StatusConfidence::Inferred,
+                reason: "idle".to_string(),
+            },
+            activity_state: SessionActivityState::Idle,
+            rollout_path: None,
+            navigation: Vec::new(),
+        };
+
+        assert!(should_refresh_live_status(&summary, now, now));
+        assert!(!should_refresh_live_status(
+            &summary,
+            now - chrono::Duration::minutes(10),
+            now
+        ));
+    }
+
+    #[test]
+    fn derive_status_stales_run_active_sessions_after_quiet_period() {
+        let now = Utc::now();
+        let row = super::SessionRow {
+            id: "session".to_string(),
+            transcript_path: std::path::PathBuf::from("/tmp/session.jsonl"),
+            created_at: now - chrono::Duration::minutes(60),
+            updated_at: now - chrono::Duration::minutes(30),
+            cwd: "/tmp/project".to_string(),
+            title: "Claude session".to_string(),
+            model: Some("claude-opus-4-6".to_string()),
+            git_branch: None,
+            is_sidechain: false,
+        };
+        let hint = TranscriptHint {
+            run_active: true,
+            latest_queue_dequeue_at: Some(now - chrono::Duration::minutes(30)),
+            last_user_message: Some((now - chrono::Duration::minutes(30), "prompt".to_string())),
+            ..TranscriptHint::default()
+        };
+
+        let status = super::derive_status(&row, &hint, now);
+
+        assert_eq!(status.kind, SessionStatusKind::Stale);
         assert_eq!(status.confidence, StatusConfidence::Inferred);
     }
 
@@ -3811,6 +4024,40 @@ mod tests {
             hint.recent_events
                 .iter()
                 .any(|event| event.summary == "Context compacted")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn analyze_transcript_marks_dequeued_prompt_as_run_active() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("agent-cow-claude-dequeue-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"2026-04-14T15:45:56.138Z\",\"sessionId\":\"session-1\",\"content\":\"prompt\"}\n",
+                "{\"type\":\"queue-operation\",\"operation\":\"dequeue\",\"timestamp\":\"2026-04-14T15:45:56.139Z\",\"sessionId\":\"session-1\"}\n",
+                "{\"type\":\"user\",\"timestamp\":\"2026-04-14T15:45:56.144Z\",\"message\":{\"role\":\"user\",\"content\":\"prompt\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let hint = analyze_transcript(&path, super::ReadMode::Summary).unwrap();
+
+        assert!(hint.run_active);
+        assert_eq!(
+            hint.latest_queue_dequeue_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-14T15:45:56.139Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
         );
 
         fs::remove_dir_all(root).unwrap();
