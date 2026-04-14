@@ -91,7 +91,7 @@ You can override the version or install directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/h0ngcha0/agent-cow/main/install.sh | \
-  AGENT_COW_VERSION=v0.0.1 AGENT_COW_INSTALL_DIR="$HOME/bin" sh
+  AGENT_COW_VERSION=v0.1.4 AGENT_COW_INSTALL_DIR="$HOME/bin" sh
 ```
 
 If you prefer to do it manually, unpack the archive for your platform and run:
