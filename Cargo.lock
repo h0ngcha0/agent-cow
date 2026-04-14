@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-cow"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "agent-cow-claude",
  "agent-cow-codex",
@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "agent-cow-claude"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "agent-cow-core",
  "anyhow",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "agent-cow-codex"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "agent-cow-core",
  "anyhow",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agent-cow-core"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
