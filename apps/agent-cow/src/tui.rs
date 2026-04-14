@@ -2876,6 +2876,7 @@ enum FollowStatus {
     Compacting,
     Exploring,
     Thinking,
+    Working,
     Waiting,
     Idle,
 }
@@ -2886,6 +2887,7 @@ impl FollowStatus {
             SessionActivityState::Compacting => Self::Compacting,
             SessionActivityState::Exploring => Self::Exploring,
             SessionActivityState::Thinking => Self::Thinking,
+            SessionActivityState::Working => Self::Working,
             SessionActivityState::Waiting => Self::Waiting,
             SessionActivityState::Idle => Self::Idle,
         }
@@ -2896,6 +2898,7 @@ impl FollowStatus {
             Self::Compacting => "Compacting",
             Self::Exploring => "Exploring",
             Self::Thinking => "Thinking",
+            Self::Working => "Working",
             Self::Waiting => "Waiting for you",
             Self::Idle => "Idle",
         }
@@ -2912,6 +2915,9 @@ impl FollowStatus {
             Self::Thinking => Style::default()
                 .fg(accent_green())
                 .add_modifier(Modifier::BOLD),
+            Self::Working => Style::default()
+                .fg(accent_blue())
+                .add_modifier(Modifier::BOLD),
             Self::Waiting => Style::default()
                 .fg(accent_magenta())
                 .add_modifier(Modifier::BOLD),
@@ -2920,7 +2926,10 @@ impl FollowStatus {
     }
 
     fn animated(self) -> bool {
-        matches!(self, Self::Compacting | Self::Exploring | Self::Thinking)
+        matches!(
+            self,
+            Self::Compacting | Self::Exploring | Self::Thinking | Self::Working
+        )
     }
 }
 
@@ -3625,6 +3634,7 @@ fn session_activity_label_for_width(state: &SessionActivityState, width: u16) ->
     match width {
         0..=1 => match state {
             SessionActivityState::Thinking => "T",
+            SessionActivityState::Working => "K",
             SessionActivityState::Exploring => "E",
             SessionActivityState::Compacting => "C",
             SessionActivityState::Waiting => "W",
@@ -3632,6 +3642,7 @@ fn session_activity_label_for_width(state: &SessionActivityState, width: u16) ->
         },
         2..=4 => match state {
             SessionActivityState::Thinking => "Thnk",
+            SessionActivityState::Working => "Work",
             SessionActivityState::Exploring => "Expl",
             SessionActivityState::Compacting => "Comp",
             SessionActivityState::Waiting => "Wait",
@@ -3639,6 +3650,7 @@ fn session_activity_label_for_width(state: &SessionActivityState, width: u16) ->
         },
         _ => match state {
             SessionActivityState::Thinking => "Think",
+            SessionActivityState::Working => "Working",
             SessionActivityState::Exploring => "Explore",
             SessionActivityState::Compacting => "Compact",
             SessionActivityState::Waiting => "Waiting",
@@ -3650,6 +3662,7 @@ fn session_activity_label_for_width(state: &SessionActivityState, width: u16) ->
 fn session_activity_label(state: &SessionActivityState) -> &'static str {
     match state {
         SessionActivityState::Thinking => "Thinking",
+        SessionActivityState::Working => "Working",
         SessionActivityState::Exploring => "Exploring",
         SessionActivityState::Compacting => "Compacting",
         SessionActivityState::Waiting => "Waiting",
@@ -3661,6 +3674,9 @@ fn session_activity_style(state: &SessionActivityState) -> Style {
     match state {
         SessionActivityState::Thinking => Style::default()
             .fg(accent_green())
+            .add_modifier(Modifier::BOLD),
+        SessionActivityState::Working => Style::default()
+            .fg(accent_blue())
             .add_modifier(Modifier::BOLD),
         SessionActivityState::Exploring => Style::default()
             .fg(accent_cyan())

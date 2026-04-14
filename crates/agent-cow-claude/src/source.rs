@@ -1044,13 +1044,21 @@ fn derive_activity_state(
         return SessionActivityState::Exploring;
     }
 
-    if matches!(
-        status.kind,
-        SessionStatusKind::Running | SessionStatusKind::ToolBusy
-    ) {
+    if hint
+        .latest_thinking_at
+        .is_some_and(|timestamp| now - timestamp <= recent_window)
+        && latest_feedback.is_none_or(|event| {
+            hint.latest_thinking_at
+                .is_some_and(|timestamp| timestamp >= event.timestamp)
+        })
+    {
+        return SessionActivityState::Thinking;
+    }
+
+    if latest_feedback.is_some_and(is_thinking_event) {
         SessionActivityState::Thinking
     } else {
-        SessionActivityState::Idle
+        SessionActivityState::Working
     }
 }
 
@@ -1076,6 +1084,12 @@ fn looks_like_compaction_signal(text: &str) -> bool {
         || lowered.contains("auto-compact")
         || lowered.contains("auto compaction")
         || lowered.contains("auto-compaction")
+}
+
+fn is_thinking_event(event: &ActivityEvent) -> bool {
+    matches!(event.kind, ActivityKind::Assistant)
+        || matches!(event.kind, ActivityKind::System)
+            && event.summary.eq_ignore_ascii_case("thinking")
 }
 
 fn build_navigation(row: &SessionRow) -> Vec<NavigationTarget> {
@@ -3479,6 +3493,7 @@ mod tests {
     };
     use chrono::{Local, TimeZone, Utc};
     use std::{
+        collections::HashSet,
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3611,14 +3626,14 @@ mod tests {
             ..compacting_hint
         };
 
-        let thinking = derive_activity_state(
+        let working = derive_activity_state(
             &status,
             &thinking_hint,
             None,
             now - chrono::Duration::seconds(1),
             now,
         );
-        assert_eq!(thinking, SessionActivityState::Thinking);
+        assert_eq!(working, SessionActivityState::Working);
     }
 
     #[test]
@@ -3656,6 +3671,35 @@ mod tests {
         );
 
         assert_eq!(activity, SessionActivityState::Thinking);
+    }
+
+    #[test]
+    fn derive_activity_state_marks_pending_tool_work_as_working() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::ToolBusy,
+            confidence: StatusConfidence::Exact,
+            reason: "tool busy".to_string(),
+        };
+        let hint = TranscriptHint {
+            pending_tool_ids: HashSet::from([String::from("tool_1")]),
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(1),
+                kind: ActivityKind::ToolResult,
+                summary: "Finished `exec_command`".to_string(),
+            }],
+            ..TranscriptHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            &hint,
+            None,
+            now - chrono::Duration::seconds(1),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Working);
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub struct SessionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum SessionActivityState {
     Thinking,
+    Working,
     Exploring,
     Compacting,
     Waiting,

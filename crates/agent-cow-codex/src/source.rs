@@ -847,7 +847,7 @@ fn derive_activity_state(
         return if matches!(status.kind, SessionStatusKind::ToolBusy)
             && now - updated_at <= recent_window
         {
-            SessionActivityState::Thinking
+            SessionActivityState::Working
         } else {
             SessionActivityState::Idle
         };
@@ -862,7 +862,7 @@ fn derive_activity_state(
     let latest_feedback = latest_recent_non_user_event(&hint.recent_events, now, recent_window);
     let Some(latest_feedback) = latest_feedback else {
         return if now - updated_at <= recent_window {
-            SessionActivityState::Thinking
+            SessionActivityState::Working
         } else {
             SessionActivityState::Idle
         };
@@ -882,7 +882,11 @@ fn derive_activity_state(
         return SessionActivityState::Exploring;
     }
 
-    SessionActivityState::Thinking
+    if is_thinking_event(latest_feedback) {
+        SessionActivityState::Thinking
+    } else {
+        SessionActivityState::Working
+    }
 }
 
 fn activity_recent_window(status: &SessionStatus, hint: Option<&RolloutHint>) -> Duration {
@@ -907,6 +911,10 @@ fn latest_recent_non_user_event(
     events.iter().rev().find(|event| {
         !matches!(event.kind, ActivityKind::User) && now - event.timestamp <= recent_window
     })
+}
+
+fn is_thinking_event(event: &ActivityEvent) -> bool {
+    matches!(event.kind, ActivityKind::Assistant)
 }
 
 fn is_exploration_tool(summary: &str) -> bool {
@@ -3197,7 +3205,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(activity, SessionActivityState::Working);
         assert_eq!(
             activity_recent_window(&status, Some(&hint)),
             chrono::Duration::seconds(super::TOOL_BUSY_ACTIVITY_WINDOW_SECONDS)
@@ -3262,7 +3270,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(activity, SessionActivityState::Thinking);
+        assert_eq!(activity, SessionActivityState::Working);
     }
 
     #[test]
@@ -3315,13 +3323,13 @@ mod tests {
             ],
             ..compacting_hint
         };
-        let thinking = derive_activity_state(
+        let working = derive_activity_state(
             &status,
             Some(&thinking_hint),
             now - chrono::Duration::seconds(1),
             now,
         );
-        assert_eq!(thinking, SessionActivityState::Thinking);
+        assert_eq!(working, SessionActivityState::Working);
     }
 
     #[test]
@@ -3347,6 +3355,35 @@ mod tests {
                     summary: "Finished `exec_command`".to_string(),
                 },
             ],
+            ..RolloutHint::default()
+        };
+
+        let activity = derive_activity_state(
+            &status,
+            Some(&hint),
+            now - chrono::Duration::seconds(1),
+            now,
+        );
+
+        assert_eq!(activity, SessionActivityState::Working);
+    }
+
+    #[test]
+    fn derive_activity_state_marks_recent_assistant_feedback_as_thinking() {
+        let now = Utc::now();
+        let status = SessionStatus {
+            kind: SessionStatusKind::Running,
+            confidence: StatusConfidence::Inferred,
+            reason: "running".to_string(),
+        };
+        let hint = RolloutHint {
+            run_active: true,
+            active_turns: 1,
+            recent_events: vec![ActivityEvent {
+                timestamp: now - chrono::Duration::seconds(1),
+                kind: ActivityKind::Assistant,
+                summary: "I am checking the workspace now".to_string(),
+            }],
             ..RolloutHint::default()
         };
 
