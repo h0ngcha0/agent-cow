@@ -2340,6 +2340,19 @@ fn animated_cow_lines(eyes: &str, mouth: &str, tail: &str) -> Vec<String> {
     ]
 }
 
+fn aligned_ascii_block(lines: Vec<String>) -> Vec<String> {
+    let width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    lines
+        .into_iter()
+        .map(|line| format!("{line:<width$}", width = width))
+        .collect()
+}
+
 fn keymap_grid_width(rows: &HeaderActionRows) -> u16 {
     let left_metrics = keymap_column_metrics(rows.iter().filter_map(|(left, _)| left.as_ref()));
     let right_metrics = keymap_column_metrics(rows.iter().filter_map(|(_, right)| right.as_ref()));
@@ -2911,6 +2924,7 @@ fn render_machine_unreachable_view(frame: &mut Frame, area: Rect, app: &TuiApp) 
         .current_machine_overview()
         .and_then(|machine| machine.error.as_deref())
         .unwrap_or("Machine temporarily unreachable");
+    let cow_lines = aligned_ascii_block(animated_cow_lines("oo", "__", "|"));
     let lines = vec![
         Line::from(Span::styled(
             truncate_chars(
@@ -2934,21 +2948,24 @@ fn render_machine_unreachable_view(frame: &mut Frame, area: Rect, app: &TuiApp) 
             Style::default().fg(text_muted_color()),
         )),
         Line::from(""),
-        Line::from(Span::styled("    ^__^", Style::default().fg(accent_gold()))),
         Line::from(Span::styled(
-            "    (oo)\\_______",
+            cow_lines[0].clone(),
             Style::default().fg(accent_gold()),
         )),
         Line::from(Span::styled(
-            "    (__)\\       )\\/\\",
+            cow_lines[1].clone(),
             Style::default().fg(accent_gold()),
         )),
         Line::from(Span::styled(
-            "        ||----w |",
+            cow_lines[2].clone(),
             Style::default().fg(accent_gold()),
         )),
         Line::from(Span::styled(
-            "        ||     ||",
+            cow_lines[3].clone(),
+            Style::default().fg(accent_gold()),
+        )),
+        Line::from(Span::styled(
+            cow_lines[4].clone(),
             Style::default().fg(accent_gold()),
         )),
     ];
@@ -4331,21 +4348,27 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         ListRefreshKind, SessionViewMode, TuiApp, animated_cow_lines, brand_cluster_lines,
-        current_detail_summary, footer_line, header_meta_lines,
+        current_detail_summary, footer_line, header_meta_lines, render_machine_unreachable_view,
     };
     use agent_cow_core::{
-        ProviderKind, SessionActivityState, SessionDetail, SessionList, SessionLoadProgress,
-        SessionStatus, SessionStatusKind, SessionSummary, StatusConfidence, TokenUsage,
-        UsageOverview,
+        MachineOverview, ProviderKind, SessionActivityState, SessionDetail, SessionList,
+        SessionLoadProgress, SessionStatus, SessionStatusKind, SessionSummary, StatusConfidence,
+        TokenUsage, UsageOverview,
     };
     use chrono::{TimeZone, Utc};
-    use ratatui::{layout::Rect, text::Line};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect, text::Line};
     use std::{collections::HashMap, time::Duration};
 
     fn flatten_line(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn buffer_row(backend: &TestBackend, row: u16) -> String {
+        (0..backend.buffer().area.width)
+            .map(|column| backend.buffer()[(column, row)].symbol())
             .collect()
     }
 
@@ -4442,6 +4465,49 @@ mod tests {
         let talking = animated_cow_lines("oo", "~~", "|");
 
         assert_eq!(closed[2].chars().count(), talking[2].chars().count());
+    }
+
+    #[test]
+    fn unreachable_view_keeps_cow_rows_in_one_block() {
+        let mut app = TuiApp::new(None, Duration::from_secs(5));
+        app.overview.machines = vec![MachineOverview {
+            source: "remote1".to_string(),
+            machine_id: "192.168.0.73".to_string(),
+            machine_label: "192.168.0.73".to_string(),
+            reachable: false,
+            error: Some("remote session stream disconnected".to_string()),
+        }];
+        app.refresh_machine_labels_cache();
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_machine_unreachable_view(frame, frame.area(), &app))
+            .unwrap();
+
+        let rows = (0..20)
+            .map(|row| buffer_row(terminal.backend(), row))
+            .collect::<Vec<_>>();
+        let head = rows
+            .iter()
+            .find_map(|row| row.find("^__^"))
+            .expect("cow head should render");
+        let body = rows
+            .iter()
+            .find_map(|row| row.find("(oo)\\_______"))
+            .expect("cow body should render");
+        let mouth = rows
+            .iter()
+            .find_map(|row| row.find("(__)\\       )\\/\\"))
+            .expect("cow mouth should render");
+        let legs = rows
+            .iter()
+            .find_map(|row| row.find("||----w |"))
+            .expect("cow legs should render");
+
+        assert_eq!(head, body);
+        assert_eq!(body, mouth);
+        assert_eq!(legs, body + 4);
     }
 
     #[test]
