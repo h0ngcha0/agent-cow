@@ -2588,7 +2588,7 @@ fn state_db_candidates_for_input(input: &Path) -> Result<Vec<PathBuf>> {
         })
         .collect();
 
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
 
     let preferred = input.join("state_5.sqlite");
     let mut ordered = Vec::new();

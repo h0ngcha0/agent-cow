@@ -456,23 +456,21 @@ async fn run_loop(
                     KeyCode::Char('m') if !app.detail_mode => app.cycle_machine_scope(),
                     KeyCode::Esc if app.detail_mode => app.close_detail_mode(),
                     KeyCode::Esc => app.clear_filter(),
-                    KeyCode::Char('r') => {
-                        if fast_refresh.is_none() && full_refresh.is_none() {
-                            if app.should_load_more() {
-                                queue_progressive_refresh(&mut app, &client, &mut full_refresh);
-                            } else if app.should_run_full_refresh() {
-                                full_refresh = Some(spawn_list_refresh(
-                                    client.clone(),
-                                    app.requested_limit,
-                                    ListRefreshKind::Full,
-                                ));
-                            } else {
-                                fast_refresh = Some(spawn_list_refresh(
-                                    client.clone(),
-                                    Some(app.fast_limit()),
-                                    ListRefreshKind::Fast,
-                                ));
-                            }
+                    KeyCode::Char('r') if fast_refresh.is_none() && full_refresh.is_none() => {
+                        if app.should_load_more() {
+                            queue_progressive_refresh(&mut app, &client, &mut full_refresh);
+                        } else if app.should_run_full_refresh() {
+                            full_refresh = Some(spawn_list_refresh(
+                                client.clone(),
+                                app.requested_limit,
+                                ListRefreshKind::Full,
+                            ));
+                        } else {
+                            fast_refresh = Some(spawn_list_refresh(
+                                client.clone(),
+                                Some(app.fast_limit()),
+                                ListRefreshKind::Fast,
+                            ));
                         }
                     }
                     KeyCode::Enter if !app.detail_mode => {
@@ -804,7 +802,7 @@ impl TuiApp {
         }
 
         self.sessions
-            .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+            .sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         self.prune_visible_state_cache();
         self.refresh_machine_labels_cache();
         self.rebuild_filter(selected_id.as_deref());

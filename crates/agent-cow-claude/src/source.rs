@@ -607,7 +607,7 @@ impl ClaudeSource {
         if self.projects_exist() {
             collect_sessions_from_projects(&self.projects_dir, &mut rows, self)?;
         }
-        rows.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
 
         let cache = SessionsCache {
             fetched_at_epoch_ms: now_epoch_millis(),
@@ -2598,15 +2598,14 @@ fn parse_transcript_static(path: &Path) -> Result<TranscriptStatic> {
                     static_parts.title = title;
                 }
             }
-            "assistant" => {
-                if static_parts.model.is_none() {
-                    static_parts.model = value
-                        .get("message")
-                        .and_then(|message| message.get("model"))
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                }
+            "assistant" if static_parts.model.is_none() => {
+                static_parts.model = value
+                    .get("message")
+                    .and_then(|message| message.get("model"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
             }
+            "assistant" => {}
             _ => {}
         }
     }
