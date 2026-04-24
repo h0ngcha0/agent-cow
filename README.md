@@ -162,14 +162,14 @@ Agent Cow works well over:
 | --- | --- |
 | `j` / `k` | Move through sessions |
 | `Enter` | Open details |
-| `Esc` | Go back |
+| `Esc` / `q` | Go back (in detail view) |
 | `f` | Open latest conversation |
 | `o` | Open the session in the provider app |
 | `m` | Cycle machine scope |
 | `v` | Cycle view: `Focus` → `Recent` → `All` |
 | `/` | Filter sessions |
 | `r` | Refresh |
-| `q` | Quit |
+| `q` | Go back (in detail view) / Quit (in main view) |
 
 ## Why Agent Cow Exists
 
