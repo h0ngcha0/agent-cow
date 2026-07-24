@@ -2008,10 +2008,7 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                     Some(action_item("j/k", "Scroll", true)),
                     Some(action_item("o", "Open", true)),
                 ),
-                (
-                    Some(action_item("r", "Refresh", true)),
-                    None,
-                ),
+                (Some(action_item("r", "Refresh", true)), None),
             ],
             DetailPane::Follow => vec![
                 (
@@ -2022,10 +2019,7 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                     Some(action_item("j/k", "Scroll", true)),
                     Some(action_item("o", "Open", true)),
                 ),
-                (
-                    Some(action_item("r", "Refresh", true)),
-                    None,
-                ),
+                (Some(action_item("r", "Refresh", true)), None),
             ],
         }
     } else if app.filter_input.is_empty() {
