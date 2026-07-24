@@ -430,7 +430,13 @@ async fn run_loop(
                     terminal_size.height,
                 ));
                 match key.code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => {
+                        if app.detail_mode {
+                            app.close_detail_mode();
+                        } else {
+                            break;
+                        }
+                    }
                     KeyCode::Down | KeyCode::Char('j') if app.detail_mode => {
                         app.detail_scroll_down(1, detail_max_scroll)
                     }
@@ -1995,7 +2001,7 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
         match app.detail_pane {
             DetailPane::Describe => vec![
                 (
-                    Some(action_item("enter/esc", "Back", true)),
+                    Some(action_item("enter/esc/q", "Back", true)),
                     Some(action_item("f", "Latest Conversation", true)),
                 ),
                 (
@@ -2004,12 +2010,12 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                 ),
                 (
                     Some(action_item("r", "Refresh", true)),
-                    Some(action_item("q", "Quit", true)),
+                    None,
                 ),
             ],
             DetailPane::Follow => vec![
                 (
-                    Some(action_item("enter/esc", "Back", true)),
+                    Some(action_item("enter/esc/q", "Back", true)),
                     Some(action_item("d", "Describe", true)),
                 ),
                 (
@@ -2018,7 +2024,7 @@ fn header_action_rows(app: &TuiApp) -> HeaderActionRows {
                 ),
                 (
                     Some(action_item("r", "Refresh", true)),
-                    Some(action_item("q", "Quit", true)),
+                    None,
                 ),
             ],
         }
