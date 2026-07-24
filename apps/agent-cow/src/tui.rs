@@ -4371,7 +4371,7 @@ mod tests {
     }
 
     fn fixture_session(id: &str, machine_label: &str) -> SessionSummary {
-        let now = Utc.with_ymd_and_hms(2026, 4, 12, 10, 0, 0).unwrap();
+        let now = Utc::now() - chrono::Duration::days(2);
         SessionSummary {
             id: id.to_string(),
             machine_id: machine_label.to_string(),
